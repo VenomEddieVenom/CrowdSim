@@ -1,0 +1,36 @@
+# Build output
+build/
+out/
+x64/
+Debug/
+Release/
+*.exe
+*.obj
+*.lib
+*.dll
+*.pdb
+*.ilk
+*.exp
+*.log
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# IDE
+.vs/
+.vscode/launch.json
+*.suo
+*.user
+*.ncb
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+
+# Build logs
+build_out*.txt
+
+# Save files
+*.city

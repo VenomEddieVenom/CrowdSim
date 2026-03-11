@@ -1,0 +1,1476 @@
+ // ============================================================
+//  main.cpp  –  CrowdSim entry point (Win32 + WickedEngine)
+//
+//  Architecture:
+//    CrowdApp (wi::Application)
+//      └─ CrowdRenderPath (wi::RenderPath3D)
+//            ├─ Start()      : set up camera & crowd (replaces Initialize)
+//            ├─ Update(dt)   : tick crowd + queue DrawBox calls
+//            └─ Compose(cmd) : HUD overlay (FPS, threads, counts)
+// ============================================================
+
+#include "WickedEngine.h"
+#include "CrowdSystem.h"
+#include "CityLayout.h"
+#include "CarSystem.h"
+#include "TrafficLightSystem.h"
+
+#include <string>
+#include <sstream>
+#include <iomanip>
+#include <algorithm>
+#include <cmath>
+
+
+
+// ============================================================
+//  CrowdRenderPath
+// ============================================================
+class CrowdRenderPath : public wi::RenderPath3D
+{
+public:
+    CrowdSystem crowd;
+    CityLayout  city;
+    CarSystem   cars;
+    TrafficLightSystem trafficLights;
+
+    // distance threshold: >CAR_HOP_THRESHOLD road cells → use car
+    static constexpr int CAR_HOP_THRESHOLD = 3;
+
+    // FPS-camera state
+    wi::scene::TransformComponent camera_transform;
+    float moveSpeed = 80.0f;  // units/second (scroll wheel adjusts)
+    float simSpeed  = 1.0f;   // simulation time scale
+
+    // Day/night cycle
+    wi::ecs::Entity sunEntity = wi::ecs::INVALID_ENTITY;
+    float timeOfDay   = 0.30f;  // 0..1 (0.25=sunrise, 0.5=noon, 0.75=sunset)
+    float dayDuration = 86400.0f; // real seconds for a full day at 1x (1:1 real time)
+
+    mutable float displayFPS = 0.0f;
+
+    // Economy
+    float townTreasury  = 0.0f;
+    static constexpr float TAX_RATE = 0.10f;   // passed through to CrowdSystem internally
+
+    // Spawn tracking – prevents double-spawning per house cell
+    bool houseHasSpawned[CityLayout::GRID_SIZE * CityLayout::GRID_SIZE] = {};
+
+    // Reproduction timer
+    float reproTimer_ = 0.0f;
+    static constexpr float REPRO_INTERVAL = 30.0f; // every 30 game-seconds
+
+    // Agent / car selection
+    int32_t selectedAgent = -1;  // agent index, or -1 for none
+    int32_t selectedCar   = -1;  // car index, or -1 for none
+
+    // Build mode
+    using CellType = CityLayout::CellType;
+    bool     buildModeEnabled = false;
+    int      placeTool        = 0;    // 0=road 1=house 2=workplace 3=tree 4=crosswalk 5=parking
+    int      hoverGX = 0, hoverGZ = 0;
+    bool     hoverValid = false;
+    bool     clickConsumedByPanel = false;  // prevent world-placement when clicking UI
+
+    // Road click-start / click-end state
+    bool     roadPlaceActive  = false;  // true = waiting for end point
+    int      roadStartGX = 0, roadStartGZ = 0;
+    std::vector<std::pair<int,int>> roadPreviewPath; // cells of the preview path
+
+    void Start() override
+    {
+        city.Initialize();
+        crowd.Initialize();
+        cars.Initialize();
+        trafficLights.Initialize();
+
+        // ---- Camera: oblique overview of city centre ----
+        auto& cam = wi::scene::GetCamera();
+        cam.zNearP = 0.5f;
+        cam.zFarP  = 3000.0f;
+        cam.fov    = XM_PI / 3.5f;
+
+        camera_transform.ClearTransform();
+        camera_transform.Translate(XMFLOAT3(0.0f, 180.0f, -260.0f));
+        camera_transform.RotateRollPitchYaw(XMFLOAT3(-0.55f, 0.0f, 0.0f));
+        camera_transform.UpdateTransform();
+        cam.TransformCamera(camera_transform);
+        cam.UpdateCamera();
+
+        // ---- Sky (initial values, updated by day cycle each frame) ----
+        auto& scene = wi::scene::GetScene();
+        scene.weather.fogStart   = 700.0f;
+        scene.weather.fogDensity = 0.0005f;
+
+        // ---- Sun (directional light with shadow cascades) ----
+        sunEntity = scene.Entity_CreateLight(
+            "Sun",
+            XMFLOAT3(0.0f, 0.0f, 0.0f),
+            XMFLOAT3(1.0f, 0.95f, 0.82f),
+            10.0f, 10000.0f,
+            wi::scene::LightComponent::DIRECTIONAL
+        );
+        auto* sunLight = scene.lights.GetComponent(sunEntity);
+        if (sunLight)
+        {
+            sunLight->SetCastShadow(true);
+            sunLight->cascade_distances = { 30.0f, 120.0f, 500.0f, 1500.0f };
+        }
+        // Set initial sun rotation matching timeOfDay
+        {
+            float sunAngle = (timeOfDay - 0.5f) * XM_2PI;
+            auto* sunTr = scene.transforms.GetComponent(sunEntity);
+            sunTr->ClearTransform();
+            sunTr->RotateRollPitchYaw(XMFLOAT3(sunAngle, 0.4f, 0.0f));
+            sunTr->SetDirty();
+        }
+
+        // ---- Post-process ----
+        setExposure(1.3f);
+        setBloomThreshold(0.6f);
+        setAO(AO_HBAO);
+        setAOPower(1.5f);
+        setShadowsEnabled(true);
+        setScreenSpaceShadowSampleCount(16);
+
+        wi::renderer::SetToDrawGridHelper(false);
+    }
+
+    void Render() const override
+    {
+        wi::RenderPath3D::Render();
+    }
+
+    void Update(float dt) override
+    {
+        wi::RenderPath3D::Update(dt);
+
+        auto& cam  = wi::scene::GetCamera();
+        auto  ms   = wi::input::GetMouseState();
+
+        // ---- Mouse-look: hold RMB (WickedEngine native input) ----
+        const XMFLOAT4 originalMouse = wi::input::GetPointer();
+        float xDif = 0.0f, yDif = 0.0f;
+
+        if (wi::input::Down(wi::input::MOUSE_BUTTON_RIGHT))
+        {
+            wi::input::HidePointer(true);
+            wi::input::SetPointer(originalMouse);
+            xDif = ms.delta_position.x * 0.1f * (1.0f / 60.0f);
+            yDif = ms.delta_position.y * 0.1f * (1.0f / 60.0f);
+        }
+        else
+        {
+            wi::input::HidePointer(false);
+        }
+
+        // ---- Speed (scroll to adjust, Shift to sprint) ----
+        moveSpeed += ms.delta_wheel * 8.0f;
+        moveSpeed  = std::clamp(moveSpeed, 5.0f, 1200.0f);
+
+        float spd = moveSpeed * dt;
+        if (wi::input::Down(wi::input::KEYBOARD_BUTTON_LSHIFT) ||
+            wi::input::Down(wi::input::KEYBOARD_BUTTON_RSHIFT))
+            spd *= 4.0f;
+
+        // ---- WASD movement in camera-local space ----
+        XMVECTOR moveVec = XMVectorZero();
+        if (wi::input::Down((wi::input::BUTTON)'W')) moveVec = XMVectorAdd(moveVec, XMVectorSet(0,0,1,0));
+        if (wi::input::Down((wi::input::BUTTON)'S')) moveVec = XMVectorAdd(moveVec, XMVectorSet(0,0,-1,0));
+        if (wi::input::Down((wi::input::BUTTON)'A')) moveVec = XMVectorAdd(moveVec, XMVectorSet(-1,0,0,0));
+        if (wi::input::Down((wi::input::BUTTON)'D')) moveVec = XMVectorAdd(moveVec, XMVectorSet(1,0,0,0));
+        if (wi::input::Down((wi::input::BUTTON)'Q')) moveVec = XMVectorAdd(moveVec, XMVectorSet(0,-1,0,0));
+        if (wi::input::Down((wi::input::BUTTON)'E')) moveVec = XMVectorAdd(moveVec, XMVectorSet(0,1,0,0));
+
+        XMMATRIX camRot = XMMatrixRotationQuaternion(XMLoadFloat4(&camera_transform.rotation_local));
+        XMVECTOR movWorld = XMVector3TransformNormal(moveVec * spd, camRot);
+        XMFLOAT3 _move; XMStoreFloat3(&_move, movWorld);
+
+        if (abs(xDif) + abs(yDif) > 0.0f ||
+            XMVectorGetX(XMVector3LengthSq(movWorld)) > 0.00001f)
+        {
+            camera_transform.Translate(_move);
+            camera_transform.RotateRollPitchYaw(XMFLOAT3(yDif, xDif, 0.0f));
+            cam.SetDirty();
+        }
+        camera_transform.UpdateTransform();
+        cam.TransformCamera(camera_transform);
+        cam.UpdateCamera();
+
+        // ---- Day/night cycle ----
+        {
+            auto& scene = wi::scene::GetScene();
+            timeOfDay += (dt * simSpeed) / dayDuration;
+            timeOfDay = fmodf(timeOfDay, 1.0f);
+
+            // sunAngle: 0 at noon (timeOfDay=0.5), PI at midnight
+            float sunAngle = (timeOfDay - 0.5f) * XM_2PI;
+            float sunElev = cosf(sunAngle); // +1=noon, -1=midnight
+
+            // Rotate sun transform (engine derives direction from Y-axis)
+            auto* sunTr = scene.transforms.GetComponent(sunEntity);
+            if (sunTr)
+            {
+                sunTr->ClearTransform();
+                sunTr->RotateRollPitchYaw(XMFLOAT3(sunAngle, 0.4f, 0.0f));
+                sunTr->SetDirty();
+            }
+
+            // Light intensity + warm color at low elevation
+            auto* sunLight = scene.lights.GetComponent(sunEntity);
+            if (sunLight)
+            {
+                if (sunElev > 0.0f)
+                {
+                    sunLight->intensity = 5.0f * sunElev;
+                    sunLight->color = XMFLOAT3(
+                        1.0f,
+                        0.75f + 0.20f * sunElev,
+                        0.50f + 0.40f * sunElev);
+                }
+                else
+                {
+                    sunLight->intensity = 0.0f;
+                }
+            }
+
+            // Sky and ambient based on sun elevation
+            float dayFactor = std::clamp(sunElev * 3.0f + 0.3f, 0.0f, 1.0f);
+            float sunsetGlow = std::max(0.0f, 1.0f - std::abs(sunElev) * 4.0f);
+
+            scene.weather.horizon = XMFLOAT3(
+                0.15f + 0.40f * dayFactor + 0.50f * sunsetGlow,
+                0.12f + 0.53f * dayFactor + 0.20f * sunsetGlow,
+                0.10f + 0.72f * dayFactor);
+            scene.weather.zenith = XMFLOAT3(
+                0.01f + 0.07f * dayFactor,
+                0.02f + 0.18f * dayFactor,
+                0.05f + 0.50f * dayFactor);
+            scene.weather.ambient = XMFLOAT3(
+                0.03f + 0.15f * dayFactor,
+                0.03f + 0.13f * dayFactor,
+                0.05f + 0.18f * dayFactor);
+            scene.weather.sunColor = XMFLOAT3(
+                1.0f * dayFactor + 0.8f * sunsetGlow,
+                0.85f * dayFactor + 0.3f * sunsetGlow,
+                0.65f * dayFactor);
+
+            setExposure(1.3f + 0.5f * (1.0f - dayFactor));
+        }
+
+        // ---- Agent count: Numpad+ / Numpad- ----
+        // (agent count now driven by placed houses)
+
+        // ---- Build mode toggle ----
+        if (wi::input::Press((wi::input::BUTTON)'B'))
+            buildModeEnabled = !buildModeEnabled;
+
+        if (buildModeEnabled)
+        {
+            // Panel click detection (right side of screen, 6 tool buttons)
+            const float panelX  = (float)cam.width - 215.0f;
+            const float btnY[6] = { 145.0f, 215.0f, 285.0f, 355.0f, 425.0f, 495.0f };
+            const float btnH    = 60.0f;
+
+            XMFLOAT4 ptr = wi::input::GetPointer();
+            bool inPanel = ptr.x >= panelX;
+            clickConsumedByPanel = false;
+
+            if (inPanel && wi::input::Press(wi::input::MOUSE_BUTTON_LEFT))
+            {
+                clickConsumedByPanel = true;
+                for (int k = 0; k < 6; ++k)
+                    if (ptr.y >= btnY[k] && ptr.y < btnY[k] + btnH)
+                        placeTool = k; // 0=road 1=house 2=workplace 3=tree 4=crosswalk 5=parking
+            }
+
+            // Ray → ground plane to find hovered grid cell
+            hoverValid = false;
+            XMMATRIX invVP = XMMatrixInverse(nullptr, cam.GetViewProjection());
+            float ndcX =  (ptr.x / static_cast<float>(cam.width))  * 2.0f - 1.0f;
+            float ndcY = 1.0f - (ptr.y / static_cast<float>(cam.height)) * 2.0f;
+            XMVECTOR nearPt = XMVector3TransformCoord(XMVectorSet(ndcX, ndcY, 0.f, 1.f), invVP);
+            XMVECTOR farPt  = XMVector3TransformCoord(XMVectorSet(ndcX, ndcY, 1.f, 1.f), invVP);
+            XMVECTOR rDir   = XMVector3Normalize(farPt - nearPt);
+            float rDirY = XMVectorGetY(rDir);
+            if (fabsf(rDirY) > 0.001f)
+            {
+                float t = -XMVectorGetY(nearPt) / rDirY;
+                if (t > 0.0f)
+                {
+                    float hx = XMVectorGetX(nearPt) + XMVectorGetX(rDir) * t;
+                    float hz = XMVectorGetZ(nearPt) + XMVectorGetZ(rDir) * t;
+                    hoverValid = city.WorldToGrid(hx, hz, hoverGX, hoverGZ);
+                }
+            }
+
+            // LMB interactions (not while RMB-looking, not on panel)
+            bool lmbDown = wi::input::Down(wi::input::MOUSE_BUTTON_LEFT) &&
+                           !wi::input::Down(wi::input::MOUSE_BUTTON_RIGHT) &&
+                           !clickConsumedByPanel && !inPanel;
+            bool lmbPress = wi::input::Press(wi::input::MOUSE_BUTTON_LEFT) &&
+                            !wi::input::Down(wi::input::MOUSE_BUTTON_RIGHT) &&
+                            !clickConsumedByPanel && !inPanel;
+
+            // Cancel road placement on RMB press
+            if (roadPlaceActive && wi::input::Press(wi::input::MOUSE_BUTTON_RIGHT))
+            {
+                roadPlaceActive = false;
+                roadPreviewPath.clear();
+            }
+
+            // When tool changes away from road, cancel active road placement
+            if (placeTool != 0 && roadPlaceActive)
+            {
+                roadPlaceActive = false;
+                roadPreviewPath.clear();
+            }
+
+            // Update road preview path when hovering in road-start mode
+            if (placeTool == 0 && roadPlaceActive && hoverValid)
+            {
+                roadPreviewPath = ComputeRoadPreviewPath(
+                    roadStartGX, roadStartGZ, hoverGX, hoverGZ, city);
+            }
+            else if (!roadPlaceActive)
+            {
+                roadPreviewPath.clear();
+            }
+
+            // Middle-click (or Shift+LMB) on a road cell: cycle lane count
+            if (hoverValid && wi::input::Press(wi::input::MOUSE_BUTTON_MIDDLE))
+            {
+                auto ct = city.GetCellType(hoverGX, hoverGZ);
+                if (ct == CellType::ROAD || ct == CellType::CROSSWALK)
+                    city.CycleRoadLanes(hoverGX, hoverGZ);
+            }
+
+            if (hoverValid && lmbPress)
+            {
+                if (placeTool == 0) // ROAD — click-start / click-end
+                {
+                    if (!roadPlaceActive)
+                    {
+                        // First click: record start
+                        roadPlaceActive = true;
+                        roadStartGX     = hoverGX;
+                        roadStartGZ     = hoverGZ;
+                        // Place start cell immediately
+                        city.PlaceCell(hoverGX, hoverGZ, CellType::ROAD);
+                        trafficLights.RebuildIntersections(city);
+                        TrySpawnAllUnspawnedHouses();
+                        roadPreviewPath.clear();
+                    }
+                    else
+                    {
+                        // Second click: place entire preview path
+                        bool anyPlaced = false;
+                        for (auto& [pgx, pgz] : roadPreviewPath)
+                        {
+                            if (city.GetCellType(pgx, pgz) == CellType::EMPTY)
+                            {
+                                city.PlaceCell(pgx, pgz, CellType::ROAD);
+                                anyPlaced = true;
+                            }
+                        }
+                        if (anyPlaced)
+                        {
+                            trafficLights.RebuildIntersections(city);
+                            TrySpawnAllUnspawnedHouses();
+                        }
+                        roadPlaceActive = false;
+                        roadPreviewPath.clear();
+                    }
+                }
+                else if (placeTool == 3) // TREE
+                {
+                    if (lmbDown)
+                    {
+                        XMFLOAT2 c = city.GridCellCenter(hoverGX, hoverGZ);
+                        wi::scene::Scene tmp;
+                        wi::scene::LoadModel(tmp, "models/drzewo.wiscene",
+                            XMMatrixTranslation(c.x, 0.0f, c.y));
+                        wi::scene::GetScene().Merge(tmp);
+                    }
+                }
+                else if (placeTool == 4) // CROSSWALK — single click only
+                {
+                    // Crosswalk can only be placed on existing ROAD cells (not intersections)
+                    CellType ct = city.GetCellType(hoverGX, hoverGZ);
+                    if (ct == CellType::ROAD)
+                    {
+                        // Prevent placing on intersection cells (3+ road neighbours)
+                        const int ddx2[] = { 1,-1, 0, 0 };
+                        const int ddz2[] = { 0, 0, 1,-1 };
+                        int roadNeighbors = 0;
+                        for (int d = 0; d < 4; ++d)
+                        {
+                            auto nct = city.GetCellType(hoverGX + ddx2[d], hoverGZ + ddz2[d]);
+                            if (nct == CellType::ROAD || nct == CellType::CROSSWALK)
+                                ++roadNeighbors;
+                        }
+                        if (roadNeighbors <= 2)
+                        {
+                            city.PlaceCell(hoverGX, hoverGZ, CellType::CROSSWALK);
+                            trafficLights.RebuildIntersections(city);
+                        }
+                    }
+                }
+                else
+                {
+                    // Tools 1=house, 2=workplace, 5=parking (lmbDown drag)
+                    CellType ct;
+                    if (placeTool == 5)
+                        ct = CellType::PARKING;
+                    else
+                        ct = static_cast<CellType>(placeTool + 1);
+                    bool placed = city.PlaceCell(hoverGX, hoverGZ, ct);
+                    if (placed)
+                    {
+                        int cellIdx = hoverGZ * CityLayout::GRID_SIZE + hoverGX;
+                        if (ct == CellType::HOUSE)
+                        {
+                            houseHasSpawned[cellIdx] = false;
+                            if (TrySpawnFromHouse(hoverGX, hoverGZ))
+                                houseHasSpawned[cellIdx] = true;
+                        }
+                        else
+                        {
+                            TrySpawnAllUnspawnedHouses();
+                        }
+                    }
+                }
+            }
+            else if (hoverValid && lmbDown && placeTool >= 1 && placeTool <= 2)
+            {
+                // Allow dragging for house/workplace placement
+                CellType ct = static_cast<CellType>(placeTool + 1);
+                bool placed = city.PlaceCell(hoverGX, hoverGZ, ct);
+                if (placed)
+                {
+                    int cellIdx = hoverGZ * CityLayout::GRID_SIZE + hoverGX;
+                    if (ct == CellType::HOUSE)
+                    {
+                        houseHasSpawned[cellIdx] = false;
+                        if (TrySpawnFromHouse(hoverGX, hoverGZ))
+                            houseHasSpawned[cellIdx] = true;
+                    }
+                    else
+                    {
+                        TrySpawnAllUnspawnedHouses();
+                    }
+                }
+            }
+
+            DrawBuildGrid();
+        }
+        else
+        {
+            // ---- Simulation speed: 1/2/3/4/5 keys ----
+            if (wi::input::Press((wi::input::BUTTON)'1')) simSpeed = 1.0f;
+            if (wi::input::Press((wi::input::BUTTON)'2')) simSpeed = 2.0f;
+            if (wi::input::Press((wi::input::BUTTON)'3')) simSpeed = 5.0f;
+            if (wi::input::Press((wi::input::BUTTON)'4')) simSpeed = 10.0f;
+            if (wi::input::Press((wi::input::BUTTON)'5')) simSpeed = 100.0f;
+            if (wi::input::Press((wi::input::BUTTON)'6')) simSpeed = 1000.0f;
+            if (wi::input::Press((wi::input::BUTTON)'7')) simSpeed = 1000.0f;
+        }
+
+        // ---- Save / Load (F5 / F9) ----
+        if (wi::input::Press(wi::input::KEYBOARD_BUTTON_F5))
+        {
+            if (city.SaveToFile("save.city"))
+                wi::backlog::post("[Save] City saved to save.city", wi::backlog::LogLevel::Default);
+            else
+                wi::backlog::post("[Save] FAILED to save!", wi::backlog::LogLevel::Warning);
+        }
+        if (wi::input::Press(wi::input::KEYBOARD_BUTTON_F9))
+        {
+            auto sd = CityLayout::LoadFromFile("save.city");
+            if (sd.valid)
+            {
+                // Clear everything
+                trafficLights.RebuildIntersections(city); // safe pre-clear
+                for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
+                for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2)
+                    city.ClearCell(gx2, gz2);
+                std::fill(std::begin(houseHasSpawned), std::end(houseHasSpawned), false);
+
+                // Rebuild city from saved data
+                // Place roads/crosswalks first, then buildings (so path finding works)
+                for (int pass = 0; pass < 2; ++pass)
+                for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
+                for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2)
+                {
+                    auto ct = sd.cells[gz2 * CityLayout::GRID_SIZE + gx2];
+                    bool isRoad = (ct == CellType::ROAD || ct == CellType::CROSSWALK);
+                    if (pass == 0 && !isRoad) continue;
+                    if (pass == 1 && isRoad) continue;
+                    if (ct == CellType::EMPTY) continue;
+                    city.PlaceCell(gx2, gz2, ct);
+                }
+                trafficLights.RebuildIntersections(city);
+
+                // Restore per-cell road lane counts
+                for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
+                for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2)
+                {
+                    int lanes = sd.roadLanes[gz2 * CityLayout::GRID_SIZE + gx2];
+                    if (lanes == 2 || lanes == 6)
+                        city.SetRoadLanes(gx2, gz2, lanes);
+                }
+
+                // Restore house population and respawn agents/cars
+                for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
+                for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2)
+                {
+                    int idx2 = gz2 * CityLayout::GRID_SIZE + gx2;
+                    if (sd.cells[idx2] == CellType::HOUSE)
+                    {
+                        city.SetHousePop(gx2, gz2, 0); // reset for respawn
+                        if (TrySpawnFromHouse(gx2, gz2))
+                            houseHasSpawned[idx2] = true;
+                    }
+                }
+
+                wi::backlog::post("[Load] City loaded from save.city", wi::backlog::LogLevel::Default);
+            }
+            else
+            {
+                wi::backlog::post("[Load] No save file found or invalid!", wi::backlog::LogLevel::Warning);
+            }
+        }
+
+        // ---- Update traffic density on city grid for traffic-aware pathfinding ----
+        {
+            constexpr int GS = CityLayout::GRID_SIZE;
+            for (int z = 0; z < GS; ++z)
+                for (int x = 0; x < GS; ++x)
+                    city.SetTrafficCount(x, z, 0);
+            for (uint32_t c = 0; c < cars.GetCarCount(); ++c)
+            {
+                int gx, gz;
+                if (city.WorldToGrid(cars.GetPosX(c), cars.GetPosZ(c), gx, gz))
+                    city.SetTrafficCount(gx, gz, city.GetTrafficCount(gx, gz) + 1);
+            }
+        }
+
+        // ---- Simulate cars + traffic lights + render ----
+        trafficLights.Update(dt * simSpeed);
+        trafficLights.UpdateVisuals();
+        // crowd.Update(dt * simSpeed, cam.Eye, city);  // pedestrians disabled
+        cars.Update(dt * simSpeed, city, trafficLights, timeOfDay, dayDuration);
+        townTreasury += cars.DrainTax();
+        // crowd.RenderSolidAgents(cam.Eye);  // pedestrians disabled
+        cars.RenderCars(cam.Eye, city);
+
+        // ---- Reproduction: houses grow population over time ----
+        reproTimer_ += dt * simSpeed;
+        if (reproTimer_ >= REPRO_INTERVAL)
+        {
+            reproTimer_ -= REPRO_INTERVAL;
+            constexpr int GS = CityLayout::GRID_SIZE;
+            for (int gz = 0; gz < GS; ++gz)
+            for (int gx = 0; gx < GS; ++gx)
+            {
+                if (city.GetCellType(gx, gz) != CellType::HOUSE) continue;
+                int pop = city.GetHousePop(gx, gz);
+                if (pop < 2) continue; // need at least 2 to reproduce
+                // One new person born (cap at 50 per house)
+                if (pop >= 50) continue;
+                city.AddHousePop(gx, gz, 1);
+                city.UpdateHouseHeight(gx, gz);
+
+                // Spawn the new person with a job
+                TrySpawnOneWorker(gx, gz);
+            }
+        }
+
+        // ---- Agent / car picking (LMB click, not in build mode, not RMB look) ----
+        if (!buildModeEnabled &&
+            wi::input::Press(wi::input::MOUSE_BUTTON_LEFT) &&
+            !wi::input::Down(wi::input::MOUSE_BUTTON_RIGHT))
+        {
+            XMFLOAT4 pointer = wi::input::GetPointer();
+            // Create a ray from screen coordinates through the camera
+            XMVECTOR rayOrigin, rayDir;
+            {
+                XMMATRIX VP = cam.GetViewProjection();
+                XMMATRIX invVP = XMMatrixInverse(nullptr, VP);
+                float screenW = static_cast<float>(cam.width);
+                float screenH = static_cast<float>(cam.height);
+                float ndcX = (pointer.x / screenW) * 2.0f - 1.0f;
+                float ndcY = 1.0f - (pointer.y / screenH) * 2.0f;
+                XMVECTOR nearPt = XMVector3TransformCoord(XMVectorSet(ndcX, ndcY, 0.0f, 1.0f), invVP);
+                XMVECTOR farPt  = XMVector3TransformCoord(XMVectorSet(ndcX, ndcY, 1.0f, 1.0f), invVP);
+                rayOrigin = nearPt;
+                rayDir = XMVector3Normalize(farPt - nearPt);
+            }
+
+            // Check cars (larger targets, pick first)
+            float bestCarDist = 5.0f;
+            int32_t bestCarIdx = -1;
+            {
+                uint32_t carVisCount = cars.GetVisibleCarCount();
+                for (uint32_t s = 0; s < carVisCount; ++s)
+                {
+                    uint32_t ci = cars.GetVisibleCarIndex(s);
+                    if (ci == UINT32_MAX) continue;
+                    XMVECTOR carPos = XMVectorSet(cars.GetPosX(ci), 0.5f, cars.GetPosZ(ci), 1.0f);
+                    XMVECTOR toCar = carPos - rayOrigin;
+                    float t = XMVectorGetX(XMVector3Dot(toCar, rayDir));
+                    if (t < 0.0f) continue;
+                    XMVECTOR closest = rayOrigin + rayDir * t;
+                    float dist = XMVectorGetX(XMVector3Length(closest - carPos));
+                    if (dist < bestCarDist)
+                    {
+                        bestCarDist = dist;
+                        bestCarIdx = static_cast<int32_t>(ci);
+                    }
+                }
+            }
+
+            // Check agents
+            float bestAgentDist = 5.0f;
+            int32_t bestAgentIdx = -1;
+            {
+                uint32_t visCount = crowd.GetVisibleCount();
+                for (uint32_t s = 0; s < visCount; ++s)
+                {
+                    uint32_t ai = crowd.GetVisibleAgentIndex(s);
+                    if (ai == UINT32_MAX) continue;
+                    XMVECTOR agentPos = XMVectorSet(crowd.GetPosX(ai), 0.9f, crowd.GetPosZ(ai), 1.0f);
+                    XMVECTOR toAgent = agentPos - rayOrigin;
+                    float t = XMVectorGetX(XMVector3Dot(toAgent, rayDir));
+                    if (t < 0.0f) continue;
+                    XMVECTOR closest = rayOrigin + rayDir * t;
+                    float dist = XMVectorGetX(XMVector3Length(closest - agentPos));
+                    if (dist < bestAgentDist)
+                    {
+                        bestAgentDist = dist;
+                        bestAgentIdx = static_cast<int32_t>(ai);
+                    }
+                }
+            }
+
+            // Prefer cars (bigger), then agents
+            if (bestCarIdx >= 0 && bestCarDist <= bestAgentDist)
+            {
+                selectedCar = bestCarIdx;
+                selectedAgent = -1;
+            }
+            else if (bestAgentIdx >= 0)
+            {
+                selectedAgent = bestAgentIdx;
+                selectedCar = -1;
+            }
+            else
+            {
+                selectedCar = -1;
+                selectedAgent = -1;
+            }
+        }
+
+        // ---- Draw selection visuals ----
+        if (selectedAgent >= 0 && static_cast<uint32_t>(selectedAgent) < crowd.GetAgentCount())
+        {
+            float ax = crowd.GetPosX(selectedAgent);
+            float az = crowd.GetPosZ(selectedAgent);
+            float tx = crowd.GetTargetX(selectedAgent);
+            float tz = crowd.GetTargetZ(selectedAgent);
+
+            // Line from agent to destination
+            wi::renderer::RenderableLine line;
+            line.start = XMFLOAT3(ax, 1.5f, az);
+            line.end   = XMFLOAT3(tx, 1.5f, tz);
+            line.color_start = XMFLOAT4(0.0f, 1.0f, 1.0f, 1.0f);
+            line.color_end   = XMFLOAT4(1.0f, 0.2f, 0.2f, 1.0f);
+            wi::renderer::DrawLine(line);
+
+            // Marker at destination
+            wi::renderer::RenderablePoint pt;
+            pt.position = XMFLOAT3(tx, 1.5f, tz);
+            pt.size = 8.0f;
+            pt.color = XMFLOAT4(1.0f, 0.2f, 0.2f, 1.0f);
+            wi::renderer::DrawPoint(pt);
+
+            // Highlight box around selected agent
+            wi::renderer::RenderablePoint agentPt;
+            agentPt.position = XMFLOAT3(ax, 1.5f, az);
+            agentPt.size = 8.0f;
+            agentPt.color = XMFLOAT4(0.0f, 1.0f, 1.0f, 1.0f);
+            wi::renderer::DrawPoint(agentPt);
+        }
+
+        // ---- Draw car selection visuals ----
+        if (selectedCar >= 0 && static_cast<uint32_t>(selectedCar) < cars.GetCarCount())
+        {
+            uint32_t ci = static_cast<uint32_t>(selectedCar);
+            float cx = cars.GetPosX(ci);
+            float cz = cars.GetPosZ(ci);
+
+            // Draw route: lines through remaining waypoints
+            uint8_t wpCurr  = cars.GetWpCurr(ci);
+            uint8_t wpCount = cars.GetWpCount(ci);
+            float prevX = cx, prevZ = cz;
+            for (uint8_t w = wpCurr; w < wpCount; ++w)
+            {
+                XMFLOAT2 wp = cars.GetWaypoint(ci, w);
+                wi::renderer::RenderableLine rl;
+                rl.start = XMFLOAT3(prevX, 1.5f, prevZ);
+                rl.end   = XMFLOAT3(wp.x, 1.5f, wp.y);
+                rl.color_start = XMFLOAT4(0.0f, 1.0f, 0.5f, 1.0f);
+                rl.color_end   = XMFLOAT4(1.0f, 0.5f, 0.0f, 1.0f);
+                wi::renderer::DrawLine(rl);
+                prevX = wp.x;
+                prevZ = wp.y;
+            }
+
+            // Destination marker
+            if (wpCount > 0)
+            {
+                XMFLOAT2 dest = cars.GetWaypoint(ci, wpCount - 1);
+                wi::renderer::RenderablePoint dp;
+                dp.position = XMFLOAT3(dest.x, 1.5f, dest.y);
+                dp.size = 10.0f;
+                dp.color = XMFLOAT4(1.0f, 0.5f, 0.0f, 1.0f);
+                wi::renderer::DrawPoint(dp);
+            }
+
+            // Highlight around car
+            wi::renderer::RenderablePoint cp;
+            cp.position = XMFLOAT3(cx, 1.0f, cz);
+            cp.size = 10.0f;
+            cp.color = XMFLOAT4(0.0f, 1.0f, 0.5f, 1.0f);
+            wi::renderer::DrawPoint(cp);
+
+            // ---- DEBUG: traffic light awareness ----
+            // Compute the car's current segment direction and scan for intersections
+            if (wpCurr < wpCount && cars.GetState(ci) == CarSystem::State::DRIVING)
+            {
+                XMFLOAT2 prev2 = (wpCurr > 0)
+                    ? cars.GetWaypoint(ci, wpCurr - 1)
+                    : XMFLOAT2{cx, cz};
+                XMFLOAT2 tgt   = cars.GetWaypoint(ci, wpCurr);
+                float sdx = tgt.x - prev2.x, sdz = tgt.y - prev2.y;
+                float slen = std::sqrt(sdx * sdx + sdz * sdz);
+                if (slen > 0.01f) { sdx /= slen; sdz /= slen; }
+
+                // Draw segment direction line (cyan arrow, 30m ahead)
+                wi::renderer::RenderableLine dirLine;
+                dirLine.start = XMFLOAT3(cx, 2.5f, cz);
+                dirLine.end   = XMFLOAT3(cx + sdx * 30.f, 2.5f, cz + sdz * 30.f);
+                dirLine.color_start = XMFLOAT4(0.f, 1.f, 1.f, 1.f);
+                dirLine.color_end   = XMFLOAT4(0.f, 0.5f, 1.f, 0.5f);
+                wi::renderer::DrawLine(dirLine);
+
+                // Check if car is currently in an intersection
+                int carGX, carGZ;
+                bool carOnGrid = city.WorldToGrid(cx, cz, carGX, carGZ);
+                bool carInIntersection = carOnGrid && trafficLights.IsIntersection(carGX, carGZ);
+
+                // Mark car's own cell
+                if (carOnGrid)
+                {
+                    XMFLOAT2 cellC = city.GridCellCenter(carGX, carGZ);
+                    float hcs = CityLayout::CELL_SIZE * 0.5f;
+                    XMFLOAT4 cellCol = carInIntersection
+                        ? XMFLOAT4(1.f, 0.f, 1.f, 0.6f)   // magenta = in intersection
+                        : XMFLOAT4(0.f, 0.6f, 0.6f, 0.4f); // teal = normal cell
+                    wi::renderer::RenderableLine cl;
+                    cl.color_start = cl.color_end = cellCol;
+                    float ax0 = cellC.x-hcs, ax1 = cellC.x+hcs;
+                    float az0 = cellC.y-hcs, az1 = cellC.y+hcs;
+                    cl.start={ax0,0.5f,az0}; cl.end={ax1,0.5f,az0}; wi::renderer::DrawLine(cl);
+                    cl.start={ax1,0.5f,az0}; cl.end={ax1,0.5f,az1}; wi::renderer::DrawLine(cl);
+                    cl.start={ax1,0.5f,az1}; cl.end={ax0,0.5f,az1}; wi::renderer::DrawLine(cl);
+                    cl.start={ax0,0.5f,az1}; cl.end={ax0,0.5f,az0}; wi::renderer::DrawLine(cl);
+                }
+
+                // Scan cells ahead and mark intersections with light color
+                if (carOnGrid && !carInIntersection)
+                {
+                    constexpr float HALF_CS = CityLayout::CELL_SIZE * 0.5f;
+                    int prevSGX = carGX, prevSGZ = carGZ;
+                    float segFwd2 = (cx - prev2.x)*sdx + (cz - prev2.y)*sdz;
+                    float scanMax2 = std::min(80.f, slen - segFwd2 + 20.f);
+                    for (float dd = HALF_CS; dd < scanMax2; dd += HALF_CS)
+                    {
+                        float sx = cx + sdx * dd;
+                        float sz = cz + sdz * dd;
+                        int sgx, sgz;
+                        if (!city.WorldToGrid(sx, sz, sgx, sgz)) continue;
+                        if (sgx == prevSGX && sgz == prevSGZ) continue;
+                        prevSGX = sgx; prevSGZ = sgz;
+
+                        if (!trafficLights.IsIntersection(sgx, sgz)) continue;
+
+                        auto lc = trafficLights.GetLight(sgx, sgz, sdx, sdz);
+                        XMFLOAT4 lcol;
+                        switch (lc)
+                        {
+                        case TrafficLightSystem::LightColor::GREEN:
+                            lcol = {0.f, 1.f, 0.f, 0.8f}; break;
+                        case TrafficLightSystem::LightColor::YELLOW:
+                            lcol = {1.f, 1.f, 0.f, 0.8f}; break;
+                        case TrafficLightSystem::LightColor::RED:
+                            lcol = {1.f, 0.f, 0.f, 0.8f}; break;
+                        }
+
+                        // Draw thick outline around detected intersection cell
+                        XMFLOAT2 ic = city.GridCellCenter(sgx, sgz);
+                        float hcs = CityLayout::CELL_SIZE * 0.5f;
+                        wi::renderer::RenderableLine il;
+                        il.color_start = il.color_end = lcol;
+                        float ix0 = ic.x-hcs, ix1 = ic.x+hcs;
+                        float iz0 = ic.y-hcs, iz1 = ic.y+hcs;
+                        // Bottom
+                        il.start={ix0,0.3f,iz0}; il.end={ix1,0.3f,iz0}; wi::renderer::DrawLine(il);
+                        il.start={ix1,0.3f,iz0}; il.end={ix1,0.3f,iz1}; wi::renderer::DrawLine(il);
+                        il.start={ix1,0.3f,iz1}; il.end={ix0,0.3f,iz1}; wi::renderer::DrawLine(il);
+                        il.start={ix0,0.3f,iz1}; il.end={ix0,0.3f,iz0}; wi::renderer::DrawLine(il);
+                        // Top
+                        il.start={ix0,3.f,iz0}; il.end={ix1,3.f,iz0}; wi::renderer::DrawLine(il);
+                        il.start={ix1,3.f,iz0}; il.end={ix1,3.f,iz1}; wi::renderer::DrawLine(il);
+                        il.start={ix1,3.f,iz1}; il.end={ix0,3.f,iz1}; wi::renderer::DrawLine(il);
+                        il.start={ix0,3.f,iz1}; il.end={ix0,3.f,iz0}; wi::renderer::DrawLine(il);
+                        // Verticals
+                        il.start={ix0,0.3f,iz0}; il.end={ix0,3.f,iz0}; wi::renderer::DrawLine(il);
+                        il.start={ix1,0.3f,iz0}; il.end={ix1,3.f,iz0}; wi::renderer::DrawLine(il);
+                        il.start={ix1,0.3f,iz1}; il.end={ix1,3.f,iz1}; wi::renderer::DrawLine(il);
+                        il.start={ix0,0.3f,iz1}; il.end={ix0,3.f,iz1}; wi::renderer::DrawLine(il);
+                    }
+                }
+            }
+        }
+
+        if (dt > 1e-6f)
+            displayFPS = displayFPS * 0.9f + (1.0f / dt) * 0.1f;
+    }
+
+    // -- Build helpers --
+    // Returns true if people were spawned/assigned for this house
+    bool TrySpawnFromHouse(int hGX, int hGZ)
+    {
+        for (int wz = 0; wz < CityLayout::GRID_SIZE; ++wz)
+        for (int wx = 0; wx < CityLayout::GRID_SIZE; ++wx)
+        {
+            if (city.GetCellType(wx, wz) == CityLayout::CellType::WORKPLACE)
+            {
+                if (!city.WorkplaceHasRoom(wx, wz)) continue;
+
+                auto path = city.FindPath(hGX, hGZ, wx, wz);
+                if ((int)path.size() < 2) continue;
+
+                int workers = 0;
+                if ((int)path.size() > CAR_HOP_THRESHOLD)
+                {
+                    uint32_t seed = (uint32_t)(hGX * 37 + hGZ * 19 + wx * 7 + wz * 3);
+                    for (int c = 0; c < 3; ++c)
+                        cars.SpawnCar(path, seed + (uint32_t)c);
+                    workers = 3;
+                }
+                else
+                {
+                    uint32_t seed = (uint32_t)(hGX * 37 + hGZ * 19 + wx * 7 + wz * 3);
+                    for (int c = 0; c < 5; ++c)
+                        cars.SpawnCar(path, seed + (uint32_t)c);
+                    workers = 5;
+                }
+                city.AddWorkers(wx, wz, workers);
+                city.AddHousePop(hGX, hGZ, workers);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Spawn a single new worker from a house (for reproduction)
+    void TrySpawnOneWorker(int hGX, int hGZ)
+    {
+        for (int wz = 0; wz < CityLayout::GRID_SIZE; ++wz)
+        for (int wx = 0; wx < CityLayout::GRID_SIZE; ++wx)
+        {
+            if (city.GetCellType(wx, wz) != CityLayout::CellType::WORKPLACE) continue;
+            if (!city.WorkplaceHasRoom(wx, wz)) continue;
+
+            auto path = city.FindPath(hGX, hGZ, wx, wz);
+            if ((int)path.size() < 2) continue;
+
+            {
+                uint32_t seed = (uint32_t)(hGX * 37 + hGZ * 19 + wx * 7 + wz * 3 + city.GetHousePop(hGX, hGZ));
+                cars.SpawnCar(path, seed);
+            }
+            city.AddWorkers(wx, wz, 1);
+            return;
+        }
+    }
+
+    // Called when roads or a workplace is placed – try all unspawned houses
+    void TrySpawnAllUnspawnedHouses()
+    {
+        for (int gz = 0; gz < CityLayout::GRID_SIZE; ++gz)
+        for (int gx = 0; gx < CityLayout::GRID_SIZE; ++gx)
+        {
+            int idx = gz * CityLayout::GRID_SIZE + gx;
+            if (!houseHasSpawned[idx] &&
+                city.GetCellType(gx, gz) == CityLayout::CellType::HOUSE)
+            {
+                if (TrySpawnFromHouse(gx, gz))
+                    houseHasSpawned[idx] = true;
+            }
+        }
+    }
+
+    // Compute shortest road path between two grid cells using Dijkstra.
+    // Prefers existing road cells (cost 1) over empty cells (cost 3).
+    // Blocked by building cells. Returns grid (gx,gz) pairs inclusive.
+    static std::vector<std::pair<int,int>> ComputeRoadPreviewPath(
+        int x0, int z0, int x1, int z1, const CityLayout& layout)
+    {
+        constexpr int GS = CityLayout::GRID_SIZE;
+        const int ddx[] = { 1,-1, 0, 0 };
+        const int ddz[] = { 0, 0, 1,-1 };
+
+        std::vector<int>  dist(GS * GS, INT32_MAX);
+        std::vector<int>  from(GS * GS, -1);
+        using PQ = std::priority_queue<std::pair<int,int>,
+                   std::vector<std::pair<int,int>>,
+                   std::greater<std::pair<int,int>>>;
+        PQ pq;
+        int srcId = z0 * GS + x0;
+        int dstId = z1 * GS + x1;
+        dist[srcId] = 0;
+        from[srcId] = srcId;
+        pq.push({0, srcId});
+        bool found = (srcId == dstId);
+
+        while (!pq.empty() && !found)
+        {
+            auto [d, cur] = pq.top(); pq.pop();
+            if (d > dist[cur]) continue;
+            int cx = cur % GS, cz = cur / GS;
+            for (int dir = 0; dir < 4; ++dir)
+            {
+                int nx = cx + ddx[dir], nz = cz + ddz[dir];
+                if (nx < 0 || nx >= GS || nz < 0 || nz >= GS) continue;
+                int nid = nz * GS + nx;
+                auto ct = layout.GetCellType(nx, nz);
+                bool blocked = (ct == CityLayout::CellType::HOUSE  ||
+                                ct == CityLayout::CellType::WORKPLACE ||
+                                ct == CityLayout::CellType::PARKING);
+                if (blocked) continue;
+                int cost = (ct == CityLayout::CellType::ROAD ||
+                            ct == CityLayout::CellType::CROSSWALK) ? 1 : 3;
+                int nd = dist[cur] + cost;
+                if (nd < dist[nid])
+                {
+                    dist[nid] = nd;
+                    from[nid] = cur;
+                    if (nid == dstId) { found = true; break; }
+                    pq.push({nd, nid});
+                }
+            }
+        }
+
+        if (!found) return {};
+
+        std::vector<std::pair<int,int>> path;
+        for (int cur = dstId; cur != srcId; cur = from[cur])
+            path.push_back({cur % GS, cur / GS});
+        path.push_back({x0, z0});
+        std::reverse(path.begin(), path.end());
+        return path;
+    }
+
+    void DrawBuildGrid()
+    {
+        static constexpr float hw = CityLayout::HALF_WORLD;
+        static constexpr float cs = CityLayout::CELL_SIZE;
+        static constexpr float Y  = 0.30f;
+
+        wi::renderer::RenderableLine ln;
+        ln.color_start = ln.color_end = XMFLOAT4(0.30f, 0.80f, 0.30f, 0.28f);
+        for (int i = 0; i <= CityLayout::GRID_SIZE; ++i)
+        {
+            float w = -hw + i * cs;
+            ln.start = XMFLOAT3(w, Y, -hw); ln.end = XMFLOAT3(w, Y,  hw);
+            wi::renderer::DrawLine(ln);
+            ln.start = XMFLOAT3(-hw, Y, w);  ln.end = XMFLOAT3( hw, Y,  w);
+            wi::renderer::DrawLine(ln);
+        }
+        if (hoverValid)
+        {
+            XMFLOAT2 c = city.GridCellCenter(hoverGX, hoverGZ);
+            float h = cs * 0.5f;
+            XMFLOAT4 col;
+            switch (placeTool)
+            {
+            case 0:  col = {0.4f, 0.4f, 1.0f, 1.0f}; break; // road
+            case 1:  col = {1.0f, 0.5f, 0.1f, 1.0f}; break; // house
+            case 2:  col = {0.2f, 0.5f, 1.0f, 1.0f}; break; // workplace
+            case 3:  col = {0.2f, 0.8f, 0.2f, 1.0f}; break; // tree
+            case 4:  col = {0.9f, 0.9f, 0.4f, 1.0f}; break; // crosswalk
+            case 5:  col = {0.55f, 0.53f, 0.75f, 1.0f}; break; // parking
+            default: col = {1.0f, 1.0f, 1.0f, 1.0f}; break;
+            }
+            wi::renderer::RenderableLine bl;
+            bl.color_start = bl.color_end = col;
+            float fx0 = c.x-h, fx1 = c.x+h, fz0 = c.y-h, fz1 = c.y+h;
+
+            // --- Road tool: draw semi-transparent preview path ---
+            if (placeTool == 0 && roadPlaceActive && !roadPreviewPath.empty())
+            {
+                // Draw start cell marker (bright)
+                XMFLOAT2 sc = city.GridCellCenter(roadStartGX, roadStartGZ);
+                wi::renderer::RenderableLine sl;
+                sl.color_start = sl.color_end = XMFLOAT4(0.2f, 1.0f, 0.2f, 1.0f);
+                float sx0 = sc.x-h, sx1 = sc.x+h, sz0 = sc.y-h, sz1 = sc.y+h;
+                sl.start={sx0,Y+.15f,sz0}; sl.end={sx1,Y+.15f,sz0}; wi::renderer::DrawLine(sl);
+                sl.start={sx1,Y+.15f,sz0}; sl.end={sx1,Y+.15f,sz1}; wi::renderer::DrawLine(sl);
+                sl.start={sx1,Y+.15f,sz1}; sl.end={sx0,Y+.15f,sz1}; wi::renderer::DrawLine(sl);
+                sl.start={sx0,Y+.15f,sz1}; sl.end={sx0,Y+.15f,sz0}; wi::renderer::DrawLine(sl);
+
+                // Draw each preview cell as semi-transparent outline
+                for (auto& [pgx, pgz] : roadPreviewPath)
+                {
+                    XMFLOAT2 pc = city.GridCellCenter(pgx, pgz);
+                    bool existing = (city.GetCellType(pgx, pgz) == CellType::ROAD ||
+                                     city.GetCellType(pgx, pgz) == CellType::CROSSWALK);
+                    // Existing road: cyan; new road: semi-transparent blue
+                    XMFLOAT4 pcol = existing
+                        ? XMFLOAT4(0.2f, 0.9f, 0.9f, 0.65f)
+                        : XMFLOAT4(0.35f, 0.45f, 1.0f, 0.55f);
+                    wi::renderer::RenderableLine pl;
+                    pl.color_start = pl.color_end = pcol;
+                    float px0 = pc.x-h, px1 = pc.x+h, pz0 = pc.y-h, pz1 = pc.y+h;
+                    pl.start={px0,Y+.12f,pz0}; pl.end={px1,Y+.12f,pz0}; wi::renderer::DrawLine(pl);
+                    pl.start={px1,Y+.12f,pz0}; pl.end={px1,Y+.12f,pz1}; wi::renderer::DrawLine(pl);
+                    pl.start={px1,Y+.12f,pz1}; pl.end={px0,Y+.12f,pz1}; wi::renderer::DrawLine(pl);
+                    pl.start={px0,Y+.12f,pz1}; pl.end={px0,Y+.12f,pz0}; wi::renderer::DrawLine(pl);
+                }
+            }
+            else if (placeTool == 4 && city.GetCellType(hoverGX, hoverGZ) == CellType::ROAD)
+            {
+                // Crosswalk preview: thin band (1/3 of tile)
+                float bandH = h / 3.0f;
+                bool hasE = city.IsRoadLike(hoverGX+1, hoverGZ);
+                bool hasW = city.IsRoadLike(hoverGX-1, hoverGZ);
+                bool hasN = city.IsRoadLike(hoverGX, hoverGZ-1);
+                bool hasS = city.IsRoadLike(hoverGX, hoverGZ+1);
+                bool goesEW = (hasE || hasW) && !(hasN || hasS);
+
+                float bx0, bx1, bz0, bz1;
+                if (goesEW) {
+                    bx0 = c.x - bandH; bx1 = c.x + bandH;
+                    bz0 = c.y - h;     bz1 = c.y + h;
+                } else {
+                    bx0 = c.x - h;     bx1 = c.x + h;
+                    bz0 = c.y - bandH; bz1 = c.y + bandH;
+                }
+                bl.start={bx0,Y+.10f,bz0}; bl.end={bx1,Y+.10f,bz0}; wi::renderer::DrawLine(bl);
+                bl.start={bx1,Y+.10f,bz0}; bl.end={bx1,Y+.10f,bz1}; wi::renderer::DrawLine(bl);
+                bl.start={bx1,Y+.10f,bz1}; bl.end={bx0,Y+.10f,bz1}; wi::renderer::DrawLine(bl);
+                bl.start={bx0,Y+.10f,bz1}; bl.end={bx0,Y+.10f,bz0}; wi::renderer::DrawLine(bl);
+            }
+            else
+            {
+                // Default: single cell outline at hover
+                bl.start={fx0,Y+.05f,fz0}; bl.end={fx1,Y+.05f,fz0}; wi::renderer::DrawLine(bl);
+                bl.start={fx1,Y+.05f,fz0}; bl.end={fx1,Y+.05f,fz1}; wi::renderer::DrawLine(bl);
+                bl.start={fx1,Y+.05f,fz1}; bl.end={fx0,Y+.05f,fz1}; wi::renderer::DrawLine(bl);
+                bl.start={fx0,Y+.05f,fz1}; bl.end={fx0,Y+.05f,fz0}; wi::renderer::DrawLine(bl);
+            }
+        }
+    }
+
+    void Compose(wi::graphics::CommandList cmd) const override
+    {
+        wi::RenderPath3D::Compose(cmd);
+
+        const uint32_t threads  = crowd.GetThreadCount();
+        const size_t   rendered = crowd.GetRenderedCount();
+        const uint32_t active   = crowd.GetAgentCount();
+
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(1)
+            << "FPS          : " << displayFPS << "\n"
+            << "CPU Threads  : " << threads    << "\n"
+            << "Walkers      : " << active << "\n"
+            << "Car drivers  : " << cars.GetCarCount() << "\n"
+            << "Rendered     : " << rendered   << "\n"
+            << "Treasury  $  : " << static_cast<int>(townTreasury) << "\n"
+            << "Time         : " << std::setfill('0') << std::setw(2) << (int)(timeOfDay * 24.0f) << ":"
+            << std::setw(2) << (int)(std::fmod(timeOfDay * 24.0f * 60.0f, 60.0f)) << std::setfill(' ') << "\n"
+            << "\n"
+            << "[WASD]        Move\n"
+            << "[RMB + Mouse] Look around\n"
+            << "[Q / E]       Down / Up\n"
+            << "[Shift]       Sprint\n"
+            << "[Scroll]      Speed: " << static_cast<int>(moveSpeed) << " u/s\n"
+            << "[B]           Build Mode: " << (buildModeEnabled ? "ON" : "OFF") << "\n"
+            << "[F5]          Save  |  [F9] Load";
+        if (buildModeEnabled)
+        {
+            if (placeTool == 0)
+            {
+                if (roadPlaceActive)
+                    oss << "\n[LMB]         Click END point  |  [RMB] Cancel";
+                else
+                    oss << "\n[LMB]         Click START point";
+            }
+            else
+                oss << "\n[LMB drag]    Place selected tile";
+            oss << "\n[1-7]         Sim speed: " << simSpeed << "x";
+
+            // ---- Build panel (right side) ----
+            const float px   = (float)this->width - 215.0f;
+            const float btnY[6] = { 145.0f, 215.0f, 285.0f, 355.0f, 425.0f, 495.0f };
+            const float btnH = 55.0f, btnW = 205.0f;
+            struct BtnDef { const char* label; XMFLOAT4 col; };
+            BtnDef btns[6] = {
+                { "  Road",       {0.40f,0.40f,1.00f,1.0f} },
+                { "  House",      {1.00f,0.50f,0.10f,1.0f} },
+                { "  Workplace",  {0.20f,0.55f,1.00f,1.0f} },
+                { "  Tree",       {0.20f,0.80f,0.20f,1.0f} },
+                { "  Crosswalk",  {0.90f,0.90f,0.40f,1.0f} },
+                { "  Parking",    {0.55f,0.53f,0.75f,1.0f} },
+            };
+
+            // Panel title
+            wi::font::Params title;
+            title.posX  = px;
+            title.posY  = 108.0f;
+            title.size  = 22;
+            title.color = wi::Color(220, 220, 220, 230);
+            wi::font::Draw("BUILD TOOLS", title, cmd);
+
+            for (int k = 0; k < 6; ++k)
+            {
+                bool sel = (placeTool == k);
+
+                // Button background
+                wi::image::Params bg;
+                bg.pos  = XMFLOAT3(px - 5.0f, btnY[k], 0.0f);
+                bg.siz  = XMFLOAT2(btnW, btnH);
+                bg.color = sel
+                    ? XMFLOAT4(btns[k].col.x*0.6f, btns[k].col.y*0.6f, btns[k].col.z*0.6f, 0.90f)
+                    : XMFLOAT4(0.08f, 0.08f, 0.12f, 0.75f);
+                wi::image::Draw(nullptr, bg, cmd);
+
+                // Selection bar on left edge
+                if (sel)
+                {
+                    wi::image::Params bar;
+                    bar.pos  = XMFLOAT3(px - 5.0f, btnY[k], 0.0f);
+                    bar.siz  = XMFLOAT2(5.0f, btnH);
+                    bar.color = btns[k].col;
+                    wi::image::Draw(nullptr, bar, cmd);
+                }
+
+                // Label
+                wi::font::Params fp;
+                fp.posX  = px + 12.0f;
+                fp.posY  = btnY[k] + 13.0f;
+                fp.size  = 26;
+                fp.color = sel
+                    ? wi::Color(255, 240, 80,  255)
+                    : wi::Color(
+                        static_cast<uint8_t>(btns[k].col.x * 220 + 35),
+                        static_cast<uint8_t>(btns[k].col.y * 220 + 35),
+                        static_cast<uint8_t>(btns[k].col.z * 220 + 35),
+                        200);
+                wi::font::Draw(btns[k].label, fp, cmd);
+            }
+
+            // Hover cell info below buttons
+            wi::font::Params hfp;
+            hfp.posX  = px;
+            hfp.posY  = 500.0f + 65.0f;
+            hfp.size  = 18;
+            hfp.color = wi::Color(180, 180, 180, 180);
+            if (hoverValid)
+            {
+                std::ostringstream hov;
+                hov << "Cell (" << hoverGX << ", " << hoverGZ << ")";
+                auto hct = city.GetCellType(hoverGX, hoverGZ);
+                if (hct == CellType::ROAD || hct == CellType::CROSSWALK)
+                    hov << "  [" << city.GetRoadLanes(hoverGX, hoverGZ) << "-lane]  MMB cycle";
+                wi::font::Draw(hov.str(), hfp, cmd);
+            }
+            else
+            {
+                wi::font::Draw("Hover over world", hfp, cmd);
+            }
+        }
+        else
+        {
+            oss << "\n[1-6]         Sim speed: " << simSpeed << "x";
+        }
+
+        // Selected agent info panel
+        if (selectedAgent >= 0 && static_cast<uint32_t>(selectedAgent) < crowd.GetAgentCount())
+        {
+            uint32_t ai = static_cast<uint32_t>(selectedAgent);
+            float ax  = crowd.GetPosX(ai);
+            float az  = crowd.GetPosZ(ai);
+            float tx  = crowd.GetTargetX(ai);
+            float tz  = crowd.GetTargetZ(ai);
+            float sp  = crowd.GetSpeed(ai);
+            float ddx = tx - ax, ddz = tz - az;
+            float dist = std::sqrt(ddx*ddx + ddz*ddz);
+
+            std::ostringstream sel;
+            sel << std::fixed << std::setprecision(1)
+                << "\n\n┌───── RESIDENT ─────┐\n"
+                << "| " << crowd.GetName(ai) << "\n"
+                << "| Age:      " << (int)crowd.GetAge(ai) << "\n"
+                << "| Activity: " << crowd.GetActivity(ai) << "\n"
+                << "| Wage:     $" << std::setprecision(2) << crowd.GetWage(ai) << "/s\n"
+                << "| Savings:  $" << static_cast<int>(crowd.GetMoney(ai)) << "\n"
+                << "| Speed:    " << std::setprecision(1) << sp << " m/s\n"
+                << "| Dist:     " << dist << " m\n"
+                << "| ETA:      " << (sp > 0.01f ? dist / sp : 0.0f) << " s\n"
+                << "└─────────────────┘";
+            oss << sel.str();
+        }
+        else if (selectedCar >= 0 && static_cast<uint32_t>(selectedCar) < cars.GetCarCount())
+        {
+            uint32_t ci = static_cast<uint32_t>(selectedCar);
+            auto st = cars.GetState(ci);
+            float spd = cars.GetSpeed(ci);
+            uint8_t wpCurr  = cars.GetWpCurr(ci);
+            uint8_t wpCount = cars.GetWpCount(ci);
+
+            std::ostringstream sel;
+            sel << std::fixed << std::setprecision(1)
+                << "\n\n┌────── CAR " << ci << " ──────┐\n"
+                << "| State:    " << CarSystem::StateStr(st) << "\n"
+                << "| Dir:      " << (cars.GetCarDir(ci) == 0 ? "To work" : "To home") << "\n"
+                << "| Speed:    " << spd << " m/s (" << std::setprecision(0) << (spd * 3.6f) << " km/h)\n"
+                << "| Waypoint: " << (int)wpCurr << "/" << (int)wpCount << "\n"
+                << "| Lane:     " << std::setprecision(1) << cars.GetLaneOff(ci) << "\n"
+                << "| Savings:  $" << std::setprecision(0) << cars.GetMoney(ci) << "\n";
+
+            // Debug: show traffic light status for next intersection
+            if (st == CarSystem::State::DRIVING && wpCurr < wpCount)
+            {
+                float px = cars.GetPosX(ci), pz = cars.GetPosZ(ci);
+                XMFLOAT2 prev2 = (wpCurr > 0)
+                    ? cars.GetWaypoint(ci, wpCurr - 1)
+                    : XMFLOAT2{px, pz};
+                XMFLOAT2 tgt = cars.GetWaypoint(ci, wpCurr);
+                float sdx2 = tgt.x - prev2.x, sdz2 = tgt.y - prev2.y;
+                float slen2 = std::sqrt(sdx2*sdx2 + sdz2*sdz2);
+                if (slen2 > 0.01f) { sdx2 /= slen2; sdz2 /= slen2; }
+
+                int cGX, cGZ;
+                bool cGrid = city.WorldToGrid(px, pz, cGX, cGZ);
+                bool cInInt = cGrid && trafficLights.IsIntersection(cGX, cGZ);
+
+                sel << "| Cell:     (" << (cGrid ? cGX : -1) << "," << (cGrid ? cGZ : -1) << ")"
+                    << (cInInt ? " [IN ISEC]" : "") << "\n";
+                sel << "| SegDir:   (" << std::setprecision(2) << sdx2 << "," << sdz2 << ")\n";
+
+                // Report nearest intersection ahead
+                if (cGrid && !cInInt)
+                {
+                    constexpr float HCS = CityLayout::CELL_SIZE * 0.5f;
+                    int psgx = cGX, psgz = cGZ;
+                    float sf = (px - prev2.x)*sdx2 + (pz - prev2.y)*sdz2;
+                    float sm = std::min(80.f, slen2 - sf + 20.f);
+                    for (float dd2 = HCS; dd2 < sm; dd2 += HCS)
+                    {
+                        int sx2, sz2;
+                        if (!city.WorldToGrid(px+sdx2*dd2, pz+sdz2*dd2, sx2, sz2)) continue;
+                        if (sx2 == psgx && sz2 == psgz) continue;
+                        psgx = sx2; psgz = sz2;
+                        if (!trafficLights.IsIntersection(sx2, sz2)) continue;
+                        auto lc2 = trafficLights.GetLight(sx2, sz2, sdx2, sdz2);
+                        const char* lcStr = (lc2 == TrafficLightSystem::LightColor::GREEN) ? "GREEN"
+                                          : (lc2 == TrafficLightSystem::LightColor::YELLOW) ? "YELLOW"
+                                          : "RED";
+                        sel << "| Light@(" << sx2 << "," << sz2 << "): "
+                            << lcStr << " d=" << std::setprecision(0) << dd2 << "m\n";
+                        break; // show nearest only
+                    }
+                }
+                else if (cInInt)
+                {
+                    sel << "| (inside intersection)\n";
+                }
+                else
+                {
+                    sel << "| (off-grid)\n";
+                }
+            }
+            sel << "└──────────────────┘";
+            oss << sel.str();
+        }
+        else
+        {
+            oss << "\n\n[LMB] Click any agent or car to inspect";
+        }
+
+        {
+            wi::font::Params shadow;
+            shadow.posX  = 12.5f;  shadow.posY  = 12.5f;
+            shadow.size  = 22;
+            shadow.color = wi::Color(0, 0, 0, 180);
+            wi::font::Draw(oss.str(), shadow, cmd);
+        }
+        {
+            wi::font::Params fp;
+            fp.posX  = 10.0f;  fp.posY  = 10.0f;
+            fp.size  = 22;
+            fp.color = wi::Color(240, 240, 60, 255);
+            wi::font::Draw(oss.str(), fp, cmd);
+        }
+    }
+
+};
+
+
+// ============================================================
+//  CrowdApp
+// ============================================================
+class CrowdApp : public wi::Application
+{
+    CrowdRenderPath renderPath;
+
+public:
+    void Initialize() override
+    {
+        wi::Application::Initialize();
+        setFrameRateLock(false);
+        wi::eventhandler::SetVSync(false);  // disable VSync for uncapped FPS
+        ActivatePath(&renderPath);
+    }
+};
+
+// ============================================================
+//  Win32 plumbing
+// ============================================================
+static CrowdApp g_app;
+
+LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+    // Resize / DPI: re-supply the window so WickedEngine rebuilds the swapchain
+    case WM_SIZE:
+    case WM_DPICHANGED:
+        if (g_app.is_window_active)
+            g_app.SetWindow(hWnd);
+        break;
+
+    // Text input forwarding (text fields in WickedEngine GUI)
+    case WM_CHAR:
+        switch (wParam)
+        {
+        case VK_BACK:
+            wi::gui::TextInputField::DeleteFromInput();
+            break;
+        default:
+        {
+            const wchar_t c = static_cast<wchar_t>(wParam);
+            wi::gui::TextInputField::AddInput(c);
+        }
+        break;
+        }
+        break;
+
+    // Raw input: required for wi::input key/mouse polling
+    case WM_INPUT:
+        wi::input::rawinput::ParseMessage(reinterpret_cast<void*>(lParam));
+        break;
+
+    case WM_SETFOCUS:
+        g_app.is_window_active = true;
+        break;
+    case WM_KILLFOCUS:
+        g_app.is_window_active = false;
+        wi::input::HidePointer(false);  // show cursor when focus lost
+        break;
+
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        break;
+
+    default:
+        return DefWindowProc(hWnd, msg, wParam, lParam);
+    }
+    return 0;
+}
+
+int WINAPI wWinMain(
+    HINSTANCE hInstance,
+    HINSTANCE /*hPrevInstance*/,
+    LPWSTR    lpCmdLine,
+    int       nCmdShow)
+{
+    wi::arguments::Parse(lpCmdLine);
+
+    // Opt in to per-monitor DPI scaling (matches the template)
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    // ---- Register window class ----
+    WNDCLASSEXW wc{};
+    wc.cbSize        = sizeof(wc);
+    wc.style         = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc   = WndProc;
+    wc.hInstance     = hInstance;
+    wc.hIcon         = LoadIcon(nullptr, IDI_APPLICATION);
+    wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOWFRAME);
+    wc.lpszClassName = L"CrowdSimClass";
+    RegisterClassExW(&wc);
+
+    // ---- Create window (1920 × 1080) ----
+    RECT rc{ 0, 0, 1920, 1080 };
+    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+
+    HWND hWnd = CreateWindowExW(
+        0,
+        L"CrowdSimClass",
+        L"Crowd Simulation  \u2013  Wicked Engine  (100k Agents | C++20)",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT,
+        rc.right  - rc.left,
+        rc.bottom - rc.top,
+        nullptr, nullptr,
+        hInstance, nullptr
+    );
+
+    if (!hWnd)
+    {
+        MessageBoxW(nullptr, L"Failed to create window.", L"Error", MB_ICONERROR);
+        return -1;
+    }
+
+    // SetWindow creates the swap-chain; call it before Show so the device exists.
+    // Do NOT call Initialize() here – let Run() call it on the first iteration
+    // AFTER ShowWindow has triggered WM_SIZE with the final window dimensions.
+    g_app.SetWindow(hWnd);
+
+    ShowWindow(hWnd, nCmdShow);
+    UpdateWindow(hWnd);
+
+    // ---- Message / render loop ----
+    MSG msg{};
+    while (msg.message != WM_QUIT)
+    {
+        if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE))
+        {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        else
+        {
+            g_app.Run();
+        }
+    }
+
+    wi::jobsystem::ShutDown();  // wait for outstanding jobs before DLL unload
+    return static_cast<int>(msg.wParam);
+}
