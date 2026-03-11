@@ -98,7 +98,7 @@ WickedEngine itself bundles its own dependencies (DirectX 12, Jolt Physics, LUA,
 
 ```powershell
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/CrowdSim.git
+git clone https://github.com/VenomEddieVenom/CrowdSim.git
 cd CrowdSim
 
 # Configure (first time takes a while — downloads WickedEngine)
