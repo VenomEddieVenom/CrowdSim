@@ -10,9 +10,9 @@
 // ============================================================
 
 #include "WickedEngine.h"
-#include "CrowdSystem.h"
 #include "CityLayout.h"
 #include "CarSystem.h"
+#include "CrowdSystem.h"
 #include "TrafficLightSystem.h"
 
 #include <string>
@@ -30,9 +30,9 @@
 class CrowdRenderPath : public wi::RenderPath3D
 {
 public:
-    CrowdSystem crowd;
     CityLayout  city;
     CarSystem   cars;
+    CrowdSystem crowd;
     TrafficLightSystem trafficLights;
 
     // distance threshold: >CAR_HOP_THRESHOLD road cells → use car
@@ -52,7 +52,7 @@ public:
 
     // Economy
     float townTreasury  = 0.0f;
-    static constexpr float TAX_RATE = 0.10f;   // passed through to CrowdSystem internally
+    static constexpr float TAX_RATE = 0.10f;
 
     // Spawn tracking – prevents double-spawning per house cell
     bool houseHasSpawned[CityLayout::GRID_SIZE * CityLayout::GRID_SIZE] = {};
@@ -120,6 +120,7 @@ public:
             city.PlaceCell(gx2, gz2, ct);
         }
         trafficLights.RebuildIntersections(city);
+        PlaceCrosswalksAroundIntersections();
         for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
         for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2) {
             int lanes = sd.roadLanes[gz2 * CityLayout::GRID_SIZE + gx2];
@@ -142,8 +143,8 @@ public:
     void Start() override
     {
         city.Initialize();
-        crowd.Initialize();
         cars.Initialize();
+        crowd.Initialize();
         trafficLights.Initialize();
 
         // ---- Camera: oblique overview of city centre ----
@@ -632,14 +633,15 @@ public:
             }
         }
 
-        // ---- Simulate cars + traffic lights + render ----
+        // ---- Simulate cars + traffic lights + pedestrians + render ----
         trafficLights.Update(dt * simSpeed);
         trafficLights.UpdateVisuals();
-        // crowd.Update(dt * simSpeed, cam.Eye, city);  // pedestrians disabled
-        cars.Update(dt * simSpeed, city, trafficLights, timeOfDay, dayDuration);
+        crowd.Update(dt * simSpeed, city, trafficLights);
+        auto pedView = crowd.GetView();
+        cars.Update(dt * simSpeed, city, trafficLights, timeOfDay, dayDuration, &pedView);
         townTreasury += cars.DrainTax();
-        // crowd.RenderSolidAgents(cam.Eye);  // pedestrians disabled
         cars.RenderCars(cam.Eye, city);
+        crowd.Render(cam.Eye);
 
         // ---- Reproduction: houses grow population over time ----
         reproTimer_ += dt * simSpeed;
@@ -710,25 +712,6 @@ public:
             // Check agents
             float bestAgentDist = 5.0f;
             int32_t bestAgentIdx = -1;
-            {
-                uint32_t visCount = crowd.GetVisibleCount();
-                for (uint32_t s = 0; s < visCount; ++s)
-                {
-                    uint32_t ai = crowd.GetVisibleAgentIndex(s);
-                    if (ai == UINT32_MAX) continue;
-                    XMVECTOR agentPos = XMVectorSet(crowd.GetPosX(ai), 0.9f, crowd.GetPosZ(ai), 1.0f);
-                    XMVECTOR toAgent = agentPos - rayOrigin;
-                    float t = XMVectorGetX(XMVector3Dot(toAgent, rayDir));
-                    if (t < 0.0f) continue;
-                    XMVECTOR closest = rayOrigin + rayDir * t;
-                    float dist = XMVectorGetX(XMVector3Length(closest - agentPos));
-                    if (dist < bestAgentDist)
-                    {
-                        bestAgentDist = dist;
-                        bestAgentIdx = static_cast<int32_t>(ai);
-                    }
-                }
-            }
 
             // Prefer cars (bigger), then agents
             if (bestCarIdx >= 0 && bestCarDist <= bestAgentDist)
@@ -746,37 +729,6 @@ public:
                 selectedCar = -1;
                 selectedAgent = -1;
             }
-        }
-
-        // ---- Draw selection visuals ----
-        if (selectedAgent >= 0 && static_cast<uint32_t>(selectedAgent) < crowd.GetAgentCount())
-        {
-            float ax = crowd.GetPosX(selectedAgent);
-            float az = crowd.GetPosZ(selectedAgent);
-            float tx = crowd.GetTargetX(selectedAgent);
-            float tz = crowd.GetTargetZ(selectedAgent);
-
-            // Line from agent to destination
-            wi::renderer::RenderableLine line;
-            line.start = XMFLOAT3(ax, 1.5f, az);
-            line.end   = XMFLOAT3(tx, 1.5f, tz);
-            line.color_start = XMFLOAT4(0.0f, 1.0f, 1.0f, 1.0f);
-            line.color_end   = XMFLOAT4(1.0f, 0.2f, 0.2f, 1.0f);
-            wi::renderer::DrawLine(line);
-
-            // Marker at destination
-            wi::renderer::RenderablePoint pt;
-            pt.position = XMFLOAT3(tx, 1.5f, tz);
-            pt.size = 8.0f;
-            pt.color = XMFLOAT4(1.0f, 0.2f, 0.2f, 1.0f);
-            wi::renderer::DrawPoint(pt);
-
-            // Highlight box around selected agent
-            wi::renderer::RenderablePoint agentPt;
-            agentPt.position = XMFLOAT3(ax, 1.5f, az);
-            agentPt.size = 8.0f;
-            agentPt.color = XMFLOAT4(0.0f, 1.0f, 1.0f, 1.0f);
-            wi::renderer::DrawPoint(agentPt);
         }
 
         // ---- Draw car selection visuals ----
@@ -946,9 +898,14 @@ public:
                     if (cars.SpawnCar(path, seed + (uint32_t)c) != UINT32_MAX)
                         ++workers;
                 }
-                if (workers == 0) continue; // no car got through – try another workplace
+                if (workers == 0) continue;
                 city.AddWorkers(wx, wz, workers);
                 city.AddHousePop(hGX, hGZ, workers);
+
+                // Spawn pedestrians (2 per house-workplace pair)
+                for (int p = 0; p < 2; ++p)
+                    crowd.SpawnPed(hGX, hGZ, wx, wz, city);
+
                 return true;
             }
         }
@@ -974,6 +931,49 @@ public:
             city.AddWorkers(wx, wz, 1);
             return;
         }
+    }
+
+    // Automatically place crosswalks on road cells adjacent to intersections.
+    // A crosswalk is placed 1 cell away from the intersection on each arm,
+    // but only on straight road segments (exactly 2 road-like neighbors).
+    void PlaceCrosswalksAroundIntersections()
+    {
+        constexpr int GS = CityLayout::GRID_SIZE;
+        const int ddx[] = { 1, -1, 0, 0 };
+        const int ddz[] = { 0, 0, 1, -1 };
+
+        // First pass: find intersections (road cells with 3+ road-like neighbors)
+        std::vector<bool> isIntersection(GS * GS, false);
+        for (int gz = 0; gz < GS; ++gz)
+        for (int gx = 0; gx < GS; ++gx) {
+            if (city.GetCellType(gx, gz) != CellType::ROAD) continue;
+            int rn = 0;
+            for (int d = 0; d < 4; ++d) {
+                if (city.IsRoadLike(gx + ddx[d], gz + ddz[d]))
+                    ++rn;
+            }
+            if (rn >= 3) isIntersection[gz * GS + gx] = true;
+        }
+
+        // Second pass: for each intersection, place crosswalks 1 cell out on each arm
+        for (int gz = 0; gz < GS; ++gz)
+        for (int gx = 0; gx < GS; ++gx) {
+            if (!isIntersection[gz * GS + gx]) continue;
+            for (int d = 0; d < 4; ++d) {
+                int nx = gx + ddx[d], nz = gz + ddz[d];
+                if (nx < 0 || nx >= GS || nz < 0 || nz >= GS) continue;
+                if (city.GetCellType(nx, nz) != CellType::ROAD) continue;
+                if (isIntersection[nz * GS + nx]) continue; // skip adjacent intersections
+                // Check it's a straight segment (exactly 2 road-like neighbors)
+                int rn2 = 0;
+                for (int d2 = 0; d2 < 4; ++d2)
+                    if (city.IsRoadLike(nx + ddx[d2], nz + ddz[d2]))
+                        ++rn2;
+                if (rn2 == 2)
+                    city.PlaceCell(nx, nz, CellType::CROSSWALK);
+            }
+        }
+        trafficLights.RebuildIntersections(city);
     }
 
     // Called when roads or a workplace is placed – try all unspawned houses
@@ -1158,17 +1158,15 @@ public:
     {
         wi::RenderPath3D::Compose(cmd);
 
-        const uint32_t threads  = crowd.GetThreadCount();
-        const size_t   rendered = crowd.GetRenderedCount();
-        const uint32_t active   = crowd.GetAgentCount();
+        const uint32_t threads  = wi::jobsystem::GetThreadCount();
 
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(1)
             << "FPS          : " << displayFPS << "\n"
             << "CPU Threads  : " << threads    << "\n"
-            << "Walkers      : " << active << "\n"
             << "Car drivers  : " << cars.GetCarCount() << "\n"
-            << "Rendered     : " << rendered   << "\n"
+            << "Pedestrians  : " << crowd.GetPedCount()
+               << " (walk:" << crowd.GetWalkingCount() << " wait:" << crowd.GetWaitingCount() << ")\n"
             << "Treasury  $  : " << static_cast<int>(townTreasury) << "\n"
             << "Time         : " << std::setfill('0') << std::setw(2) << (int)(timeOfDay * 24.0f) << ":"
             << std::setw(2) << (int)(std::fmod(timeOfDay * 24.0f * 60.0f, 60.0f)) << std::setfill(' ') << "\n"
@@ -1278,33 +1276,8 @@ public:
             oss << "\n[1-6]         Sim speed: " << simSpeed << "x";
         }
 
-        // Selected agent info panel
-        if (selectedAgent >= 0 && static_cast<uint32_t>(selectedAgent) < crowd.GetAgentCount())
-        {
-            uint32_t ai = static_cast<uint32_t>(selectedAgent);
-            float ax  = crowd.GetPosX(ai);
-            float az  = crowd.GetPosZ(ai);
-            float tx  = crowd.GetTargetX(ai);
-            float tz  = crowd.GetTargetZ(ai);
-            float sp  = crowd.GetSpeed(ai);
-            float ddx = tx - ax, ddz = tz - az;
-            float dist = std::sqrt(ddx*ddx + ddz*ddz);
-
-            std::ostringstream sel;
-            sel << std::fixed << std::setprecision(1)
-                << "\n\n┌───── RESIDENT ─────┐\n"
-                << "| " << crowd.GetName(ai) << "\n"
-                << "| Age:      " << (int)crowd.GetAge(ai) << "\n"
-                << "| Activity: " << crowd.GetActivity(ai) << "\n"
-                << "| Wage:     $" << std::setprecision(2) << crowd.GetWage(ai) << "/s\n"
-                << "| Savings:  $" << static_cast<int>(crowd.GetMoney(ai)) << "\n"
-                << "| Speed:    " << std::setprecision(1) << sp << " m/s\n"
-                << "| Dist:     " << dist << " m\n"
-                << "| ETA:      " << (sp > 0.01f ? dist / sp : 0.0f) << " s\n"
-                << "└─────────────────┘";
-            oss << sel.str();
-        }
-        else if (selectedCar >= 0 && static_cast<uint32_t>(selectedCar) < cars.GetCarCount())
+        // Selected entity info panel
+        if (selectedCar >= 0 && static_cast<uint32_t>(selectedCar) < cars.GetCarCount())
         {
             uint32_t ci = static_cast<uint32_t>(selectedCar);
             auto st = cars.GetState(ci);

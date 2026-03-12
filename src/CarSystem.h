@@ -5,6 +5,9 @@
 #include <vector>
 #include <unordered_map>
 
+// Forward-declared lightweight ped view (defined in CrowdSystem.h)
+struct PedestrianView;
+
 // ============================================================
 //  CarSystem  –  city traffic simulation
 //
@@ -63,7 +66,8 @@ public:
     // Returns car slot, or UINT32_MAX if at capacity / bad path
     uint32_t SpawnCar(const std::vector<XMFLOAT2>& roadPath, uint32_t colorSeed);
     void     Update(float dt, CityLayout& city, const TrafficLightSystem& lights,
-                    float timeOfDay = 0.5f, float dayDuration = 86400.0f);
+                    float timeOfDay = 0.5f, float dayDuration = 86400.0f,
+                    const PedestrianView* peds = nullptr);
     void     RenderCars(const XMFLOAT3& cameraPos, const CityLayout& city);
 
     uint32_t GetCarCount()        const { return activeCount; }

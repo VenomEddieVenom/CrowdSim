@@ -1,99 +1,98 @@
 #pragma once
-
 #include "WickedEngine.h"
-
+#include "CityLayout.h"
+#include "TrafficLightSystem.h"
 #include <vector>
-#include <atomic>
 #include <cstdint>
-#include <cmath>
-#include <string>
-
-class CityLayout; // forward declaration
 
 // ============================================================
-//  CrowdSystem  –  waypoint-following pedestrian crowd
+//  Lightweight ped-data view — passed to CarSystem for safety brake
+//  (avoids circular header dependency)
+// ============================================================
+struct PedestrianView {
+    const float*    posX   = nullptr;
+    const float*    posZ   = nullptr;
+    const uint8_t*  state  = nullptr;   // 0=idle, nonzero=active
+    uint32_t        count  = 0;
+    const uint32_t* cellHead = nullptr; // per-grid-cell linked-list head
+    const uint32_t* cellNext = nullptr; // per-ped next pointer
+};
+
+// ============================================================
+//  CrowdSystem — sidewalk-only pedestrian simulation
 //
-//  Agents are spawned with a world-space path (std::vector<XMFLOAT2>).
-//  They follow the path, then reverse direction to loop home↔work.
-//  Visible agents are rendered as solid cube instances.
+//  Pedestrians walk on sidewalks (±9 m from road centreline).
+//  They cross roads only at crosswalks and follow ped traffic lights.
+//  Pathfinding uses Dijkstra on road cells → sidewalk waypoints.
 // ============================================================
 class CrowdSystem
 {
 public:
-    static constexpr uint32_t MAX_AGENTS     = 50'000;
-    static constexpr uint32_t MAX_WAYPOINTS  = 64;
-    static constexpr float    LOD_NEAR       = 100.0f;
-    static constexpr float    LOD_MID        = 200.0f;
-    static constexpr float    LOD_FAR        = 600.0f;
-    static constexpr uint32_t JOB_GROUP_SIZE = 256;
-    static constexpr uint32_t MAX_VISIBLE    = 8'000;
+    static constexpr uint32_t MAX_PEDS      = 5000;
+    static constexpr uint16_t MAX_WP        = 256;
 
-    void Initialize();
+    static constexpr float PED_SPEED_MIN    = 1.2f;   // m/s
+    static constexpr float PED_SPEED_MAX    = 1.8f;   // m/s
+    static constexpr float PED_RADIUS       = 0.25f;
+    static constexpr float PED_MIN_SEP      = 0.6f;
+    static constexpr float PED_AVOID_DIST   = 2.0f;
 
-    // Spawn `count` agents walking along `path` (road cells, built by CityLayout::FindPath)
-    void SpawnAgents(const std::vector<XMFLOAT2>& path,
-                     int homeGX, int homeGZ, int workGX, int workGZ,
-                     uint32_t count = 5);
+    // Sidewalk geometry (must match CityLayout)
+    static constexpr float SIDEWALK_W       = CityLayout::SIDEWALK_W;          // 2.0 m
+    static constexpr float SIDEWALK_INNER   = CityLayout::CELL_SIZE * 0.5f - SIDEWALK_W; // 8.0 m
+    static constexpr float SIDEWALK_MID     = SIDEWALK_INNER + SIDEWALK_W * 0.5f;        // 9.0 m
 
-    uint32_t GetAgentCount() const { return activeCount; }
+    enum class State : uint8_t { IDLE = 0, WALKING = 1, WAITING_CROSS = 2 };
 
-    void Update(float dt, const XMFLOAT3& cameraPos, const CityLayout& city);
-    void RenderSolidAgents(const XMFLOAT3& cameraPos);
+    void     Initialize();
+    uint32_t SpawnPed(int homeGX, int homeGZ, int workGX, int workGZ,
+                      const CityLayout& city);
+    void     Update(float dt, const CityLayout& city,
+                    const TrafficLightSystem& lights);
+    void     Render(const XMFLOAT3& cameraPos);
 
-    float    GetPosX(uint32_t i)    const { return posX[i]; }
-    float    GetPosZ(uint32_t i)    const { return posZ[i]; }
-    float    GetTargetX(uint32_t i) const;
-    float    GetTargetZ(uint32_t i) const;
-    float    GetSpeed(uint32_t i)   const { return speed[i]; }
-    const char* GetName(uint32_t i) const { return i < agentName.size() ? agentName[i].c_str() : ""; }
-    uint8_t     GetAge(uint32_t i)  const { return i < agentAge.size()  ? agentAge[i]  : 0; }
-    const char* GetActivity(uint32_t i) const
-    {
-        if (i >= activeCount) return "";
-        return agentDir[i] == 0 ? "Going to work" : "Going home";
-    }
-    float    GetMoney(uint32_t i)    const { return i < agentMoney.size() ? agentMoney[i] : 0.0f; }
-    float    GetWage(uint32_t i)     const { return i < agentWage.size()  ? agentWage[i]  : 0.0f; }
-    // Returns tax collected this frame (call once per Update tick)
-    float    DrainTax()                    { float t = lastFrameTax_; lastFrameTax_ = 0.0f; return t; }
+    uint32_t GetPedCount() const { return activeCount_; }
+    PedestrianView GetView() const;
 
-    uint32_t GetVisibleAgentIndex(uint32_t slot) const
-        { return slot < visCount_ ? visIndices[slot] : UINT32_MAX; }
-    uint32_t GetVisibleCount()  const { return visCount_; }
-    uint32_t GetThreadCount()   const { return wi::jobsystem::GetThreadCount(); }
-    size_t   GetRenderedCount() const { return renderedCount.load(std::memory_order_relaxed); }
+    // For HUD
+    uint32_t GetWalkingCount() const;
+    uint32_t GetWaitingCount() const;
 
 private:
-    uint32_t activeCount = 0;
+    uint32_t activeCount_ = 0;
 
-    // Position + speed (SoA)
-    std::vector<float> posX, posZ;
-    std::vector<float> speed;
+    // SoA ped data
+    std::vector<float>    posX_, posZ_;
+    std::vector<float>    speed_;
+    std::vector<float>    heading_;
+    std::vector<State>    state_;
+    std::vector<uint8_t>  dir_;           // 0=to work, 1=to home
 
-    // Agent metadata
-    std::vector<std::string> agentName;
-    std::vector<uint8_t>     agentAge;
-    std::vector<uint8_t>     agentDir;   // 0 = going to work, 1 = going home
-    std::vector<float>       agentMoney; // lifetime savings ($)
-    std::vector<float>       agentWage;  // $/game-second while at work
-    std::vector<float>       agentSidewalkOff_; // lateral sidewalk offset ±9 m
-    float taxRate_     = 0.10f; // 10% city tax
-    float lastFrameTax_ = 0.0f;
+    // Waypoints per ped
+    std::vector<std::vector<XMFLOAT2>> wpBuf_;
+    std::vector<uint16_t> wpCurr_;
 
-    // Per-agent waypoint paths
-    // Agent i's path: waypointBuf[i*MAX_WAYPOINTS .. (i+1)*MAX_WAYPOINTS)
-    std::vector<XMFLOAT2> waypointBuf;
-    std::vector<uint8_t>  waypointCount_;  // valid entries per agent
-    std::vector<uint8_t>  waypointCurr_;   // current target index
+    // Spatial hash for avoidance
+    std::vector<uint32_t> cellHead_;      // per grid cell
+    std::vector<uint32_t> cellNext_;      // per ped
 
     // Rendering
-    std::vector<uint32_t>        visIndices;
+    static constexpr uint32_t MAX_VISIBLE = 2000;
+    std::vector<uint32_t>        visIdx_;
     uint32_t                     visCount_ = 0;
-    wi::ecs::Entity              meshEntity = wi::ecs::INVALID_ENTITY;
-    std::vector<wi::ecs::Entity> instancePool;
-    mutable std::atomic<size_t>  renderedCount{ 0 };
+    wi::ecs::Entity              meshEnt_ = wi::ecs::INVALID_ENTITY;
+    std::vector<wi::ecs::Entity> instPool_;
 
-    wi::jobsystem::context jobCtx;
+    void RebuildSpatialHash();
+    void CreateInstPool();
 
-    void CreateInstancePool();
+    // Pathfinding: road Dijkstra → sidewalk waypoints
+    static std::vector<XMFLOAT2> FindPedPath(
+        int srcGX, int srcGZ, int dstGX, int dstGZ,
+        const CityLayout& city);
+
+    // Traffic light query for crosswalk
+    static bool CanPedCross(int gx, int gz,
+                            const CityLayout& city,
+                            const TrafficLightSystem& lights);
 };

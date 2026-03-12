@@ -1,4 +1,5 @@
 #include "CarSystem.h"
+#include "CrowdSystem.h"
 #include "TrafficLightSystem.h"
 #include <algorithm>
 #include <cmath>
@@ -185,7 +186,8 @@ void CarSystem::SimplifyPath(XMFLOAT2* wp, uint8_t& count)
 //  Traffic lights: virtual stopped car injected at stop line.
 // ============================================================
 void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lights,
-                       float timeOfDay, float dayDuration)
+                       float timeOfDay, float dayDuration,
+                       const PedestrianView* peds)
 {
     // ---- DT clamping: substep when simSpeed pushes dt beyond safe limit ----
     constexpr float MAX_PHYSICS_DT = 0.05f;          // 50 ms max per substep
@@ -919,6 +921,30 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
                         }
                     }
                     break; // only check nearest intersection
+                }
+            }
+        }
+
+        // ---- Pedestrian safety brake: yield to peds in our path ----
+        if (peds && peds->count > 0 && onGrid) {
+            float scanAhead = std::min(20.0f, speed_[i] * 2.0f + 3.0f);
+            float fwdX = std::sin(heading_[i]);
+            float fwdZ = std::cos(heading_[i]);
+            for (int dg = -1; dg <= 1; dg++)
+            for (int dh = -1; dh <= 1; dh++) {
+                int cgx = myGX + dh, cgz = myGZ + dg;
+                if (cgx < 0 || cgx >= GS || cgz < 0 || cgz >= GS) continue;
+                int cellKey = cgz * GS + cgx;
+                for (uint32_t p = peds->cellHead[cellKey]; p != UINT32_MAX; p = peds->cellNext[p]) {
+                    if (peds->state[p] == 0) continue; // IDLE
+                    float pdx = peds->posX[p] - posX_[i];
+                    float pdz = peds->posZ[p] - posZ_[i];
+                    float fwd = pdx * fwdX + pdz * fwdZ;
+                    if (fwd < 1.0f || fwd > scanAhead) continue;
+                    float lat = std::abs(pdx * fwdZ - pdz * fwdX);
+                    if (lat > CAR_HW + 0.25f + 0.5f) continue; // 0.25 = PED_RADIUS
+                    float stopDist = std::max(0.0f, fwd - CAR_HL - 0.25f - 0.5f);
+                    if (stopDist < bestGap) { bestGap = stopDist; bestSpd = 0.0f; }
                 }
             }
         }
