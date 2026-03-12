@@ -9,11 +9,11 @@
 //
 //  Auto-detects intersections (road cells with 3+ road neighbors).
 //  8-phase cycle (32 s total):
-//    Phase 0 – NS through  (NS straight+right GREEN, EW right GREEN)  8 s
+//    Phase 0 – NS through  (NS straight+right GREEN)                  8 s
 //    Phase 1 – NS yellow                                               2 s
 //    Phase 2 – NS left     (NS left GREEN only)                        4 s
 //    Phase 3 – ALL RED clearance                                       2 s
-//    Phase 4 – EW through  (EW straight+right GREEN, NS right GREEN)  8 s
+//    Phase 4 – EW through  (EW straight+right GREEN)                   8 s
 //    Phase 5 – EW yellow                                               2 s
 //    Phase 6 – EW left     (EW left GREEN only)                        4 s
 //    Phase 7 – ALL RED clearance                                       2 s
@@ -84,8 +84,7 @@ public:
         case Phase::NS_THROUGH:
             if (carAxis == Axis::NS)
                 return (intent == TurnIntent::LEFT) ? LightColor::RED : LightColor::GREEN;
-            else // EW car
-                return (intent == TurnIntent::RIGHT) ? LightColor::GREEN : LightColor::RED;
+            return LightColor::RED;
 
         case Phase::NS_YELLOW:
             if (carAxis == Axis::NS && intent != TurnIntent::LEFT)
@@ -103,8 +102,7 @@ public:
         case Phase::EW_THROUGH:
             if (carAxis == Axis::EW)
                 return (intent == TurnIntent::LEFT) ? LightColor::RED : LightColor::GREEN;
-            else // NS car
-                return (intent == TurnIntent::RIGHT) ? LightColor::GREEN : LightColor::RED;
+            return LightColor::RED;
 
         case Phase::EW_YELLOW:
             if (carAxis == Axis::EW && intent != TurnIntent::LEFT)
@@ -143,9 +141,15 @@ private:
     std::vector<float>   timer_;
 
     struct PoleVisuals {
-        wi::ecs::Entity pole   = wi::ecs::INVALID_ENTITY;
-        wi::ecs::Entity arm    = wi::ecs::INVALID_ENTITY;
-        wi::ecs::Entity light  = wi::ecs::INVALID_ENTITY;
+        wi::ecs::Entity pole          = wi::ecs::INVALID_ENTITY;
+        wi::ecs::Entity arm           = wi::ecs::INVALID_ENTITY;
+        wi::ecs::Entity lightLeft     = wi::ecs::INVALID_ENTITY;
+        wi::ecs::Entity lightStraight = wi::ecs::INVALID_ENTITY;
+        wi::ecs::Entity lightRight    = wi::ecs::INVALID_ENTITY;
+        wi::ecs::Entity arrowLeft     = wi::ecs::INVALID_ENTITY;
+        wi::ecs::Entity arrowStraight = wi::ecs::INVALID_ENTITY;
+        wi::ecs::Entity arrowRight    = wi::ecs::INVALID_ENTITY;
+        bool hasLeft = false, hasStraight = false, hasRight = false;
     };
     std::vector<std::vector<PoleVisuals>> poleVisuals_;
 

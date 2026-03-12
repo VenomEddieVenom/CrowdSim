@@ -92,6 +92,20 @@ void TrafficLightSystem::UpdateVisuals()
     auto& scene = wi::scene::GetScene();
     const int N = GS * GS;
 
+    const XMFLOAT4 RED    = {0.9f, 0.1f, 0.1f, 1.0f};
+    const XMFLOAT4 GREEN  = {0.1f, 0.9f, 0.1f, 1.0f};
+    const XMFLOAT4 YELLOW = {0.9f, 0.8f, 0.1f, 1.0f};
+    const XMFLOAT4 DIM    = {0.15f, 0.15f, 0.15f, 1.0f};
+
+    auto setLight = [&](wi::ecs::Entity ent, const XMFLOAT4& color) {
+        if (ent == wi::ecs::INVALID_ENTITY) return;
+        auto* mat = scene.materials.GetComponent(ent);
+        if (!mat) return;
+        mat->SetBaseColor(color);
+        float emStr = (color.x > 0.5f || color.y > 0.5f) ? 4.0f : 0.2f;
+        mat->SetEmissiveColor(XMFLOAT4(color.x, color.y, color.z, emStr));
+    };
+
     for (int key = 0; key < N; ++key)
     {
         if (!isIntersection_[key]) continue;
@@ -100,55 +114,52 @@ void TrafficLightSystem::UpdateVisuals()
 
         Phase ph = phase_[key];
 
-        // Determine NS and EW light colors for poles
-        XMFLOAT4 nsColor, ewColor;
-        switch (ph)
+        for (int p = 0; p < (int)poles.size(); ++p)
         {
-        case Phase::NS_THROUGH:
-            nsColor = {0.1f, 0.9f, 0.1f, 1.0f};  // green
-            ewColor = {0.9f, 0.1f, 0.1f, 1.0f};  // red
-            break;
-        case Phase::NS_YELLOW:
-            nsColor = {0.9f, 0.8f, 0.1f, 1.0f};  // yellow
-            ewColor = {0.9f, 0.1f, 0.1f, 1.0f};  // red
-            break;
-        case Phase::NS_LEFT:
-            nsColor = {0.1f, 0.9f, 0.4f, 1.0f};  // green-ish (left arrow)
-            ewColor = {0.9f, 0.1f, 0.1f, 1.0f};  // red
-            break;
-        case Phase::ALL_RED_1:
-        case Phase::ALL_RED_2:
-            nsColor = {0.9f, 0.1f, 0.1f, 1.0f};  // red
-            ewColor = {0.9f, 0.1f, 0.1f, 1.0f};  // red
-            break;
-        case Phase::EW_THROUGH:
-            nsColor = {0.9f, 0.1f, 0.1f, 1.0f};  // red
-            ewColor = {0.1f, 0.9f, 0.1f, 1.0f};  // green
-            break;
-        case Phase::EW_YELLOW:
-            nsColor = {0.9f, 0.1f, 0.1f, 1.0f};  // red
-            ewColor = {0.9f, 0.8f, 0.1f, 1.0f};  // yellow
-            break;
-        case Phase::EW_LEFT:
-            nsColor = {0.9f, 0.1f, 0.1f, 1.0f};  // red
-            ewColor = {0.1f, 0.9f, 0.4f, 1.0f};  // green-ish (left arrow)
-            break;
-        }
+            if (poles[p].pole == wi::ecs::INVALID_ENTITY) continue;
 
-        // Poles: 0=NE, 1=NW, 2=SE, 3=SW
-        // NE and SW face NS traffic; NW and SE face EW traffic
-        // Actually: poles on the SIDE of the road face the approaching traffic.
-        // NE corner: faces South (NS axis) and West (EW axis)
-        // For simplicity: poles 0,3 (NE,SW diagonal) show NS color; poles 1,2 (NW,SE) show EW color
-        // This makes NS traffic (travelling along Z) see the NS light on poles at their right
-        for (int p = 0; p < 4 && p < (int)poles.size(); ++p)
-        {
-            auto* mat = scene.materials.GetComponent(poles[p].light);
-            if (!mat) continue;
-            // Poles 0(NE), 3(SW) → NS light; Poles 1(NW), 2(SE) → EW light
-            XMFLOAT4 color = (p == 0 || p == 3) ? nsColor : ewColor;
-            mat->SetBaseColor(color);
-            mat->SetEmissiveColor(XMFLOAT4(color.x, color.y, color.z, 4.0f));
+            bool isNS = (p == 0 || p == 3);
+            XMFLOAT4 leftC = RED, straightC = RED, rightC = RED;
+
+            switch (ph)
+            {
+            case Phase::NS_THROUGH:
+                if (isNS) { straightC = GREEN; rightC = GREEN; }
+                else      { rightC = GREEN; }
+                break;
+            case Phase::NS_YELLOW:
+                if (isNS) { straightC = YELLOW; rightC = YELLOW; }
+                break;
+            case Phase::NS_LEFT:
+                if (isNS) { leftC = GREEN; }
+                break;
+            case Phase::ALL_RED_1:
+            case Phase::ALL_RED_2:
+                break;
+            case Phase::EW_THROUGH:
+                if (!isNS) { straightC = GREEN; rightC = GREEN; }
+                else       { rightC = GREEN; }
+                break;
+            case Phase::EW_YELLOW:
+                if (!isNS) { straightC = YELLOW; rightC = YELLOW; }
+                break;
+            case Phase::EW_LEFT:
+                if (!isNS) { leftC = GREEN; }
+                break;
+            }
+
+            // Update light colors
+            if (poles[p].hasLeft)     setLight(poles[p].lightLeft, leftC);
+            if (poles[p].hasStraight) setLight(poles[p].lightStraight, straightC);
+            if (poles[p].hasRight)    setLight(poles[p].lightRight, rightC);
+
+            // Update arrow indicator colors (bright when green/yellow, dim when red)
+            auto arrowCol = [&](const XMFLOAT4& lc) -> XMFLOAT4 {
+                return (lc.y > 0.5f || lc.x > 0.5f) ? XMFLOAT4(1.f, 1.f, 1.f, 1.f) : DIM;
+            };
+            if (poles[p].hasLeft)     setLight(poles[p].arrowLeft, arrowCol(leftC));
+            if (poles[p].hasStraight) setLight(poles[p].arrowStraight, arrowCol(straightC));
+            if (poles[p].hasRight)    setLight(poles[p].arrowRight, arrowCol(rightC));
         }
     }
 }
@@ -174,22 +185,40 @@ void TrafficLightSystem::CreatePolesForIntersection(int gx, int gz,
     const float offX[4] = {  h - 1.5f, -(h - 1.5f),   h - 1.5f, -(h - 1.5f) };
     const float offZ[4] = { -(h - 1.5f), -(h - 1.5f),  h - 1.5f,   h - 1.5f };
 
-    // Mast arm directions: horizontal arm extends from pole over the road
-    // Pole 0 (NE, NS light): arm → -X (west over northbound lanes)
-    // Pole 1 (NW, EW light): arm → +Z (south over eastbound lanes)
-    // Pole 2 (SE, EW light): arm → -Z (north over westbound lanes)
-    // Pole 3 (SW, NS light): arm → +X (east over southbound lanes)
+    // Mast arm directions: from pole toward road center
+    // Pole 0 (NE): arm → -X   Pole 1 (NW): arm → +Z
+    // Pole 2 (SE): arm → -Z   Pole 3 (SW): arm → +X
     const float armDX[4] = { -1.f,  0.f,  0.f,  1.f };
     const float armDZ[4] = {  0.f,  1.f, -1.f,  0.f };
-    const float armLen = 5.5f;    // arm length over road
-    const float poleH  = 7.0f;   // pole height
+    const float armLen = 5.5f;
+    const float poleH  = 7.0f;
+
+    // Direction tables: approach-from, straight-exit, left-exit, right-exit
+    const int aDX[4] = {  0,  1, -1,  0 }, aDZ[4] = {  1,  0,  0, -1 };
+    const int sDX[4] = {  0, -1,  1,  0 }, sDZ[4] = { -1,  0,  0,  1 };
+    const int lDX[4] = { -1,  0,  0,  1 }, lDZ[4] = {  0,  1, -1,  0 };
+    const int rDX[4] = {  1,  0,  0, -1 }, rDZ[4] = {  0, -1,  1,  0 };
+
+    // Light arrangement: along the arm direction
+    //   Left light = further along arm (driver's left)
+    //   Straight = center
+    //   Right light = closer to pole (driver's right)
+    const float spacing = 0.80f;
 
     for (int p = 0; p < 4; ++p)
     {
+        // Only create pole + lights if traffic approaches from this direction
+        bool hasApproach = city.IsRoadLike(gx + aDX[p], gz + aDZ[p]);
+        if (!hasApproach)
+        {
+            poles[p] = {};
+            continue;
+        }
+
         float px = center.x + offX[p];
         float pz = center.y + offZ[p];
 
-        // Vertical pole (tall gray)
+        // Vertical pole
         auto poleEnt = scene.Entity_CreateCube("tl_pole");
         auto* pt = scene.transforms.GetComponent(poleEnt);
         pt->Scale(XMFLOAT3(0.15f, poleH, 0.15f));
@@ -198,10 +227,9 @@ void TrafficLightSystem::CreatePolesForIntersection(int gx, int gz,
         scene.materials.GetComponent(poleEnt)->SetBaseColor(
             XMFLOAT4(0.25f, 0.25f, 0.25f, 1.0f));
 
-        // Horizontal mast arm (extends from pole top over road)
+        // Horizontal mast arm
         float armCX = px + armDX[p] * armLen * 0.5f;
         float armCZ = pz + armDZ[p] * armLen * 0.5f;
-        // Scale: arm is long in one axis, thin in others
         float armSX = (armDX[p] != 0.f) ? armLen : 0.12f;
         float armSZ = (armDZ[p] != 0.f) ? armLen : 0.12f;
 
@@ -213,23 +241,81 @@ void TrafficLightSystem::CreatePolesForIntersection(int gx, int gz,
         scene.materials.GetComponent(armEnt)->SetBaseColor(
             XMFLOAT4(0.25f, 0.25f, 0.25f, 1.0f));
 
-        // Traffic light head (hanging from arm tip, slightly below)
-        float lightX = px + armDX[p] * armLen;
-        float lightZ = pz + armDZ[p] * armLen;
+        // Detect available exit directions
+        bool hasStraight = city.IsRoadLike(gx + sDX[p], gz + sDZ[p]);
+        bool hasLeft     = city.IsRoadLike(gx + lDX[p], gz + lDZ[p]);
+        bool hasRight    = city.IsRoadLike(gx + rDX[p], gz + rDZ[p]);
 
-        auto lightEnt = scene.Entity_CreateCube("tl_light");
-        auto* lt = scene.transforms.GetComponent(lightEnt);
-        lt->Scale(XMFLOAT3(0.4f, 0.7f, 0.4f));
-        lt->Translate(XMFLOAT3(lightX, poleH - 0.55f, lightZ));
-        lt->UpdateTransform();
-        // Default red with emissive glow
-        auto* lightMat = scene.materials.GetComponent(lightEnt);
-        lightMat->SetBaseColor(XMFLOAT4(0.9f, 0.1f, 0.1f, 1.0f));
-        lightMat->SetEmissiveColor(XMFLOAT4(0.9f, 0.1f, 0.1f, 4.0f));
+        poles[p].hasStraight = hasStraight;
+        poles[p].hasLeft     = hasLeft;
+        poles[p].hasRight    = hasRight;
 
-        poles[p].pole  = poleEnt;
-        poles[p].arm   = armEnt;
-        poles[p].light = lightEnt;
+        // Light and arrow positions
+        float lightBaseX = px + armDX[p] * armLen;
+        float lightBaseZ = pz + armDZ[p] * armLen;
+        float lightY = poleH - 0.55f;
+        float arrowY = lightY - 0.45f;
+
+        // Offset directions for left/right lights (along arm direction)
+        float leftOX  =  armDX[p] * spacing, leftOZ  =  armDZ[p] * spacing;
+        float rightOX = -armDX[p] * spacing, rightOZ = -armDZ[p] * spacing;
+
+        // Arrow shape: horizontal arrows elongated in leftDir (= armDir),
+        // straight arrow elongated vertically
+        bool armAlongX = std::abs(armDX[p]) > 0.5f;
+        XMFLOAT3 hArrowScale = armAlongX
+            ? XMFLOAT3(0.28f, 0.04f, 0.06f)
+            : XMFLOAT3(0.06f, 0.04f, 0.28f);
+        XMFLOAT3 vArrowScale(0.06f, 0.28f, 0.06f);
+
+        // Light shapes: horizontal arrows = wide in armDir, straight = tall
+        XMFLOAT3 hLightScale = armAlongX
+            ? XMFLOAT3(0.40f, 0.30f, 0.18f)
+            : XMFLOAT3(0.18f, 0.30f, 0.40f);
+        XMFLOAT3 vLightScale(0.18f, 0.45f, 0.18f);
+
+        auto makeLight = [&](const char* name, float ox, float oz, const XMFLOAT3& sc) {
+            auto e = scene.Entity_CreateCube(name);
+            auto* t = scene.transforms.GetComponent(e);
+            t->Scale(sc);
+            t->Translate(XMFLOAT3(lightBaseX + ox, lightY, lightBaseZ + oz));
+            t->UpdateTransform();
+            auto* m = scene.materials.GetComponent(e);
+            m->SetBaseColor(XMFLOAT4(0.9f, 0.1f, 0.1f, 1.0f));
+            m->SetEmissiveColor(XMFLOAT4(0.9f, 0.1f, 0.1f, 4.0f));
+            return e;
+        };
+
+        auto makeArrow = [&](const char* name, float ox, float oz, const XMFLOAT3& sc) {
+            auto e = scene.Entity_CreateCube(name);
+            auto* t = scene.transforms.GetComponent(e);
+            t->Scale(sc);
+            t->Translate(XMFLOAT3(lightBaseX + ox, arrowY, lightBaseZ + oz));
+            t->UpdateTransform();
+            auto* m = scene.materials.GetComponent(e);
+            m->SetBaseColor(XMFLOAT4(0.15f, 0.15f, 0.15f, 1.0f));
+            m->SetEmissiveColor(XMFLOAT4(0.15f, 0.15f, 0.15f, 0.2f));
+            return e;
+        };
+
+        if (hasLeft)
+        {
+            poles[p].lightLeft = makeLight("tl_left", leftOX, leftOZ, hLightScale);
+            poles[p].arrowLeft = makeArrow("tl_arr_left", leftOX, leftOZ, hArrowScale);
+        }
+        if (hasStraight)
+        {
+            poles[p].lightStraight = makeLight("tl_straight", 0.f, 0.f, vLightScale);
+            poles[p].arrowStraight = makeArrow("tl_arr_straight", 0.f, 0.f, vArrowScale);
+        }
+        if (hasRight)
+        {
+            poles[p].lightRight = makeLight("tl_right", rightOX, rightOZ, hLightScale);
+            poles[p].arrowRight = makeArrow("tl_arr_right", rightOX, rightOZ, hArrowScale);
+        }
+
+        poles[p].pole = poleEnt;
+        poles[p].arm  = armEnt;
     }
 }
 
@@ -242,12 +328,15 @@ void TrafficLightSystem::RemovePolesForCell(int key)
     auto& poles = poleVisuals_[key];
     for (auto& pv : poles)
     {
-        if (pv.pole  != wi::ecs::INVALID_ENTITY) scene.Entity_Remove(pv.pole);
-        if (pv.arm   != wi::ecs::INVALID_ENTITY) scene.Entity_Remove(pv.arm);
-        if (pv.light != wi::ecs::INVALID_ENTITY) scene.Entity_Remove(pv.light);
-        pv.pole  = wi::ecs::INVALID_ENTITY;
-        pv.arm   = wi::ecs::INVALID_ENTITY;
-        pv.light = wi::ecs::INVALID_ENTITY;
+        if (pv.pole          != wi::ecs::INVALID_ENTITY) scene.Entity_Remove(pv.pole);
+        if (pv.arm           != wi::ecs::INVALID_ENTITY) scene.Entity_Remove(pv.arm);
+        if (pv.lightLeft     != wi::ecs::INVALID_ENTITY) scene.Entity_Remove(pv.lightLeft);
+        if (pv.lightStraight != wi::ecs::INVALID_ENTITY) scene.Entity_Remove(pv.lightStraight);
+        if (pv.lightRight    != wi::ecs::INVALID_ENTITY) scene.Entity_Remove(pv.lightRight);
+        if (pv.arrowLeft     != wi::ecs::INVALID_ENTITY) scene.Entity_Remove(pv.arrowLeft);
+        if (pv.arrowStraight != wi::ecs::INVALID_ENTITY) scene.Entity_Remove(pv.arrowStraight);
+        if (pv.arrowRight    != wi::ecs::INVALID_ENTITY) scene.Entity_Remove(pv.arrowRight);
+        pv = {};
     }
     poles.clear();
 }

@@ -199,12 +199,14 @@ public:
         f.read(reinterpret_cast<char*>(&magic), 4);
         f.read(reinterpret_cast<char*>(&ver), 4);
         f.read(reinterpret_cast<char*>(&gs), 4);
-        if (magic != 0x43495459 || (ver != 1 && ver != 2) || gs != (uint32_t)GRID_SIZE) return sd;
-        f.read(reinterpret_cast<char*>(sd.cells), GRID_SIZE * GRID_SIZE);
-        f.read(reinterpret_cast<char*>(sd.housePop), GRID_SIZE * GRID_SIZE * sizeof(int));
+        if (magic != 0x43495459 || (ver != 1 && ver != 2)) return sd;
+        if (gs != (uint32_t)GRID_SIZE) return sd;
+        f.read(reinterpret_cast<char*>(sd.cells),    gs * gs);
+        f.read(reinterpret_cast<char*>(sd.housePop), gs * gs * sizeof(int));
         if (ver >= 2)
-            f.read(reinterpret_cast<char*>(sd.roadLanes), GRID_SIZE * GRID_SIZE * sizeof(int));
-        sd.valid = f.good();
+            f.read(reinterpret_cast<char*>(sd.roadLanes), gs * gs * sizeof(int));
+        if (!f.good()) return sd;
+        sd.valid = true;
         return sd;
     }
 
@@ -452,10 +454,13 @@ private:
         {
             auto e  = s.Entity_CreateCube("road");
             auto* tr = s.transforms.GetComponent(e);
-            tr->Scale(XMFLOAT3(h, 0.10f, h));
-            tr->Translate(XMFLOAT3(c.x, 0.10f, c.y));
-            tr->UpdateTransform();
-            s.materials.GetComponent(e)->SetBaseColor(XMFLOAT4(0.10f, 0.10f, 0.12f, 1.0f));
+            if (tr) {
+                tr->Scale(XMFLOAT3(h, 0.10f, h));
+                tr->Translate(XMFLOAT3(c.x, 0.10f, c.y));
+                tr->UpdateTransform();
+            }
+            auto* mat = s.materials.GetComponent(e);
+            if (mat) mat->SetBaseColor(XMFLOAT4(0.10f, 0.10f, 0.12f, 1.0f));
             cellEntities[idx].push_back(e);
         }
 
@@ -482,11 +487,14 @@ private:
         {
             auto se = s.Entity_CreateCube("sidewalk");
             auto* st = s.transforms.GetComponent(se);
-            const float visY = connected[d] ? -100.0f : 0.14f;
-            st->Scale(XMFLOAT3(hx[d], 0.14f, hz[d]));
-            st->Translate(XMFLOAT3(c.x + ox[d], visY, c.y + oz[d]));
-            st->UpdateTransform();
-            s.materials.GetComponent(se)->SetBaseColor(XMFLOAT4(0.74f, 0.72f, 0.65f, 1.0f));
+            if (st) {
+                const float visY = connected[d] ? -100.0f : 0.14f;
+                st->Scale(XMFLOAT3(hx[d], 0.14f, hz[d]));
+                st->Translate(XMFLOAT3(c.x + ox[d], visY, c.y + oz[d]));
+                st->UpdateTransform();
+            }
+            auto* mat = s.materials.GetComponent(se);
+            if (mat) mat->SetBaseColor(XMFLOAT4(0.74f, 0.72f, 0.65f, 1.0f));
             cellEntities[idx].push_back(se);
             roadSidewalks[idx][d] = se;
         }
@@ -507,11 +515,14 @@ private:
             {
                 auto ce = s.Entity_CreateCube("sidewalk_corner");
                 auto* ct = s.transforms.GetComponent(ce);
-                const float visY = cornerVis[d] ? 0.14f : -100.0f;
-                ct->Scale(XMFLOAT3(swh, 0.14f, swh));
-                ct->Translate(XMFLOAT3(c.x + cox[d], visY, c.y + coz[d]));
-                ct->UpdateTransform();
-                s.materials.GetComponent(ce)->SetBaseColor(XMFLOAT4(0.74f, 0.72f, 0.65f, 1.0f));
+                if (ct) {
+                    const float visY = cornerVis[d] ? 0.14f : -100.0f;
+                    ct->Scale(XMFLOAT3(swh, 0.14f, swh));
+                    ct->Translate(XMFLOAT3(c.x + cox[d], visY, c.y + coz[d]));
+                    ct->UpdateTransform();
+                }
+                auto* mat = s.materials.GetComponent(ce);
+                if (mat) mat->SetBaseColor(XMFLOAT4(0.74f, 0.72f, 0.65f, 1.0f));
                 cellEntities[idx].push_back(ce);
                 roadCorners[idx][d] = ce;
             }
@@ -745,21 +756,27 @@ private:
         // Main body (warm orange-red, varied by location)
         auto e = s.Entity_CreateCube("house");
         auto* tr = s.transforms.GetComponent(e);
-        tr->Scale(XMFLOAT3(bw, bh, bw));
-        tr->Translate(XMFLOAT3(c.x, bh, c.y));
-        tr->UpdateTransform();
+        if (tr) {
+            tr->Scale(XMFLOAT3(bw, bh, bw));
+            tr->Translate(XMFLOAT3(c.x, bh, c.y));
+            tr->UpdateTransform();
+        }
         float hi = static_cast<float>((gx * 13 + gz * 7) % 8) / 7.0f;
-        s.materials.GetComponent(e)->SetBaseColor(
+        auto* mat = s.materials.GetComponent(e);
+        if (mat) mat->SetBaseColor(
             XMFLOAT4(0.82f + hi * 0.10f, 0.35f + hi * 0.10f, 0.16f, 1.0f));
         cellEntities[idx].push_back(e);
 
         // Dark roof strip
         auto r = s.Entity_CreateCube("house_roof");
         auto* rt = s.transforms.GetComponent(r);
-        rt->Scale(XMFLOAT3(bw * 1.06f, bh * 0.10f, bw * 1.06f));
-        rt->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.10f, c.y));
-        rt->UpdateTransform();
-        s.materials.GetComponent(r)->SetBaseColor(XMFLOAT4(0.30f, 0.14f, 0.09f, 1.0f));
+        if (rt) {
+            rt->Scale(XMFLOAT3(bw * 1.06f, bh * 0.10f, bw * 1.06f));
+            rt->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.10f, c.y));
+            rt->UpdateTransform();
+        }
+        auto* rmat = s.materials.GetComponent(r);
+        if (rmat) rmat->SetBaseColor(XMFLOAT4(0.30f, 0.14f, 0.09f, 1.0f));
         cellEntities[idx].push_back(r);
     }
 
@@ -774,21 +791,27 @@ private:
         // Tower body (cool blue-gray)
         auto e = s.Entity_CreateCube("workplace");
         auto* tr = s.transforms.GetComponent(e);
-        tr->Scale(XMFLOAT3(bw, bh, bw));
-        tr->Translate(XMFLOAT3(c.x, bh, c.y));
-        tr->UpdateTransform();
+        if (tr) {
+            tr->Scale(XMFLOAT3(bw, bh, bw));
+            tr->Translate(XMFLOAT3(c.x, bh, c.y));
+            tr->UpdateTransform();
+        }
         float ti = static_cast<float>((gx * 7 + gz * 13) % 6) / 5.0f;
-        s.materials.GetComponent(e)->SetBaseColor(
+        auto* mat = s.materials.GetComponent(e);
+        if (mat) mat->SetBaseColor(
             XMFLOAT4(0.22f + ti * 0.08f, 0.38f + ti * 0.10f, 0.72f + ti * 0.12f, 1.0f));
         cellEntities[idx].push_back(e);
 
         // Glass crown
         auto g = s.Entity_CreateCube("workplace_crown");
         auto* gt = s.transforms.GetComponent(g);
-        gt->Scale(XMFLOAT3(bw * 1.03f, bh * 0.09f, bw * 1.03f));
-        gt->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.09f, c.y));
-        gt->UpdateTransform();
-        s.materials.GetComponent(g)->SetBaseColor(XMFLOAT4(0.62f, 0.82f, 0.97f, 1.0f));
+        if (gt) {
+            gt->Scale(XMFLOAT3(bw * 1.03f, bh * 0.09f, bw * 1.03f));
+            gt->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.09f, c.y));
+            gt->UpdateTransform();
+        }
+        auto* gmat = s.materials.GetComponent(g);
+        if (gmat) gmat->SetBaseColor(XMFLOAT4(0.62f, 0.82f, 0.97f, 1.0f));
         cellEntities[idx].push_back(g);
     }
 

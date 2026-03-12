@@ -33,7 +33,7 @@ public:
     static constexpr float CAR_HH      =  0.35f;  // half-height (~0.7 m)
     static constexpr float CAR_HL      =  1.00f;  // half-length (~2.0 m)
     static constexpr float MIN_SEP     =  CAR_HL * 2.f + 0.5f; // bumper-to-bumper (2.5 m)
-    static constexpr float LAT_BAND    =  2.6f;   // lateral collision band (must be < inter-lane gap)
+    static constexpr float LAT_BAND    =  1.5f;   // lateral collision band (< inter-lane gap of 3m)
 
     // Lane offsets for each road mode (per-direction, from centreline)
     // 2-lane (1 per dir): centre at 2.5 m
@@ -42,8 +42,8 @@ public:
     static void GetLaneOffsets(int totalLanes, float* offsets, int& count)
     {
         if (totalLanes >= 6) { count = 3; offsets[0] = 1.5f; offsets[1] = 4.0f; offsets[2] = 6.5f; }
-        else if (totalLanes >= 4) { count = 2; offsets[0] = 1.5f; offsets[1] = 4.5f; }
-        else { count = 1; offsets[0] = 2.5f; }
+        else if (totalLanes >= 4) { count = 2; offsets[0] = 2.5f; offsets[1] = 5.5f; }
+        else { count = 1; offsets[0] = 4.0f; }
     }
 
     // IDM (Intelligent Driver Model) following parameters
@@ -141,6 +141,8 @@ private:
     std::vector<uint8_t>  wpCurr_;
     std::vector<uint8_t>  carDir_;   // 0 = to work, 1 = to home
     std::vector<float>    laneOff_;  // current lane offset from centreline
+    std::vector<float>    laneTarget_; // target lane for smooth transitions
+    std::vector<int8_t>   laneIdx_;    // lane index (0=inner, N-1=outer)
 
     // Parking-animation data
     struct ParkAnim {

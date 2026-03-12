@@ -20,6 +20,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 
 
 
@@ -39,7 +40,7 @@ public:
 
     // FPS-camera state
     wi::scene::TransformComponent camera_transform;
-    float moveSpeed = 80.0f;  // units/second (scroll wheel adjusts)
+    float moveSpeed = 50.0f;  // units/second (scroll wheel adjusts)
     float simSpeed  = 1.0f;   // simulation time scale
 
     // Day/night cycle
@@ -77,6 +78,67 @@ public:
     int      roadStartGX = 0, roadStartGZ = 0;
     std::vector<std::pair<int,int>> roadPreviewPath; // cells of the preview path
 
+    // Saves menu
+    bool     savesMenuOpen = false;
+    std::vector<std::string> saveFiles;     // filenames in saves/
+    int      savesMenuScroll = 0;
+    bool     savesMenuSaveMode = false;     // true = saving, false = loading
+    std::string pendingSaveName;            // for new save typing
+    bool     typingSaveName = false;
+
+    void RefreshSaveList() {
+        saveFiles.clear();
+        namespace fs = std::filesystem;
+        fs::create_directories("saves");
+        for (auto& entry : fs::directory_iterator("saves")) {
+            if (entry.is_regular_file() && entry.path().extension() == ".city")
+                saveFiles.push_back(entry.path().stem().string());
+        }
+        std::sort(saveFiles.begin(), saveFiles.end());
+    }
+
+    void DoLoadSave(const std::string& name) {
+        std::string path = "saves/" + name + ".city";
+        auto sd = CityLayout::LoadFromFile(path.c_str());
+        if (!sd.valid) {
+            wi::backlog::post("[Load] Failed to load: " + path, wi::backlog::LogLevel::Warning);
+            return;
+        }
+        trafficLights.RebuildIntersections(city);
+        for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
+        for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2)
+            city.ClearCell(gx2, gz2);
+        std::fill(std::begin(houseHasSpawned), std::end(houseHasSpawned), false);
+        for (int pass = 0; pass < 2; ++pass)
+        for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
+        for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2) {
+            auto ct = sd.cells[gz2 * CityLayout::GRID_SIZE + gx2];
+            bool isRoad = (ct == CellType::ROAD || ct == CellType::CROSSWALK);
+            if (pass == 0 && !isRoad) continue;
+            if (pass == 1 && isRoad) continue;
+            if (ct == CellType::EMPTY) continue;
+            city.PlaceCell(gx2, gz2, ct);
+        }
+        trafficLights.RebuildIntersections(city);
+        for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
+        for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2) {
+            int lanes = sd.roadLanes[gz2 * CityLayout::GRID_SIZE + gx2];
+            if (lanes == 2 || lanes == 6)
+                city.SetRoadLanes(gx2, gz2, lanes);
+        }
+        for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
+        for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2) {
+            int idx2 = gz2 * CityLayout::GRID_SIZE + gx2;
+            if (sd.cells[idx2] == CellType::HOUSE) {
+                city.SetHousePop(gx2, gz2, 0);
+                if (TrySpawnFromHouse(gx2, gz2))
+                    houseHasSpawned[idx2] = true;
+            }
+        }
+        wi::backlog::post("[Load] Loaded: " + path, wi::backlog::LogLevel::Default);
+        savesMenuOpen = false;
+    }
+
     void Start() override
     {
         city.Initialize();
@@ -87,11 +149,11 @@ public:
         // ---- Camera: oblique overview of city centre ----
         auto& cam = wi::scene::GetCamera();
         cam.zNearP = 0.5f;
-        cam.zFarP  = 3000.0f;
+        cam.zFarP  = 2500.0f;
         cam.fov    = XM_PI / 3.5f;
 
         camera_transform.ClearTransform();
-        camera_transform.Translate(XMFLOAT3(0.0f, 180.0f, -260.0f));
+        camera_transform.Translate(XMFLOAT3(0.0f, 200.0f, -300.0f));
         camera_transform.RotateRollPitchYaw(XMFLOAT3(-0.55f, 0.0f, 0.0f));
         camera_transform.UpdateTransform();
         cam.TransformCamera(camera_transform);
@@ -99,8 +161,8 @@ public:
 
         // ---- Sky (initial values, updated by day cycle each frame) ----
         auto& scene = wi::scene::GetScene();
-        scene.weather.fogStart   = 700.0f;
-        scene.weather.fogDensity = 0.0005f;
+        scene.weather.fogStart   = 600.0f;
+        scene.weather.fogDensity = 0.002f;
 
         // ---- Sun (directional light with shadow cascades) ----
         sunEntity = scene.Entity_CreateLight(
@@ -114,7 +176,7 @@ public:
         if (sunLight)
         {
             sunLight->SetCastShadow(true);
-            sunLight->cascade_distances = { 30.0f, 120.0f, 500.0f, 1500.0f };
+            sunLight->cascade_distances = { 20.0f, 80.0f, 300.0f, 1000.0f };
         }
         // Set initial sun rotation matching timeOfDay
         {
@@ -166,7 +228,7 @@ public:
 
         // ---- Speed (scroll to adjust, Shift to sprint) ----
         moveSpeed += ms.delta_wheel * 8.0f;
-        moveSpeed  = std::clamp(moveSpeed, 5.0f, 1200.0f);
+        moveSpeed  = std::clamp(moveSpeed, 5.0f, 500.0f);
 
         float spd = moveSpeed * dt;
         if (wi::input::Down(wi::input::KEYBOARD_BUTTON_LSHIFT) ||
@@ -479,65 +541,80 @@ public:
         // ---- Save / Load (F5 / F9) ----
         if (wi::input::Press(wi::input::KEYBOARD_BUTTON_F5))
         {
-            if (city.SaveToFile("save.city"))
-                wi::backlog::post("[Save] City saved to save.city", wi::backlog::LogLevel::Default);
-            else
-                wi::backlog::post("[Save] FAILED to save!", wi::backlog::LogLevel::Warning);
+            savesMenuSaveMode = true;
+            typingSaveName = false;
+            pendingSaveName.clear();
+            RefreshSaveList();
+            savesMenuOpen = true;
         }
         if (wi::input::Press(wi::input::KEYBOARD_BUTTON_F9))
         {
-            auto sd = CityLayout::LoadFromFile("save.city");
-            if (sd.valid)
+            savesMenuSaveMode = false;
+            typingSaveName = false;
+            RefreshSaveList();
+            savesMenuOpen = !savesMenuOpen;
+        }
+        if (wi::input::Press(wi::input::KEYBOARD_BUTTON_ESCAPE) && savesMenuOpen)
+        {
+            savesMenuOpen = false;
+            typingSaveName = false;
+        }
+
+        // Handle saves menu interaction
+        if (savesMenuOpen)
+        {
+            float mx = (float)wi::input::GetPointer().x;
+            float my = (float)wi::input::GetPointer().y;
+            float menuX = this->width * 0.5f - 200.0f;
+            float menuY = 80.0f;
+            float entryH = 40.0f;
+            float menuW = 400.0f;
+
+            if (wi::input::Press(wi::input::MOUSE_BUTTON_LEFT))
             {
-                // Clear everything
-                trafficLights.RebuildIntersections(city); // safe pre-clear
-                for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
-                for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2)
-                    city.ClearCell(gx2, gz2);
-                std::fill(std::begin(houseHasSpawned), std::end(houseHasSpawned), false);
-
-                // Rebuild city from saved data
-                // Place roads/crosswalks first, then buildings (so path finding works)
-                for (int pass = 0; pass < 2; ++pass)
-                for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
-                for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2)
+                // "New Save" button at top (only in save mode)
+                if (savesMenuSaveMode)
                 {
-                    auto ct = sd.cells[gz2 * CityLayout::GRID_SIZE + gx2];
-                    bool isRoad = (ct == CellType::ROAD || ct == CellType::CROSSWALK);
-                    if (pass == 0 && !isRoad) continue;
-                    if (pass == 1 && isRoad) continue;
-                    if (ct == CellType::EMPTY) continue;
-                    city.PlaceCell(gx2, gz2, ct);
-                }
-                trafficLights.RebuildIntersections(city);
-
-                // Restore per-cell road lane counts
-                for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
-                for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2)
-                {
-                    int lanes = sd.roadLanes[gz2 * CityLayout::GRID_SIZE + gx2];
-                    if (lanes == 2 || lanes == 6)
-                        city.SetRoadLanes(gx2, gz2, lanes);
-                }
-
-                // Restore house population and respawn agents/cars
-                for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
-                for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2)
-                {
-                    int idx2 = gz2 * CityLayout::GRID_SIZE + gx2;
-                    if (sd.cells[idx2] == CellType::HOUSE)
+                    float newBtnY = menuY + 40.0f;
+                    if (mx >= menuX && mx <= menuX + menuW && my >= newBtnY && my <= newBtnY + entryH)
                     {
-                        city.SetHousePop(gx2, gz2, 0); // reset for respawn
-                        if (TrySpawnFromHouse(gx2, gz2))
-                            houseHasSpawned[idx2] = true;
+                        // Generate auto-name
+                        namespace fs = std::filesystem;
+                        fs::create_directories("saves");
+                        int num = 1;
+                        while (fs::exists("saves/save_" + std::to_string(num) + ".city")) num++;
+                        std::string autoName = "save_" + std::to_string(num);
+                        std::string path = "saves/" + autoName + ".city";
+                        if (city.SaveToFile(path.c_str()))
+                            wi::backlog::post("[Save] Saved to " + path, wi::backlog::LogLevel::Default);
+                        RefreshSaveList();
+                        savesMenuOpen = false;
                     }
                 }
 
-                wi::backlog::post("[Load] City loaded from save.city", wi::backlog::LogLevel::Default);
-            }
-            else
-            {
-                wi::backlog::post("[Load] No save file found or invalid!", wi::backlog::LogLevel::Warning);
+                // Save entries
+                float listStartY = menuY + (savesMenuSaveMode ? 90.0f : 40.0f);
+                int maxShow = 12;
+                for (int si = 0; si < (int)saveFiles.size() && si < maxShow; ++si)
+                {
+                    float ey = listStartY + (float)si * entryH;
+                    if (mx >= menuX && mx <= menuX + menuW && my >= ey && my <= ey + entryH)
+                    {
+                        if (savesMenuSaveMode)
+                        {
+                            // Overwrite this save
+                            std::string path = "saves/" + saveFiles[si] + ".city";
+                            if (city.SaveToFile(path.c_str()))
+                                wi::backlog::post("[Save] Overwrote " + path, wi::backlog::LogLevel::Default);
+                            savesMenuOpen = false;
+                        }
+                        else
+                        {
+                            DoLoadSave(saveFiles[si]);
+                        }
+                        break;
+                    }
+                }
             }
         }
 
@@ -863,20 +940,13 @@ public:
                 if ((int)path.size() < 2) continue;
 
                 int workers = 0;
-                if ((int)path.size() > CAR_HOP_THRESHOLD)
-                {
-                    uint32_t seed = (uint32_t)(hGX * 37 + hGZ * 19 + wx * 7 + wz * 3);
-                    for (int c = 0; c < 3; ++c)
-                        cars.SpawnCar(path, seed + (uint32_t)c);
-                    workers = 3;
+                int toSpawn = ((int)path.size() > CAR_HOP_THRESHOLD) ? 3 : 5;
+                uint32_t seed = (uint32_t)(hGX * 37 + hGZ * 19 + wx * 7 + wz * 3);
+                for (int c = 0; c < toSpawn; ++c) {
+                    if (cars.SpawnCar(path, seed + (uint32_t)c) != UINT32_MAX)
+                        ++workers;
                 }
-                else
-                {
-                    uint32_t seed = (uint32_t)(hGX * 37 + hGZ * 19 + wx * 7 + wz * 3);
-                    for (int c = 0; c < 5; ++c)
-                        cars.SpawnCar(path, seed + (uint32_t)c);
-                    workers = 5;
-                }
+                if (workers == 0) continue; // no car got through – try another workplace
                 city.AddWorkers(wx, wz, workers);
                 city.AddHousePop(hGX, hGZ, workers);
                 return true;
@@ -899,7 +969,7 @@ public:
 
             {
                 uint32_t seed = (uint32_t)(hGX * 37 + hGZ * 19 + wx * 7 + wz * 3 + city.GetHousePop(hGX, hGZ));
-                cars.SpawnCar(path, seed);
+                if (cars.SpawnCar(path, seed) == UINT32_MAX) continue;
             }
             city.AddWorkers(wx, wz, 1);
             return;
@@ -1109,7 +1179,7 @@ public:
             << "[Shift]       Sprint\n"
             << "[Scroll]      Speed: " << static_cast<int>(moveSpeed) << " u/s\n"
             << "[B]           Build Mode: " << (buildModeEnabled ? "ON" : "OFF") << "\n"
-            << "[F5]          Save  |  [F9] Load";
+            << "[F5]          Save  |  [F9] Load / Saves Menu";
         if (buildModeEnabled)
         {
             if (placeTool == 0)
@@ -1325,6 +1395,94 @@ public:
             fp.size  = 22;
             fp.color = wi::Color(240, 240, 60, 255);
             wi::font::Draw(oss.str(), fp, cmd);
+        }
+
+        // ---- Saves Menu Overlay ----
+        if (savesMenuOpen)
+        {
+            float menuW = 400.0f;
+            float menuX = (float)this->width * 0.5f - menuW * 0.5f;
+            float menuY = 80.0f;
+            float entryH = 40.0f;
+            int maxShow = 12;
+
+            // Dim background
+            {
+                wi::image::Params dim;
+                dim.pos  = XMFLOAT3(0, 0, 0);
+                dim.siz  = XMFLOAT2((float)this->width, (float)this->height);
+                dim.color = XMFLOAT4(0, 0, 0, 0.5f);
+                wi::image::Draw(nullptr, dim, cmd);
+            }
+
+            // Title
+            {
+                wi::font::Params tp;
+                tp.posX = menuX; tp.posY = menuY;
+                tp.size = 28;
+                tp.color = wi::Color(255, 255, 255, 255);
+                wi::font::Draw(savesMenuSaveMode ? "SAVE GAME" : "LOAD GAME", tp, cmd);
+            }
+
+            float listStartY = menuY + 40.0f;
+
+            // "New Save" button (save mode only)
+            if (savesMenuSaveMode)
+            {
+                wi::image::Params bg;
+                bg.pos  = XMFLOAT3(menuX, listStartY, 0);
+                bg.siz  = XMFLOAT2(menuW, entryH);
+                bg.color = XMFLOAT4(0.15f, 0.55f, 0.15f, 0.85f);
+                wi::image::Draw(nullptr, bg, cmd);
+
+                wi::font::Params fp2;
+                fp2.posX = menuX + 12.0f; fp2.posY = listStartY + 8.0f;
+                fp2.size = 22;
+                fp2.color = wi::Color(255, 255, 255, 255);
+                wi::font::Draw("+ New Save", fp2, cmd);
+                listStartY += entryH + 10.0f;
+            }
+
+            // List existing saves
+            for (int si = 0; si < (int)saveFiles.size() && si < maxShow; ++si)
+            {
+                float ey = listStartY + (float)si * entryH;
+                bool hover = false;
+                float mx2 = (float)wi::input::GetPointer().x;
+                float my2 = (float)wi::input::GetPointer().y;
+                if (mx2 >= menuX && mx2 <= menuX + menuW && my2 >= ey && my2 <= ey + entryH)
+                    hover = true;
+
+                wi::image::Params bg;
+                bg.pos = XMFLOAT3(menuX, ey, 0);
+                bg.siz = XMFLOAT2(menuW, entryH - 2.0f);
+                bg.color = hover ? XMFLOAT4(0.3f, 0.3f, 0.6f, 0.9f) : XMFLOAT4(0.1f, 0.1f, 0.15f, 0.85f);
+                wi::image::Draw(nullptr, bg, cmd);
+
+                wi::font::Params fp2;
+                fp2.posX = menuX + 12.0f; fp2.posY = ey + 8.0f;
+                fp2.size = 22;
+                fp2.color = hover ? wi::Color(255, 255, 80, 255) : wi::Color(220, 220, 220, 230);
+                wi::font::Draw(saveFiles[si], fp2, cmd);
+
+                if (savesMenuSaveMode) {
+                    wi::font::Params ov;
+                    ov.posX = menuX + menuW - 100.0f; ov.posY = ey + 8.0f;
+                    ov.size = 18;
+                    ov.color = wi::Color(255, 120, 120, 200);
+                    wi::font::Draw("overwrite", ov, cmd);
+                }
+            }
+
+            // Footer
+            {
+                float footY = listStartY + (float)std::min((int)saveFiles.size(), maxShow) * entryH + 10.0f;
+                wi::font::Params fp2;
+                fp2.posX = menuX; fp2.posY = footY;
+                fp2.size = 18;
+                fp2.color = wi::Color(180, 180, 180, 180);
+                wi::font::Draw("[ESC] Close", fp2, cmd);
+            }
         }
     }
 
