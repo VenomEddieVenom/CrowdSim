@@ -65,6 +65,12 @@ public:
     int32_t selectedAgent = -1;  // agent index, or -1 for none
     int32_t selectedCar   = -1;  // car index, or -1 for none
 
+    // Shadow cascade sliders
+    float cascadeDist1_     = 30.0f;    // near cascade distance (m)
+    float cascadeDist2_     = 200.0f;   // far cascade distance (m)
+    bool  draggingCascade1_ = false;
+    bool  draggingCascade2_ = false;
+
     // Build mode
     using CellType = CityLayout::CellType;
     bool     buildModeEnabled = false;
@@ -332,6 +338,42 @@ public:
 
         // ---- Agent count: Numpad+ / Numpad- ----
         // (agent count now driven by placed houses)
+
+        // ---- Shadow cascade sliders (bottom-left panel) ----
+        {
+            XMFLOAT4 ptr  = wi::input::GetPointer();
+            bool lmbDown  = wi::input::Down(wi::input::MOUSE_BUTTON_LEFT);
+            bool lmbPress = wi::input::Press(wi::input::MOUSE_BUTTON_LEFT);
+
+            const float sliderX = 15.f, sliderW = 185.f;
+            const float track1Y = (float)cam.height - 85.f;
+            const float track2Y = (float)cam.height - 48.f;
+            const float trackH  = 12.f, hitExtra = 8.f;
+
+            auto hitTrack = [&](float ty) {
+                return ptr.x >= sliderX && ptr.x <= sliderX + sliderW
+                    && ptr.y >= ty - hitExtra && ptr.y <= ty + trackH + hitExtra;
+            };
+
+            if (lmbPress && hitTrack(track1Y)) { draggingCascade1_ = true; clickConsumedByPanel = true; }
+            if (lmbPress && hitTrack(track2Y)) { draggingCascade2_ = true; clickConsumedByPanel = true; }
+            if (!lmbDown) { draggingCascade1_ = false; draggingCascade2_ = false; }
+
+            if (draggingCascade1_) {
+                float t = std::clamp((ptr.x - sliderX) / sliderW, 0.f, 1.f);
+                cascadeDist1_ = 5.f + t * 145.f;  // 5 – 150 m
+                cascadeDist2_ = std::max(cascadeDist2_, cascadeDist1_ + 10.f);
+            }
+            if (draggingCascade2_) {
+                float t = std::clamp((ptr.x - sliderX) / sliderW, 0.f, 1.f);
+                cascadeDist2_ = 30.f + t * 770.f;  // 30 – 800 m
+                cascadeDist1_ = std::min(cascadeDist1_, cascadeDist2_ - 10.f);
+            }
+
+            // Apply current slider values to the sun light every frame
+            if (auto* sl = wi::scene::GetScene().lights.GetComponent(sunEntity))
+                sl->cascade_distances = { cascadeDist1_, cascadeDist2_ };
+        }
 
         // ---- Build mode toggle ----
         if (wi::input::Press((wi::input::BUTTON)'B'))
@@ -1362,6 +1404,66 @@ public:
         else
         {
             oss << "\n[1-6]         Sim speed: " << simSpeed << "x";
+        }
+
+        // ---- Shadow cascade slider panel (bottom-left, always visible) ----
+        {
+            const float panX = 10.f, panW = 215.f, panH = 105.f;
+            const float panY = (float)height - panH - 10.f;
+            const float sliderX = panX + 5.f, sliderW = 185.f, trackH = 12.f;
+            const float track1Y = panY + 30.f;
+            const float track2Y = panY + 67.f;
+
+            // Panel background
+            wi::image::Params bg;
+            bg.pos   = XMFLOAT3(panX, panY, 0.f);
+            bg.siz   = XMFLOAT2(panW, panH);
+            bg.color = XMFLOAT4(0.05f, 0.05f, 0.10f, 0.80f);
+            wi::image::Draw(nullptr, bg, cmd);
+
+            // Title
+            wi::font::Params tp;
+            tp.posX  = panX + 6.f; tp.posY = panY + 6.f;
+            tp.size  = 16; tp.color = wi::Color(160, 180, 255, 220);
+            wi::font::Draw("Shadow Cascades", tp, cmd);
+
+            auto drawSlider = [&](float trackY, float val, float minV, float maxV,
+                                  const char* label, wi::Color fillCol) {
+                float t = std::clamp((val - minV) / (maxV - minV), 0.f, 1.f);
+
+                // Track background
+                wi::image::Params bg2;
+                bg2.pos   = XMFLOAT3(sliderX, trackY, 0.f);
+                bg2.siz   = XMFLOAT2(sliderW, trackH);
+                bg2.color = XMFLOAT4(0.18f, 0.18f, 0.22f, 1.f);
+                wi::image::Draw(nullptr, bg2, cmd);
+
+                // Filled portion
+                wi::image::Params fill;
+                fill.pos   = XMFLOAT3(sliderX, trackY, 0.f);
+                fill.siz   = XMFLOAT2(sliderW * t, trackH);
+                fill.color = XMFLOAT4(fillCol.getR()/255.f, fillCol.getG()/255.f,
+                                      fillCol.getB()/255.f, 0.85f);
+                wi::image::Draw(nullptr, fill, cmd);
+
+                // Thumb
+                wi::image::Params thumb;
+                thumb.pos   = XMFLOAT3(sliderX + sliderW * t - 5.f, trackY - 3.f, 0.f);
+                thumb.siz   = XMFLOAT2(10.f, trackH + 6.f);
+                thumb.color = XMFLOAT4(1.f, 1.f, 1.f, 0.95f);
+                wi::image::Draw(nullptr, thumb, cmd);
+
+                // Label
+                std::ostringstream los;
+                los << label << ": " << std::fixed << std::setprecision(0) << val << " m";
+                wi::font::Params lp;
+                lp.posX  = sliderX; lp.posY = trackY + trackH + 2.f;
+                lp.size  = 14; lp.color = wi::Color(190, 190, 190, 200);
+                wi::font::Draw(los.str(), lp, cmd);
+            };
+
+            drawSlider(track1Y, cascadeDist1_,   5.f, 150.f, "Near", wi::Color(120, 160, 255, 255));
+            drawSlider(track2Y, cascadeDist2_,  30.f, 800.f, "Far",  wi::Color( 80, 210, 200, 255));
         }
 
         // Selected entity info panel
