@@ -125,19 +125,29 @@ uint32_t CarSystem::SpawnCar(const std::vector<XMFLOAT2>& roadPath, uint32_t col
     wage_[i]  = 0.50f + (float)((ws >> 8) & 0x3F) / 63.f * 1.50f;
     money_[i] = 0.f;
 
-    // Work schedule: mostly 7-9 AM departure, 8-10 h shift
-    // ~80% standard (7-9), ~12% early (5-7), ~8% night shift (20-23)
+    // Work schedule: spread across 6 shift windows for even traffic distribution
+    //   15% early morning  (5:00 – 7:00)   – bakeries, hospitals, logistics
+    //   25% morning rush   (7:00 – 9:00)   – classic office workers
+    //   15% late morning   (9:00 – 11:00)  – flexi workers, retail open
+    //   15% midday         (11:00 – 13:00) – split-shift, hospitality
+    //   15% afternoon      (14:00 – 16:00) – schools, part-time retail
+    //   15% night shift    (20:00 – 23:00) – bars, factories, security
     uint32_t schedSeed = ws * 1103515245u + 12345u;
     float schedRand = (float)((schedSeed >> 8) & 0xFF) / 255.f;
     float depart;
-    if (schedRand < 0.08f)
-        depart = 20.0f + (schedRand / 0.08f) * 3.0f;  // night: 20-23
-    else if (schedRand < 0.20f)
-        depart = 5.0f + ((schedRand - 0.08f) / 0.12f) * 2.0f;  // early: 5-7
-    else
-        depart = 7.0f + ((schedRand - 0.20f) / 0.80f) * 2.0f;  // standard: 7-9
+    if      (schedRand < 0.15f) depart = 5.0f  + (schedRand / 0.15f) * 2.0f;
+    else if (schedRand < 0.40f) depart = 7.0f  + ((schedRand - 0.15f) / 0.25f) * 2.0f;
+    else if (schedRand < 0.55f) depart = 9.0f  + ((schedRand - 0.40f) / 0.15f) * 2.0f;
+    else if (schedRand < 0.70f) depart = 11.0f + ((schedRand - 0.55f) / 0.15f) * 2.0f;
+    else if (schedRand < 0.85f) depart = 14.0f + ((schedRand - 0.70f) / 0.15f) * 2.0f;
+    else                        depart = 20.0f + ((schedRand - 0.85f) / 0.15f) * 3.0f;
 
-    float shiftLen = 7.5f + (float)(((schedSeed >> 16) & 0x1F)) / 31.f * 2.5f; // 7.5-10 h
+    // Shift length 4–10 h (includes part-time workers at 4–6 h)
+    uint32_t shiftSeed = (schedSeed >> 16) & 0xFF;
+    float shiftLen;
+    if (shiftSeed < 64)        shiftLen = 4.0f + (shiftSeed / 64.f) * 2.0f;   // 25% part-time  4-6 h
+    else if (shiftSeed < 128)  shiftLen = 6.0f + ((shiftSeed - 64) / 64.f) * 2.0f; // 25% mid  6-8 h
+    else                       shiftLen = 8.0f + ((shiftSeed - 128) / 128.f) * 2.0f; // 50% full 8-10 h
     schedDepart_[i] = depart;
     schedReturn_[i] = std::fmod(depart + shiftLen, 24.0f);
     lastDayTrip_[i] = 0;
