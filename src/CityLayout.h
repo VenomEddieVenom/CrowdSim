@@ -103,12 +103,46 @@ public:
         scene.materials.GetComponent(ground)->SetBaseColor(
             XMFLOAT4(0.18f, 0.38f, 0.12f, 1.0f)); // green grass (desaturated)
 
-        // Load house prefab once – BuildHouse uses Instantiate() per cell
+        // Load dom.wiscene ONCE into a prefab scene, then merge its meshes/materials
+        // into the main scene. All houses share the same mesh entity IDs → GPU instancing.
         wi::scene::LoadModel(domPrefab_, "models/dom.wiscene");
-        domPrefabLoaded_ = (domPrefab_.transforms.GetCount() > 0);
-        if (!domPrefabLoaded_)
+        if (domPrefab_.objects.GetCount() > 0) {
+            domPrefabLoaded_ = true;
+            // Compute world matrices for all prefab entities
+            domPrefab_.Update(0.0f);
+            // Collect (meshID, world-space local matrix) for every sub-object in the prefab
+            std::vector<wi::ecs::Entity> protoEnts;
+            for (size_t pi = 0; pi < domPrefab_.objects.GetCount(); ++pi) {
+                wi::ecs::Entity ent = domPrefab_.objects.GetEntity(pi);
+                auto& objComp = domPrefab_.objects[pi];
+                DomSubObject sub;
+                sub.meshID = objComp.meshID;
+                sub.color  = objComp.color;
+                auto* tr = domPrefab_.transforms.GetComponent(ent);
+                if (tr) sub.localMatrix = tr->world;
+                else XMStoreFloat4x4(&sub.localMatrix, XMMatrixIdentity());
+                domSubObjects_.push_back(sub);
+                protoEnts.push_back(ent);
+            }
+            // Also collect hierarchy-only (non-mesh, non-material) transforms for removal
+            for (size_t pi = 0; pi < domPrefab_.transforms.GetCount(); ++pi) {
+                wi::ecs::Entity ent = domPrefab_.transforms.GetEntity(pi);
+                if (!domPrefab_.meshes.GetComponent(ent) &&
+                    !domPrefab_.materials.GetComponent(ent) &&
+                    !domPrefab_.objects.GetComponent(ent))
+                    protoEnts.push_back(ent);
+            }
+            // Merge meshes + materials (and everything else) into main scene
+            scene.Merge(domPrefab_);
+            // Remove the prototype instances (object/transform entities) – shared meshes stay
+            for (auto e : protoEnts)
+                scene.Entity_Remove(e);
+            wi::backlog::post("[CityLayout] dom.wiscene merged – GPU instancing enabled",
+                              wi::backlog::LogLevel::Default);
+        } else {
             wi::backlog::post("[CityLayout] dom.wiscene not found, falling back to procedural houses",
                               wi::backlog::LogLevel::Warning);
+        }
     }
 
     // ----------------------------------------------------------
@@ -903,9 +937,15 @@ public:
         }
     }
 
-    // Prefab scene for dom.wiscene – loaded once in Initialize()
-    wi::scene::Scene domPrefab_;
+    // dom.wiscene shared instancing data
+    wi::scene::Scene domPrefab_;       // emptied after Initialize() merges into main scene
     bool domPrefabLoaded_ = false;
+    struct DomSubObject {
+        wi::ecs::Entity meshID = wi::ecs::INVALID_ENTITY;
+        XMFLOAT4X4 localMatrix;
+        XMFLOAT4   color = {1.f, 1.f, 1.f, 1.f};
+    };
+    std::vector<DomSubObject> domSubObjects_;  // one entry per mesh object in dom.wiscene
 
 private:
     void BuildHouse(int idx, int gx, int gz, XMFLOAT2 c, wi::scene::Scene& s)
@@ -916,18 +956,21 @@ private:
 
         if (domPrefabLoaded_)
         {
-            // Instantiate from prefab – safe, fast, no file I/O per house
-            wi::ecs::Entity root = s.Instantiate(domPrefab_, true);
-            auto* tr = s.transforms.GetComponent(root);
-            if (tr) {
-                // Vary rotation in 90° steps so adjacent houses don't look identical
-                float rot = static_cast<float>((gx * 7 + gz * 13) % 4) * XM_PIDIV2;
-                tr->ClearTransform();
-                tr->RotateRollPitchYaw(XMFLOAT3(0.0f, rot, 0.0f));
-                tr->Translate(XMFLOAT3(c.x, 0.0f, c.y));
-                tr->SetDirty();
+            // Create one entity per sub-object, all sharing the same mesh entity → GPU instanced
+            float rot = static_cast<float>((gx * 7 + gz * 13) % 4) * XM_PIDIV2;
+            XMMATRIX houseMat = XMMatrixRotationY(rot) * XMMatrixTranslation(c.x, 0.0f, c.y);
+            for (auto& sub : domSubObjects_) {
+                wi::ecs::Entity e = wi::ecs::CreateEntity();
+                s.layers.Create(e);
+                auto& tr = s.transforms.Create(e);
+                XMMATRIX world = XMLoadFloat4x4(&sub.localMatrix) * houseMat;
+                tr.MatrixTransform(world);
+                tr.UpdateTransform();
+                auto& obj = s.objects.Create(e);
+                obj.meshID = sub.meshID;  // shared mesh → instanced by renderer
+                obj.color  = sub.color;
+                cellEntities[idx].push_back(e);
             }
-            cellEntities[idx].push_back(root);
         }
         else
         {
