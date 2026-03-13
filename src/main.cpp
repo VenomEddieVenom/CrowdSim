@@ -184,7 +184,7 @@ public:
         if (sunLight)
         {
             sunLight->SetCastShadow(true);
-            sunLight->cascade_distances = { 20.0f, 80.0f, 300.0f, 1000.0f };
+            sunLight->cascade_distances = { 30.0f, 200.0f };  // 2 cascades; enough for overhead view
         }
         // Set initial sun rotation matching timeOfDay
         {
@@ -198,10 +198,10 @@ public:
         // ---- Post-process ----
         setExposure(1.3f);
         setBloomThreshold(0.6f);
-        setAO(AO_HBAO);
+        setAO(AO_MSAO);           // MSAO is much cheaper than HBAO
         setAOPower(1.5f);
         setShadowsEnabled(true);
-        setScreenSpaceShadowSampleCount(16);
+        setScreenSpaceShadowSampleCount(4);  // 16 was excessive
 
         wi::renderer::SetToDrawGridHelper(false);
     }
@@ -297,10 +297,12 @@ public:
                         1.0f,
                         0.75f + 0.20f * sunElev,
                         0.50f + 0.40f * sunElev);
+                    sunLight->SetCastShadow(true);   // sun is up — enable shadows
                 }
                 else
                 {
                     sunLight->intensity = 0.0f;
+                    sunLight->SetCastShadow(false);  // sun below horizon — skip shadow maps
                 }
             }
 
