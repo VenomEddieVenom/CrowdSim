@@ -181,9 +181,13 @@ void TrafficLightSystem::CreatePolesForIntersection(int gx, int gz,
     XMFLOAT2 center = city.GridCellCenter(gx, gz);
     float h = CS * 0.5f;
 
-    // 4 corners: NE, NW, SE, SW  (offset from center)
-    const float offX[4] = {  h - 1.5f, -(h - 1.5f),   h - 1.5f, -(h - 1.5f) };
-    const float offZ[4] = { -(h - 1.5f), -(h - 1.5f),  h - 1.5f,   h - 1.5f };
+    // Near-side signal placement: poles right behind the crosswalk zebra,
+    // on the right side of the road for approaching traffic.
+    // Order seen by driver: traffic light → crosswalk → intersection.
+    const float pOff  = h - 1.5f;   // 8.5  perpendicular (right side of road)
+    const float cwOff = h + 3.0f;   // 13.0 along approach  (2 tiles closer to crossroad)
+    const float offX[4] = {  pOff,  cwOff, -cwOff, -pOff };
+    const float offZ[4] = { cwOff, -pOff,   pOff, -cwOff };
 
     // Mast arm directions: from pole toward road center
     // Pole 0 (NE): arm → -X   Pole 1 (NW): arm → +Z

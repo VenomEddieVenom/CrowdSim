@@ -31,8 +31,8 @@ public:
     static constexpr float THROUGH_DUR  = 8.0f;
     static constexpr float YELLOW_DUR   = 2.0f;
     static constexpr float LEFT_DUR     = 4.0f;
-    static constexpr float ALL_RED_DUR  = 2.0f;
-    static constexpr float CYCLE_DUR    = (THROUGH_DUR + YELLOW_DUR + LEFT_DUR + ALL_RED_DUR) * 2.0f; // 32 s
+    static constexpr float ALL_RED_DUR  = 3.0f;
+    static constexpr float CYCLE_DUR    = (THROUGH_DUR + YELLOW_DUR + LEFT_DUR + ALL_RED_DUR) * 2.0f; // 34 s
     static constexpr int   NUM_PHASES   = 8;
 
     // Phase identifiers

@@ -199,6 +199,7 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
     constexpr int GS = CityLayout::GRID_SIZE;
     constexpr float CS = CityLayout::CELL_SIZE;
     constexpr float HALF_CS = CS * 0.5f;
+    constexpr float SIDEWALK_MID = HALF_CS - CityLayout::SIDEWALK_W + CityLayout::SIDEWALK_W * 0.5f; // 9.0 m
 
     // Track day transitions for trip-per-day tracking (only on first substep)
     if (sub == 0) {
@@ -839,15 +840,18 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
                 float toCZ = intC.y - posZ_[i];
                 float fwdDist = toCX * dirX + toCZ * dirZ;
                 if (fwdDist < 0.0f) return;
-                float stopLine = std::max(0.0f, fwdDist - HALF_CS - 1.0f);
+                // Stop at the traffic light pole (13 m from intersection centre)
+                float stopLine = fwdDist - HALF_CS - 3.0f;
+                if (stopLine < -1.0f) return; // already well past stop line, committed to crossing
+                float gap = std::max(0.0f, stopLine);
 
                 if (color == TrafficLightSystem::LightColor::RED)
                 {
-                    if (stopLine < bestGap) { bestGap = stopLine; bestSpd = 0.0f; }
+                    if (gap < bestGap) { bestGap = gap; bestSpd = 0.0f; }
                 }
                 else if (color == TrafficLightSystem::LightColor::YELLOW)
                 {
-                    if (stopLine > 3.0f && stopLine < bestGap) { bestGap = stopLine; bestSpd = 0.0f; }
+                    if (gap > 3.0f && gap < bestGap) { bestGap = gap; bestSpd = 0.0f; }
                 }
             };
 
@@ -916,8 +920,8 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
                         float toCZ2 = intC2.y - posZ_[i];
                         float fwdDist2 = toCX2 * segDir.x + toCZ2 * segDir.y;
                         if (fwdDist2 > 0.0f) {
-                            float stopDist = std::max(0.0f, fwdDist2 - HALF_CS - 1.0f);
-                            if (stopDist < bestGap) { bestGap = stopDist; bestSpd = 0.0f; }
+                            float stopDist = fwdDist2 - HALF_CS - 3.0f;
+                            if (stopDist > -1.0f && stopDist < bestGap) { bestGap = std::max(0.0f, stopDist); bestSpd = 0.0f; }
                         }
                     }
                     break; // only check nearest intersection
@@ -927,24 +931,56 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
 
         // ---- Pedestrian safety brake: yield to peds in our path ----
         if (peds && peds->count > 0 && onGrid) {
-            float scanAhead = std::min(20.0f, speed_[i] * 2.0f + 3.0f);
+            float scanAhead = std::min(40.0f, speed_[i] * 3.5f + 8.0f);
             float fwdX = std::sin(heading_[i]);
             float fwdZ = std::cos(heading_[i]);
-            for (int dg = -1; dg <= 1; dg++)
-            for (int dh = -1; dh <= 1; dh++) {
+            for (int dg = -2; dg <= 2; dg++)
+            for (int dh = -2; dh <= 2; dh++) {
                 int cgx = myGX + dh, cgz = myGZ + dg;
                 if (cgx < 0 || cgx >= GS || cgz < 0 || cgz >= GS) continue;
                 int cellKey = cgz * GS + cgx;
                 for (uint32_t p = peds->cellHead[cellKey]; p != UINT32_MAX; p = peds->cellNext[p]) {
                     if (peds->state[p] == 0) continue; // IDLE
+                    // Skip peds safely on the sidewalk — only brake for peds on road/crosswalk
+                    if (city.IsOnSidewalk(peds->posX[p], peds->posZ[p])) continue;
                     float pdx = peds->posX[p] - posX_[i];
                     float pdz = peds->posZ[p] - posZ_[i];
+
+                    // Method 1: Forward projection
                     float fwd = pdx * fwdX + pdz * fwdZ;
-                    if (fwd < 1.0f || fwd > scanAhead) continue;
                     float lat = std::abs(pdx * fwdZ - pdz * fwdX);
-                    if (lat > CAR_HW + 0.25f + 0.5f) continue; // 0.25 = PED_RADIUS
-                    float stopDist = std::max(0.0f, fwd - CAR_HL - 0.25f - 0.5f);
-                    if (stopDist < bestGap) { bestGap = stopDist; bestSpd = 0.0f; }
+                    float latThresh = (inIntersection || isTurn || inArc)
+                        ? (CAR_HW + 0.25f + 4.0f)
+                        : (CAR_HW + 0.25f + 1.0f);
+                    if (fwd > 0.3f && fwd <= scanAhead && lat <= latThresh) {
+                        float stopDist = std::max(0.0f, fwd - CAR_HL - 0.25f - 2.0f);
+                        if (stopDist < bestGap) { bestGap = stopDist; bestSpd = 0.0f; }
+                    }
+
+                    // Method 2: Radius check at intersections/turns
+                    if (inIntersection || inArc) {
+                        float d2 = pdx * pdx + pdz * pdz;
+                        float safeR = CAR_HL + 0.25f + 4.5f;
+                        if (d2 < safeR * safeR && d2 > 0.01f) {
+                            float dd = std::sqrt(d2);
+                            float stopDist = std::max(0.0f, dd - CAR_HL - 0.25f - 1.0f);
+                            if (stopDist < bestGap) { bestGap = stopDist; bestSpd = 0.0f; }
+                        }
+                    }
+
+                    // Method 3: Approaching turn — detect peds at next intersection
+                    if (!inIntersection && isTurn && fwd > -1.0f) {
+                        float pedToDst = std::sqrt(
+                            (peds->posX[p] - target_raw.x) * (peds->posX[p] - target_raw.x) +
+                            (peds->posZ[p] - target_raw.y) * (peds->posZ[p] - target_raw.y));
+                        if (pedToDst < HALF_CS + SIDEWALK_MID) {
+                            float myToDst = std::sqrt(
+                                (posX_[i] - target_raw.x) * (posX_[i] - target_raw.x) +
+                                (posZ_[i] - target_raw.y) * (posZ_[i] - target_raw.y));
+                            float stopDist = std::max(0.0f, myToDst - HALF_CS - 2.0f);
+                            if (stopDist < bestGap) { bestGap = stopDist; bestSpd = 0.0f; }
+                        }
+                    }
                 }
             }
         }
@@ -998,7 +1034,7 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
             speed_[i] = std::min(speed_[i], 0.5f);
 
         // Cars inside an intersection creep through to clear the box, but only if room ahead
-        if (inIntersection && speed_[i] < 2.0f && bestGap > 0.0f)
+        if (inIntersection && speed_[i] < 2.0f && bestGap > 5.0f)
             speed_[i] = std::min(2.0f, desiredMax);
 
         // ---- Proactive lane switching (congestion avoidance) ----
@@ -1212,6 +1248,22 @@ void CarSystem::CreateInstPool()
         obj.color  = XMFLOAT4(0.82f, 0.82f, 0.82f, 1.f);
         instPool_[j] = e;
     }
+}
+
+// ============================================================
+//  GetCarView — return lightweight snapshot for CrowdSystem
+// ============================================================
+CarView CarSystem::GetCarView() const
+{
+    CarView v;
+    v.posX     = posX_.data();
+    v.posZ     = posZ_.data();
+    v.speed    = speed_.data();
+    v.heading  = heading_.data();
+    v.count    = activeCount;
+    v.cellHead = driveHead_.data();
+    v.cellNext = driveNext_.data();
+    return v;
 }
 
 // ============================================================

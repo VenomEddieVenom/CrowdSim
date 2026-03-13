@@ -142,6 +142,15 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/build/models/drzewo.wiscene")
         VERBATIM
     )
 endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/build/models/dom.wiscene")
+    add_custom_command(TARGET CrowdSim POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/build/models/dom.wiscene"
+            "$<TARGET_FILE_DIR:CrowdSim>/models/dom.wiscene"
+        COMMENT "Copying dom.wiscene..."
+        VERBATIM
+    )
+endif()
 
 set(WE_DXCOMPILER "${wickedengine_SOURCE_DIR}/WickedEngine/dxcompiler.dll")
 if(EXISTS "${WE_DXCOMPILER}")

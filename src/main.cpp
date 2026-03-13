@@ -80,6 +80,12 @@ public:
 
     // Saves menu
     bool     savesMenuOpen = false;
+    bool     showSidewalkDebug = false;  // F8 toggle: visualise sidewalk layer
+    float    hoverWorldX = 0.f, hoverWorldZ = 0.f;  // world-space hit position
+    bool     swDebugClickActive = false;
+    float    swDebugClickX = 0.f, swDebugClickZ = 0.f;
+    int      swDebugClickSX = 0, swDebugClickSZ = 0;
+    bool     swDebugClickOnSW = false;
     std::vector<std::string> saveFiles;     // filenames in saves/
     int      savesMenuScroll = 0;
     bool     savesMenuSaveMode = false;     // true = saving, false = loading
@@ -121,6 +127,7 @@ public:
         }
         trafficLights.RebuildIntersections(city);
         PlaceCrosswalksAroundIntersections();
+        city.BuildSidewalkLayer([&](int gx, int gz){ return trafficLights.IsIntersection(gx, gz); });
         for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
         for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2) {
             int lanes = sd.roadLanes[gz2 * CityLayout::GRID_SIZE + gx2];
@@ -363,6 +370,7 @@ public:
                 {
                     float hx = XMVectorGetX(nearPt) + XMVectorGetX(rDir) * t;
                     float hz = XMVectorGetZ(nearPt) + XMVectorGetZ(rDir) * t;
+                    hoverWorldX = hx; hoverWorldZ = hz;
                     hoverValid = city.WorldToGrid(hx, hz, hoverGX, hoverGZ);
                 }
             }
@@ -421,6 +429,7 @@ public:
                         // Place start cell immediately
                         city.PlaceCell(hoverGX, hoverGZ, CellType::ROAD);
                         trafficLights.RebuildIntersections(city);
+                        city.BuildSidewalkLayer([&](int gx2, int gz2){ return trafficLights.IsIntersection(gx2, gz2); });
                         TrySpawnAllUnspawnedHouses();
                         roadPreviewPath.clear();
                     }
@@ -439,6 +448,7 @@ public:
                         if (anyPlaced)
                         {
                             trafficLights.RebuildIntersections(city);
+                            city.BuildSidewalkLayer([&](int gx2, int gz2){ return trafficLights.IsIntersection(gx2, gz2); });
                             TrySpawnAllUnspawnedHouses();
                         }
                         roadPlaceActive = false;
@@ -476,6 +486,7 @@ public:
                         {
                             city.PlaceCell(hoverGX, hoverGZ, CellType::CROSSWALK);
                             trafficLights.RebuildIntersections(city);
+                            city.BuildSidewalkLayer([&](int gx2, int gz2){ return trafficLights.IsIntersection(gx2, gz2); });
                         }
                     }
                 }
@@ -547,6 +558,12 @@ public:
             pendingSaveName.clear();
             RefreshSaveList();
             savesMenuOpen = true;
+        }
+        // ---- Sidewalk debug layer (F8) ----
+        if (wi::input::Press(wi::input::KEYBOARD_BUTTON_F8))
+        {
+            showSidewalkDebug = !showSidewalkDebug;
+            swDebugClickActive = false;
         }
         if (wi::input::Press(wi::input::KEYBOARD_BUTTON_F9))
         {
@@ -636,7 +653,8 @@ public:
         // ---- Simulate cars + traffic lights + pedestrians + render ----
         trafficLights.Update(dt * simSpeed);
         trafficLights.UpdateVisuals();
-        crowd.Update(dt * simSpeed, city, trafficLights);
+        auto carView = cars.GetCarView();
+        crowd.Update(dt * simSpeed, city, trafficLights, &carView);
         auto pedView = crowd.GetView();
         cars.Update(dt * simSpeed, city, trafficLights, timeOfDay, dayDuration, &pedView);
         townTreasury += cars.DrainTax();
@@ -873,6 +891,65 @@ public:
             }
         }
 
+        // ---- Sidewalk debug: click to inspect sub-cell ----
+        if (showSidewalkDebug && !buildModeEnabled &&
+            wi::input::Press(wi::input::MOUSE_BUTTON_LEFT) &&
+            !wi::input::Down(wi::input::MOUSE_BUTTON_RIGHT))
+        {
+            // Compute ground-plane hit from mouse
+            XMFLOAT4 ptr2 = wi::input::GetPointer();
+            XMMATRIX invVP2 = XMMatrixInverse(nullptr, cam.GetViewProjection());
+            float ndcX2 =  (ptr2.x / static_cast<float>(cam.width))  * 2.0f - 1.0f;
+            float ndcY2 = 1.0f - (ptr2.y / static_cast<float>(cam.height)) * 2.0f;
+            XMVECTOR nearPt2 = XMVector3TransformCoord(XMVectorSet(ndcX2, ndcY2, 0.f, 1.f), invVP2);
+            XMVECTOR farPt2  = XMVector3TransformCoord(XMVectorSet(ndcX2, ndcY2, 1.f, 1.f), invVP2);
+            XMVECTOR rDir2   = XMVector3Normalize(farPt2 - nearPt2);
+            float rDirY2 = XMVectorGetY(rDir2);
+            if (fabsf(rDirY2) > 0.001f) {
+                float t2 = -XMVectorGetY(nearPt2) / rDirY2;
+                if (t2 > 0.0f) {
+                    float hitX = XMVectorGetX(nearPt2) + XMVectorGetX(rDir2) * t2;
+                    float hitZ = XMVectorGetZ(nearPt2) + XMVectorGetZ(rDir2) * t2;
+                    swDebugClickX = hitX;
+                    swDebugClickZ = hitZ;
+                    constexpr float HW2 = CityLayout::HALF_WORLD;
+                    constexpr float SS2 = CityLayout::SW_SUB_SIZE;
+                    swDebugClickSX = (int)std::floor((hitX + HW2) / SS2);
+                    swDebugClickSZ = (int)std::floor((hitZ + HW2) / SS2);
+                    swDebugClickOnSW = city.IsOnSidewalk(hitX, hitZ);
+                    swDebugClickActive = true;
+                }
+            }
+        }
+
+        // ---- Sidewalk debug overlay (F8) ----
+        if (showSidewalkDebug)
+        {
+            constexpr int   SD = CityLayout::SW_DIM;
+            constexpr float SS = CityLayout::SW_SUB_SIZE;
+            constexpr float HW = CityLayout::HALF_WORLD;
+            const float debugY = 0.30f;
+            const XMFLOAT4 swColor(0.0f, 0.8f, 1.0f, 0.45f);
+            // Only draw near camera to avoid flooding
+            XMFLOAT3 camPos;
+            XMStoreFloat3(&camPos, wi::scene::GetCamera().GetEye());
+            const float drawRadius = 120.0f;
+            for (int sz = 0; sz < SD; sz++)
+            for (int sx = 0; sx < SD; sx++) {
+                if (!city.sidewalkLayer[sz * SD + sx]) continue;
+                float cx = -HW + (sx + 0.5f) * SS;
+                float cz = -HW + (sz + 0.5f) * SS;
+                if (std::abs(cx - camPos.x) > drawRadius || std::abs(cz - camPos.z) > drawRadius) continue;
+                float hs = SS * 0.48f;
+                wi::renderer::RenderableLine sl;
+                sl.color_start = sl.color_end = swColor;
+                sl.start={cx-hs,debugY,cz-hs}; sl.end={cx+hs,debugY,cz-hs}; wi::renderer::DrawLine(sl);
+                sl.start={cx+hs,debugY,cz-hs}; sl.end={cx+hs,debugY,cz+hs}; wi::renderer::DrawLine(sl);
+                sl.start={cx+hs,debugY,cz+hs}; sl.end={cx-hs,debugY,cz+hs}; wi::renderer::DrawLine(sl);
+                sl.start={cx-hs,debugY,cz+hs}; sl.end={cx-hs,debugY,cz-hs}; wi::renderer::DrawLine(sl);
+            }
+        }
+
         if (dt > 1e-6f)
             displayFPS = displayFPS * 0.9f + (1.0f / dt) * 0.1f;
     }
@@ -974,6 +1051,7 @@ public:
             }
         }
         trafficLights.RebuildIntersections(city);
+        city.BuildSidewalkLayer([&](int gx, int gz){ return trafficLights.IsIntersection(gx, gz); });
     }
 
     // Called when roads or a workplace is placed – try all unspawned houses
@@ -1177,7 +1255,15 @@ public:
             << "[Shift]       Sprint\n"
             << "[Scroll]      Speed: " << static_cast<int>(moveSpeed) << " u/s\n"
             << "[B]           Build Mode: " << (buildModeEnabled ? "ON" : "OFF") << "\n"
-            << "[F5]          Save  |  [F9] Load / Saves Menu";
+            << "[F5]          Save  |  [F9] Load / Saves Menu\n"
+            << "[F8]          Sidewalk Debug: " << (showSidewalkDebug ? "ON" : "OFF");
+        if (showSidewalkDebug && swDebugClickActive)
+        {
+            oss << "\n  Click: world(" << std::fixed << std::setprecision(1)
+                << swDebugClickX << ", " << swDebugClickZ << ") sub("
+                << swDebugClickSX << "," << swDebugClickSZ << ") "
+                << (swDebugClickOnSW ? "SIDEWALK" : "NOT sidewalk");
+        }
         if (buildModeEnabled)
         {
             if (placeTool == 0)

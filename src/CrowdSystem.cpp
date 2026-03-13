@@ -135,47 +135,88 @@ std::vector<XMFLOAT2> CrowdSystem::FindPedPath(
         return {{cc.x + SIDEWALK_MID, cc.y}};
     }
 
-    // Convert cell path to sidewalk waypoints
-    // Pedestrians walk on the RIGHT side of the road (right-hand drive convention)
+    // Convert cell path to sidewalk waypoints.
+    // Peds walk ONLY on sidewalks and crosswalks — never on road surface.
+    // Right-hand traffic convention: walk on right side of road.
     std::vector<XMFLOAT2> waypoints;
+
+    auto sidewalkOff = [](int dx, int dz, float& ox, float& oz) {
+        ox = oz = 0.f;
+        if (dx == 0) ox = (dz < 0) ? SIDEWALK_MID : -SIDEWALK_MID;
+        if (dz == 0) oz = (dx > 0) ? SIDEWALK_MID : -SIDEWALK_MID;
+    };
 
     for (size_t i = 0; i < cellPath.size(); i++) {
         int cx = cellPath[i] % GS, cz = cellPath[i] / GS;
         auto cc = city.GridCellCenter(cx, cz);
 
-        int ddx = 0, ddz = 0;
-        if (i == 0) {
-            int nx = cellPath[1] % GS, nz = cellPath[1] / GS;
-            ddx = nx - cx; ddz = nz - cz;
-        } else {
+        // Incoming direction
+        int pddx = 0, pddz = 0;
+        if (i > 0) {
             int px = cellPath[i-1] % GS, pz = cellPath[i-1] / GS;
-            ddx = cx - px; ddz = cz - pz;
+            pddx = cx - px; pddz = cz - pz;
+        } else if (cellPath.size() > 1) {
+            int nx = cellPath[1] % GS, nz = cellPath[1] / GS;
+            pddx = nx - cx; pddz = nz - cz;
         }
 
-        // Right side offset from travel direction
-        // Going N (ddz=-1): right = E (+x)
-        // Going S (ddz=+1): right = W (-x)
-        // Going E (ddx=+1): right = S (+z)
-        // Going W (ddx=-1): right = N (-z)
-        float offX = 0.f, offZ = 0.f;
-        if (ddx == 0) offX = (ddz < 0) ? SIDEWALK_MID : -SIDEWALK_MID;
-        if (ddz == 0) offZ = (ddx > 0) ? SIDEWALK_MID : -SIDEWALK_MID;
-
-        // At direction changes, add corner waypoints
-        if (i > 0 && i + 1 < cellPath.size()) {
-            int nnx = cellPath[i+1] % GS, nnz = cellPath[i+1] / GS;
-            int nddx = nnx - cx, nddz = nnz - cz;
-            if (nddx != ddx || nddz != ddz) {
-                waypoints.push_back({cc.x + offX, cc.y + offZ});
-                float offX2 = 0.f, offZ2 = 0.f;
-                if (nddx == 0) offX2 = (nddz < 0) ? SIDEWALK_MID : -SIDEWALK_MID;
-                if (nddz == 0) offZ2 = (nddx > 0) ? SIDEWALK_MID : -SIDEWALK_MID;
-                waypoints.push_back({cc.x + offX2, cc.y + offZ2});
-                continue;
-            }
+        // Outgoing direction
+        int nddx = pddx, nddz = pddz;
+        if (i + 1 < cellPath.size()) {
+            int nx = cellPath[i+1] % GS, nz = cellPath[i+1] / GS;
+            nddx = nx - cx; nddz = nz - cz;
         }
 
-        waypoints.push_back({cc.x + offX, cc.y + offZ});
+        // Detect turn
+        bool isTurn = (i > 0 && i + 1 < cellPath.size() && (pddx != nddx || pddz != nddz));
+
+        if (!isTurn) {
+            // Straight: sidewalk waypoint
+            float ox, oz;
+            sidewalkOff(pddx, pddz, ox, oz);
+            waypoints.push_back({cc.x + ox, cc.y + oz});
+            continue;
+        }
+
+        // === TURN at intersection cell ===
+        // Previous cell = approach crosswalk. Crossing happens there.
+        int px = cellPath[i-1] % GS, pz = cellPath[i-1] / GS;
+        auto prevC = city.GridCellCenter(px, pz);
+
+        float pox, poz;  // incoming sidewalk offset
+        sidewalkOff(pddx, pddz, pox, poz);
+        float nox, noz;  // outgoing sidewalk offset
+        sidewalkOff(nddx, nddz, nox, noz);
+
+        // Inner edge of approach crosswalk cell (boundary with intersection)
+        float edgeAlongX = (float)pddx * HCS;
+        float edgeAlongZ = (float)pddz * HCS;
+
+        int turn = pddx * nddz - pddz * nddx; // >0 right, <0 left
+
+        if (turn > 0) {
+            // RIGHT turn: stay on same sidewalk, round the corner
+            // 1. Approach: inner edge of crosswalk cell, on current sidewalk
+            waypoints.push_back({prevC.x + pox + edgeAlongX,
+                                 prevC.y + poz + edgeAlongZ});
+            // 2. Corner: intersection outer corner where two sidewalks meet
+            float crnX = (pox != 0.f) ? pox : nox;
+            float crnZ = (poz != 0.f) ? poz : noz;
+            waypoints.push_back({cc.x + crnX, cc.y + crnZ});
+        } else {
+            // LEFT turn: cross at approach crosswalk, then walk around
+            // 1. Approach: inner edge of crosswalk, current sidewalk
+            waypoints.push_back({prevC.x + pox + edgeAlongX,
+                                 prevC.y + poz + edgeAlongZ});
+            // 2. Cross road at crosswalk inner edge (opposite sidewalk)
+            waypoints.push_back({prevC.x - pox + edgeAlongX,
+                                 prevC.y - poz + edgeAlongZ});
+            // 3. Far corner of intersection
+            float crnX = (pox != 0.f) ? -pox : nox;
+            float crnZ = (poz != 0.f) ? -poz : noz;
+            waypoints.push_back({cc.x + crnX, cc.y + crnZ});
+        }
+        // Exit waypoint on next cell is handled when that cell is processed
     }
 
     if (waypoints.size() > MAX_WP)
@@ -228,7 +269,8 @@ void CrowdSystem::RebuildSpatialHash()
 //  Update
 // ============================================================
 void CrowdSystem::Update(float dt, const CityLayout& city,
-                          const TrafficLightSystem& lights)
+                          const TrafficLightSystem& lights,
+                          const CarView* carView)
 {
     RebuildSpatialHash();
 
@@ -256,7 +298,16 @@ void CrowdSystem::Update(float dt, const CityLayout& city,
         int myGX, myGZ;
         bool onGrid = city.WorldToGrid(posX_[i], posZ_[i], myGX, myGZ);
 
+        // Only stop at red if ped hasn't started crossing yet.
+        // If already on a crosswalk or intersection, keep going to finish crossing.
+        bool alreadyCrossing = false;
         if (onGrid) {
+            auto ct = city.GetCellType(myGX, myGZ);
+            alreadyCrossing = city.IsCrosswalk(myGX, myGZ) ||
+                              (ct == CityLayout::CellType::ROAD && lights.IsIntersection(myGX, myGZ));
+        }
+
+        if (onGrid && !alreadyCrossing) {
             int tgtGX, tgtGZ;
             if (city.WorldToGrid(target.x, target.y, tgtGX, tgtGZ)) {
                 if (city.IsCrosswalk(tgtGX, tgtGZ) && !CanPedCross(tgtGX, tgtGZ, city, lights)) {
@@ -269,36 +320,25 @@ void CrowdSystem::Update(float dt, const CityLayout& city,
         state_[i] = State::WALKING;
         float spd = speed_[i];
 
-        // Ped-ped avoidance
-        if (onGrid) {
-            for (int dg = -1; dg <= 1; dg++)
-            for (int dh = -1; dh <= 1; dh++) {
+        // Ped yields to approaching cars (skip if on sidewalk)
+        if (carView && carView->count > 0 && onGrid && !city.IsOnSidewalk(posX_[i], posZ_[i]) && distToTarget > 0.01f) {
+            constexpr int GS = CityLayout::GRID_SIZE;
+            for (int dg = -1; dg <= 1 && spd > 0.0f; dg++)
+            for (int dh = -1; dh <= 1 && spd > 0.0f; dh++) {
                 int cgx = myGX + dh, cgz = myGZ + dg;
                 if (cgx < 0 || cgx >= GS || cgz < 0 || cgz >= GS) continue;
-                int cellKey = cgz * GS + cgx;
-                for (uint32_t j = cellHead_[cellKey]; j != UINT32_MAX; j = cellNext_[j]) {
-                    if (j == i) continue;
-                    float odx = posX_[j] - posX_[i], odz = posZ_[j] - posZ_[i];
-                    float dd2 = odx * odx + odz * odz;
-                    if (dd2 > PED_AVOID_DIST * PED_AVOID_DIST) continue;
-                    float dd = std::sqrt(dd2);
-                    if (dd < PED_MIN_SEP) {
-                        if (dd > 0.01f) {
-                            float nx = odx / dd, nz = odz / dd;
-                            float push = (PED_MIN_SEP - dd) * 0.3f;
-                            posX_[i] -= nx * push;
-                            posZ_[i] -= nz * push;
-                        }
-                        spd *= 0.3f;
-                    } else if (dd < PED_AVOID_DIST) {
-                        float myFwdX = std::sin(heading_[i]);
-                        float myFwdZ = std::cos(heading_[i]);
-                        float fwd = odx * myFwdX + odz * myFwdZ;
-                        if (fwd > 0) {
-                            float t = 1.f - (dd - PED_MIN_SEP) / (PED_AVOID_DIST - PED_MIN_SEP);
-                            spd *= (1.f - 0.5f * t);
-                        }
-                    }
+                int ck = cgz * GS + cgx;
+                for (uint32_t c = carView->cellHead[ck]; c != UINT32_MAX; c = carView->cellNext[c]) {
+                    if (carView->speed[c] < 0.5f) continue;
+                    float toX = posX_[i] - carView->posX[c];
+                    float toZ = posZ_[i] - carView->posZ[c];
+                    float d2 = toX * toX + toZ * toZ;
+                    if (d2 > 64.0f || d2 < 0.01f) continue; // within 8m
+                    float cfx = std::sin(carView->heading[c]);
+                    float cfz = std::cos(carView->heading[c]);
+                    float ahead = toX * cfx + toZ * cfz;
+                    float lat = std::abs(toX * cfz - toZ * cfx);
+                    if (ahead > 0.0f && ahead < 8.0f && lat < 2.5f) { spd = 0.0f; break; }
                 }
             }
         }
@@ -314,24 +354,9 @@ void CrowdSystem::Update(float dt, const CityLayout& city,
         posZ_[i] += ndz * step;
         heading_[i] = std::atan2(ndx, ndz);
 
-        // Clamp to sidewalk on regular road cells
-        if (onGrid) {
-            auto ct = city.GetCellType(myGX, myGZ);
-            if (ct == CityLayout::CellType::ROAD && !lights.IsIntersection(myGX, myGZ)) {
-                auto cc = city.GridCellCenter(myGX, myGZ);
-                float relX = posX_[i] - cc.x;
-                float relZ = posZ_[i] - cc.y;
-                bool hasNS = city.IsRoadLike(myGX, myGZ - 1) || city.IsRoadLike(myGX, myGZ + 1);
-                bool hasEW = city.IsRoadLike(myGX - 1, myGZ) || city.IsRoadLike(myGX + 1, myGZ);
-                if (hasNS && !hasEW) {
-                    if (std::abs(relX) < SIDEWALK_INNER)
-                        posX_[i] = cc.x + ((relX >= 0) ? SIDEWALK_MID : -SIDEWALK_MID);
-                } else if (hasEW && !hasNS) {
-                    if (std::abs(relZ) < SIDEWALK_INNER)
-                        posZ_[i] = cc.y + ((relZ >= 0) ? SIDEWALK_MID : -SIDEWALK_MID);
-                }
-            }
-        }
+        // Snap to sidewalk layer if strayed off
+        if (!city.IsOnSidewalk(posX_[i], posZ_[i]))
+            city.SnapToSidewalk(posX_[i], posZ_[i]);
     }
 }
 

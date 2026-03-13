@@ -7,6 +7,7 @@
 
 // Forward-declared lightweight ped view (defined in CrowdSystem.h)
 struct PedestrianView;
+struct CarView;
 
 // ============================================================
 //  CarSystem  –  city traffic simulation
@@ -35,7 +36,7 @@ public:
     static constexpr float CAR_HW      =  0.50f;  // half-width  (~1.0 m)
     static constexpr float CAR_HH      =  0.35f;  // half-height (~0.7 m)
     static constexpr float CAR_HL      =  1.00f;  // half-length (~2.0 m)
-    static constexpr float MIN_SEP     =  CAR_HL * 2.f + 0.5f; // bumper-to-bumper (2.5 m)
+    static constexpr float MIN_SEP     =  CAR_HL * 2.f + 1.5f; // bumper-to-bumper (3.5 m)
     static constexpr float LAT_BAND    =  1.5f;   // lateral collision band (< inter-lane gap of 3m)
 
     // Lane offsets for each road mode (per-direction, from centreline)
@@ -71,6 +72,7 @@ public:
     void     RenderCars(const XMFLOAT3& cameraPos, const CityLayout& city);
 
     uint32_t GetCarCount()        const { return activeCount; }
+    CarView  GetCarView()        const;
     float    GetPosX(uint32_t i)  const { return i < posX_.size() ? posX_[i] : 0.f; }
     float    GetPosZ(uint32_t i)  const { return i < posZ_.size() ? posZ_[i] : 0.f; }
     // Drain tax accumulated since last call (main loop adds to treasury)

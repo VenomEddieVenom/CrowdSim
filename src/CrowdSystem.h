@@ -18,6 +18,17 @@ struct PedestrianView {
     const uint32_t* cellNext = nullptr; // per-ped next pointer
 };
 
+// Lightweight car-data view — passed to CrowdSystem so peds yield to cars
+struct CarView {
+    const float*    posX     = nullptr;
+    const float*    posZ     = nullptr;
+    const float*    speed    = nullptr;
+    const float*    heading  = nullptr;
+    uint32_t        count    = 0;
+    const uint32_t* cellHead = nullptr;
+    const uint32_t* cellNext = nullptr;
+};
+
 // ============================================================
 //  CrowdSystem — sidewalk-only pedestrian simulation
 //
@@ -48,7 +59,8 @@ public:
     uint32_t SpawnPed(int homeGX, int homeGZ, int workGX, int workGZ,
                       const CityLayout& city);
     void     Update(float dt, const CityLayout& city,
-                    const TrafficLightSystem& lights);
+                    const TrafficLightSystem& lights,
+                    const CarView* carView = nullptr);
     void     Render(const XMFLOAT3& cameraPos);
 
     uint32_t GetPedCount() const { return activeCount_; }

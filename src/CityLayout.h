@@ -4,6 +4,8 @@
 #include <queue>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <functional>
 #include <fstream>
 
 // ============================================================
@@ -22,6 +24,12 @@ public:
     static constexpr float HALF_WORLD = GRID_SIZE * CELL_SIZE * 0.5f;   // 400 m
     static constexpr float SIDEWALK_W = 2.0f;
     static constexpr float GRID_CELL  = 2.0f;  // legacy API compat
+
+    // Sidewalk walkability layer: 10×10 sub-cells per grid cell (2 m resolution)
+    static constexpr int   SW_SUB      = 10;
+    static constexpr float SW_SUB_SIZE = CELL_SIZE / SW_SUB;          // 2 m
+    static constexpr int   SW_DIM      = GRID_SIZE * SW_SUB;          // 400
+    bool sidewalkLayer[SW_DIM * SW_DIM] = {};
 
     enum class CellType : uint8_t { EMPTY = 0, ROAD, HOUSE, WORKPLACE, CROSSWALK, PARKING };
 
@@ -116,6 +124,128 @@ public:
     {
         if (!InBounds(gx, gz)) return CellType::EMPTY;
         return cellType[gz * GRID_SIZE + gx];
+    }
+
+    // ----------------------------------------------------------
+    //  Sidewalk walkability layer
+    // ----------------------------------------------------------
+    void BuildSidewalkLayer(const std::function<bool(int,int)>& isIntersection)
+    {
+        std::memset(sidewalkLayer, 0, sizeof(sidewalkLayer));
+        for (int gz = 0; gz < GRID_SIZE; gz++)
+        for (int gx = 0; gx < GRID_SIZE; gx++) {
+            CellType ct = GetCellType(gx, gz);
+            bool hasN = IsRoadLike(gx, gz-1), hasS = IsRoadLike(gx, gz+1);
+            bool hasE = IsRoadLike(gx+1, gz), hasW = IsRoadLike(gx-1, gz);
+            int bx = gx * SW_SUB, bz = gz * SW_SUB;
+
+            if (ct == CellType::CROSSWALK) {
+                // Find which neighbour is the intersection → determines road direction
+                bool intN = gz > 0 && isIntersection(gx, gz-1);
+                bool intS = gz < GRID_SIZE-1 && isIntersection(gx, gz+1);
+                bool intE = gx < GRID_SIZE-1 && isIntersection(gx+1, gz);
+                bool intW = gx > 0 && isIntersection(gx-1, gz);
+                bool nsRoad = intN || intS;   // road runs N↔S
+                bool ewRoad = intE || intW;   // road runs E↔W
+                for (int sz = 0; sz < SW_SUB; sz++)
+                for (int sx = 0; sx < SW_SUB; sx++) {
+                    bool mark = false;
+                    if (nsRoad) {
+                        // Sidewalk strips only on edges facing non-road neighbours
+                        if (!hasW && sx == 0) mark = true;
+                        if (!hasE && sx == SW_SUB-1) mark = true;
+                        // Crossing band: 2 sub-cells at intersection-facing edge (1 more in intersection cell)
+                        if (intN && sz <= 1) mark = true;
+                        if (intS && sz >= SW_SUB-2) mark = true;
+                    }
+                    if (ewRoad) {
+                        if (!hasN && sz == 0) mark = true;
+                        if (!hasS && sz == SW_SUB-1) mark = true;
+                        // Crossing band: 2 sub-cells at intersection-facing edge
+                        if (intE && sx >= SW_SUB-2) mark = true;
+                        if (intW && sx <= 1) mark = true;
+                    }
+                    if (mark) sidewalkLayer[(bz+sz)*SW_DIM + bx+sx] = true;
+                }
+            }
+            else if (ct == CellType::ROAD && isIntersection(gx, gz)) {
+                // Only mark edges facing non-road neighbours
+                for (int sz = 0; sz < SW_SUB; sz++)
+                for (int sx = 0; sx < SW_SUB; sx++) {
+                    bool mark = false;
+                    if (!hasW && sx == 0) mark = true;
+                    if (!hasE && sx == SW_SUB-1) mark = true;
+                    if (!hasN && sz == 0) mark = true;
+                    if (!hasS && sz == SW_SUB-1) mark = true;
+                    if (mark) sidewalkLayer[(bz+sz)*SW_DIM + bx+sx] = true;
+                }
+                // Mark visible corners (where two connected sides meet)
+                auto setBit = [&](int sx, int sz){ sidewalkLayer[(bz+sz)*SW_DIM+bx+sx] = true; };
+                if (hasE && hasN) setBit(SW_SUB-1, 0);
+                if (hasW && hasN) setBit(0, 0);
+                if (hasE && hasS) setBit(SW_SUB-1, SW_SUB-1);
+                if (hasW && hasS) setBit(0, SW_SUB-1);
+                // Crossing band: 1 sub-cell at edge facing a crosswalk (extends the band from the crosswalk cell)
+                auto isCW = [&](int cx, int cz){ return InBounds(cx,cz) && cellType[cz*GRID_SIZE+cx]==CellType::CROSSWALK; };
+                if (isCW(gx, gz-1)) for (int sx=0; sx<SW_SUB; sx++) sidewalkLayer[bz*SW_DIM+bx+sx] = true;
+                if (isCW(gx, gz+1)) for (int sx=0; sx<SW_SUB; sx++) sidewalkLayer[(bz+SW_SUB-1)*SW_DIM+bx+sx] = true;
+                if (isCW(gx+1, gz)) for (int sz=0; sz<SW_SUB; sz++) sidewalkLayer[(bz+sz)*SW_DIM+bx+SW_SUB-1] = true;
+                if (isCW(gx-1, gz)) for (int sz=0; sz<SW_SUB; sz++) sidewalkLayer[(bz+sz)*SW_DIM+bx] = true;
+            }
+            else if (ct == CellType::ROAD) {
+                // Only mark edges facing non-road neighbours (1 sub-cell wide)
+                for (int sz = 0; sz < SW_SUB; sz++)
+                for (int sx = 0; sx < SW_SUB; sx++) {
+                    if (!hasW && sx == 0) sidewalkLayer[(bz+sz)*SW_DIM + bx+sx] = true;
+                    if (!hasE && sx == SW_SUB-1) sidewalkLayer[(bz+sz)*SW_DIM + bx+sx] = true;
+                    if (!hasN && sz == 0) sidewalkLayer[(bz+sz)*SW_DIM + bx+sx] = true;
+                    if (!hasS && sz == SW_SUB-1) sidewalkLayer[(bz+sz)*SW_DIM + bx+sx] = true;
+                }
+                // Mark visible corners
+                auto setBit2 = [&](int sx, int sz){ sidewalkLayer[(bz+sz)*SW_DIM+bx+sx] = true; };
+                if (hasE && hasN) setBit2(SW_SUB-1, 0);
+                if (hasW && hasN) setBit2(0, 0);
+                if (hasE && hasS) setBit2(SW_SUB-1, SW_SUB-1);
+                if (hasW && hasS) setBit2(0, SW_SUB-1);
+            }
+            // Buildings don't mark sidewalk — road cells own their edges
+        }
+    }
+
+    bool IsOnSidewalk(float wx, float wz) const
+    {
+        int sx = (int)std::floor((wx + HALF_WORLD) / SW_SUB_SIZE);
+        int sz = (int)std::floor((wz + HALF_WORLD) / SW_SUB_SIZE);
+        if (sx < 0 || sx >= SW_DIM || sz < 0 || sz >= SW_DIM) return false;
+        return sidewalkLayer[sz * SW_DIM + sx];
+    }
+
+    void SnapToSidewalk(float& wx, float& wz) const
+    {
+        int sx = (int)std::floor((wx + HALF_WORLD) / SW_SUB_SIZE);
+        int sz = (int)std::floor((wz + HALF_WORLD) / SW_SUB_SIZE);
+        sx = std::clamp(sx, 0, SW_DIM-1);
+        sz = std::clamp(sz, 0, SW_DIM-1);
+        if (sidewalkLayer[sz * SW_DIM + sx]) return;
+        for (int r = 1; r <= 10; r++) {
+            float bestD2 = 1e9f; int bestSX = sx, bestSZ = sz;
+            for (int dz = -r; dz <= r; dz++)
+            for (int dx = -r; dx <= r; dx++) {
+                if (std::abs(dx) != r && std::abs(dz) != r) continue;
+                int nx = sx + dx, nz = sz + dz;
+                if (nx < 0 || nx >= SW_DIM || nz < 0 || nz >= SW_DIM) continue;
+                if (!sidewalkLayer[nz * SW_DIM + nx]) continue;
+                float cx = -HALF_WORLD + (nx + 0.5f) * SW_SUB_SIZE;
+                float cz = -HALF_WORLD + (nz + 0.5f) * SW_SUB_SIZE;
+                float dd = (cx-wx)*(cx-wx) + (cz-wz)*(cz-wz);
+                if (dd < bestD2) { bestD2 = dd; bestSX = nx; bestSZ = nz; }
+            }
+            if (bestD2 < 1e8f) {
+                wx = -HALF_WORLD + (bestSX + 0.5f) * SW_SUB_SIZE;
+                wz = -HALF_WORLD + (bestSZ + 0.5f) * SW_SUB_SIZE;
+                return;
+            }
+        }
     }
 
     // ----------------------------------------------------------
@@ -400,6 +530,7 @@ private:
             isRoadLike(gx, gz+1),  // S
             isRoadLike(gx, gz-1),  // N
         };
+        const float soff = 0.0f;  // no shift (unused, kept for reference)
         const float ox[4] = {  h - swh, -(h-swh), 0.f,      0.f      };
         const float oz[4] = {  0.f,      0.f,      h - swh, -(h-swh) };
         const float hx[4] = {  swh,      swh,      h,        h        };
@@ -562,12 +693,31 @@ private:
             cellEntities[idx].push_back(e);
         }
 
-        // Zebra stripes
+        // Zebra stripes — shifted to inner edge (touching intersection)
         {
-            const float bandHalf = h / 3.0f;
-            const int NUM_STRIPES = 5;
+            const float bandHalf = 3.0f;    // 6 m = 3 sub-tiles
+            const int NUM_STRIPES = 6;
             const float stripeGap = (bandHalf * 2.0f) / (float)(NUM_STRIPES);
-            const float stripeThick = stripeGap * 0.55f;
+            const float stripeThick = stripeGap * 0.6f;
+
+            // Detect which neighbor is the intersection to shift stripes there
+            auto countRN = [&](int cx, int cz) -> int {
+                int rn = 0;
+                if (isRoadLike2(cx+1,cz)) rn++;
+                if (isRoadLike2(cx-1,cz)) rn++;
+                if (isRoadLike2(cx,cz+1)) rn++;
+                if (isRoadLike2(cx,cz-1)) rn++;
+                return rn;
+            };
+            float interOff = 0.0f;
+            constexpr float CW_SHIFT = 2.0f;  // 1 sub-tile toward intersection
+            if (roadGoesEW) {
+                if (hasE && countRN(gx+1, gz) >= 3) interOff =  (h - bandHalf + CW_SHIFT);
+                else if (hasW && countRN(gx-1, gz) >= 3) interOff = -(h - bandHalf + CW_SHIFT);
+            } else {
+                if (hasS && countRN(gx, gz+1) >= 3) interOff =  (h - bandHalf + CW_SHIFT);
+                else if (hasN && countRN(gx, gz-1) >= 3) interOff = -(h - bandHalf + CW_SHIFT);
+            }
 
             for (int stripe = 0; stripe < NUM_STRIPES; ++stripe)
             {
@@ -577,13 +727,13 @@ private:
                     float along = -bandHalf + stripeGap * ((float)stripe + 0.5f);
                     if (roadGoesEW)
                     {
-                        tr->Scale(XMFLOAT3(stripeThick * 0.5f, 0.02f, h * 0.75f));
-                        tr->Translate(XMFLOAT3(c.x + along, 0.21f, c.y));
+                        tr->Scale(XMFLOAT3(stripeThick * 0.5f, 0.02f, (h - SIDEWALK_W) * 0.95f));
+                        tr->Translate(XMFLOAT3(c.x + along + interOff, 0.21f, c.y));
                     }
                     else
                     {
-                        tr->Scale(XMFLOAT3(h * 0.75f, 0.02f, stripeThick * 0.5f));
-                        tr->Translate(XMFLOAT3(c.x, 0.21f, c.y + along));
+                        tr->Scale(XMFLOAT3((h - SIDEWALK_W) * 0.95f, 0.02f, stripeThick * 0.5f));
+                        tr->Translate(XMFLOAT3(c.x, 0.21f, c.y + along + interOff));
                     }
                     tr->UpdateTransform();
                 }
