@@ -102,6 +102,13 @@ public:
         tr->UpdateTransform();
         scene.materials.GetComponent(ground)->SetBaseColor(
             XMFLOAT4(0.18f, 0.38f, 0.12f, 1.0f)); // green grass (desaturated)
+
+        // Load house prefab once – BuildHouse uses Instantiate() per cell
+        wi::scene::LoadModel(domPrefab_, "models/dom.wiscene");
+        domPrefabLoaded_ = (domPrefab_.transforms.GetCount() > 0);
+        if (!domPrefabLoaded_)
+            wi::backlog::post("[CityLayout] dom.wiscene not found, falling back to procedural houses",
+                              wi::backlog::LogLevel::Warning);
     }
 
     // ----------------------------------------------------------
@@ -866,7 +873,8 @@ public:
         if (!InBounds(gx,gz)) return;
         int idx = gz * GRID_SIZE + gx;
         if (cellType[idx] != CellType::HOUSE) return;
-        if (cellEntities[idx].size() < 2) return;
+        // wiscene houses have a single root entity – visual scaling not applicable
+        if (domPrefabLoaded_ || cellEntities[idx].size() < 2) return;
 
         auto& s = wi::scene::GetScene();
         float baseBH = houseBaseHeight_[idx];
@@ -895,39 +903,61 @@ public:
         }
     }
 
+    // Prefab scene for dom.wiscene – loaded once in Initialize()
+    wi::scene::Scene domPrefab_;
+    bool domPrefabLoaded_ = false;
+
 private:
     void BuildHouse(int idx, int gx, int gz, XMFLOAT2 c, wi::scene::Scene& s)
     {
-        float bw = CELL_SIZE * 0.38f;
         float bh = CELL_SIZE * 0.30f + static_cast<float>((gx * 17 + gz * 31) % 5) * 1.2f;
         houseBaseHeight_[idx] = bh;
         housePopulation_[idx] = 0;
 
-        // Main body (warm orange-red, varied by location)
-        auto e = s.Entity_CreateCube("house");
-        auto* tr = s.transforms.GetComponent(e);
-        if (tr) {
-            tr->Scale(XMFLOAT3(bw, bh, bw));
-            tr->Translate(XMFLOAT3(c.x, bh, c.y));
-            tr->UpdateTransform();
+        if (domPrefabLoaded_)
+        {
+            // Instantiate from prefab – safe, fast, no file I/O per house
+            wi::ecs::Entity root = s.Instantiate(domPrefab_, true);
+            auto* tr = s.transforms.GetComponent(root);
+            if (tr) {
+                // Vary rotation in 90° steps so adjacent houses don't look identical
+                float rot = static_cast<float>((gx * 7 + gz * 13) % 4) * XM_PIDIV2;
+                tr->ClearTransform();
+                tr->RotateRollPitchYaw(XMFLOAT3(0.0f, rot, 0.0f));
+                tr->Translate(XMFLOAT3(c.x, 0.0f, c.y));
+                tr->SetDirty();
+            }
+            cellEntities[idx].push_back(root);
         }
-        float hi = static_cast<float>((gx * 13 + gz * 7) % 8) / 7.0f;
-        auto* mat = s.materials.GetComponent(e);
-        if (mat) mat->SetBaseColor(
-            XMFLOAT4(0.82f + hi * 0.10f, 0.35f + hi * 0.10f, 0.16f, 1.0f));
-        cellEntities[idx].push_back(e);
+        else
+        {
+            // Fallback: procedural cube house
+            float bw = CELL_SIZE * 0.38f;
 
-        // Dark roof strip
-        auto r = s.Entity_CreateCube("house_roof");
-        auto* rt = s.transforms.GetComponent(r);
-        if (rt) {
-            rt->Scale(XMFLOAT3(bw * 1.06f, bh * 0.10f, bw * 1.06f));
-            rt->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.10f, c.y));
-            rt->UpdateTransform();
+            auto e = s.Entity_CreateCube("house");
+            auto* tr = s.transforms.GetComponent(e);
+            if (tr) {
+                tr->Scale(XMFLOAT3(bw, bh, bw));
+                tr->Translate(XMFLOAT3(c.x, bh, c.y));
+                tr->UpdateTransform();
+            }
+            float hi = static_cast<float>((gx * 13 + gz * 7) % 8) / 7.0f;
+            auto* mat = s.materials.GetComponent(e);
+            if (mat) mat->SetBaseColor(
+                XMFLOAT4(0.82f + hi * 0.10f, 0.35f + hi * 0.10f, 0.16f, 1.0f));
+            cellEntities[idx].push_back(e);
+
+            auto r = s.Entity_CreateCube("house_roof");
+            auto* rt = s.transforms.GetComponent(r);
+            if (rt) {
+                rt->Scale(XMFLOAT3(bw * 1.06f, bh * 0.10f, bw * 1.06f));
+                rt->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.10f, c.y));
+                rt->UpdateTransform();
+            }
+            auto* rmat = s.materials.GetComponent(r);
+            if (rmat) rmat->SetBaseColor(XMFLOAT4(0.30f, 0.14f, 0.09f, 1.0f));
+            cellEntities[idx].push_back(r);
         }
-        auto* rmat = s.materials.GetComponent(r);
-        if (rmat) rmat->SetBaseColor(XMFLOAT4(0.30f, 0.14f, 0.09f, 1.0f));
-        cellEntities[idx].push_back(r);
     }
 
     void BuildWorkplace(int idx, int gx, int gz, XMFLOAT2 c, wi::scene::Scene& s)
