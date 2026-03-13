@@ -1241,13 +1241,16 @@ void CarSystem::CreateInstPool()
         wi::ecs::Entity e = wi::ecs::CreateEntity();
         scene.layers.Create(e);
         auto& tr   = scene.transforms.Create(e);
-        tr.Translate(XMFLOAT3(0.f, -1000.f, 0.f));
-        tr.UpdateTransform();
+        // Scale is constant — set once here, never touched in the render loop
+        tr.scale_local = XMFLOAT3(CAR_HW * 2.f, CAR_HH * 2.f, CAR_HL * 2.f);
+        tr.translation_local = XMFLOAT3(0.f, -1000.f, 0.f);
+        tr.SetDirty();
         auto& obj  = scene.objects.Create(e);
         obj.meshID = meshEnt_;
         obj.color  = XMFLOAT4(0.82f, 0.82f, 0.82f, 1.f);
         instPool_[j] = e;
     }
+    prevVisCount_ = 0;
 }
 
 // ============================================================
@@ -1317,10 +1320,10 @@ void CarSystem::RenderCars(const XMFLOAT3& cameraPos, const CityLayout& city)
             }
         }
 
-        tr->ClearTransform();
-        tr->Scale(XMFLOAT3(CAR_HW * 2.f, CAR_HH * 2.f, CAR_HL * 2.f));
-        tr->RotateRollPitchYaw(XMFLOAT3(0.f, heading_[i], 0.f));
-        tr->Translate(XMFLOAT3(posX_[i], carY, posZ_[i]));
+        // Direct SRT write — scale is already set in CreateInstPool and never changes
+        float h2 = heading_[i] * 0.5f;
+        tr->rotation_local    = XMFLOAT4(0.f, sinf(h2), 0.f, cosf(h2));
+        tr->translation_local = XMFLOAT3(posX_[i], carY, posZ_[i]);
         tr->SetDirty();
 
         // Per-car colour via ObjectComponent tint
@@ -1328,10 +1331,11 @@ void CarSystem::RenderCars(const XMFLOAT3& cameraPos, const CityLayout& city)
         if (obj) obj->color = carColor_[i];
     }
 
-    // Hide unused slots
-    for (uint32_t j = count; j < MAX_VISIBLE; ++j)
+    // Only un-hide the slots that were visible last frame but are hidden this frame
+    for (uint32_t j = count; j < prevVisCount_; ++j)
     {
         auto* tr = scene.transforms.GetComponent(instPool_[j]);
-        if (tr) { tr->ClearTransform(); tr->Translate(XMFLOAT3(0.f,-1000.f,0.f)); tr->SetDirty(); }
+        if (tr) { tr->translation_local = XMFLOAT3(0.f, -1000.f, 0.f); tr->SetDirty(); }
     }
+    prevVisCount_ = count;
 }

@@ -90,8 +90,14 @@ private:
 
     // Rendering
     static constexpr uint32_t MAX_VISIBLE = 2000;
+
+    // Pedestrian mesh half-extents (used in CreateInstPool and Render)
+    static constexpr float PED_HW = 0.15f;  // half-width  (30 cm)
+    static constexpr float PED_HH = 0.45f;  // half-height (90 cm → 1.8m tall)
+    static constexpr float PED_HD = 0.10f;  // half-depth  (20 cm)
     std::vector<uint32_t>        visIdx_;
-    uint32_t                     visCount_ = 0;
+    uint32_t                     visCount_    = 0;
+    uint32_t                     prevVisCount_ = 0;   // slots visible last frame
     wi::ecs::Entity              meshEnt_ = wi::ecs::INVALID_ENTITY;
     std::vector<wi::ecs::Entity> instPool_;
 

@@ -178,7 +178,8 @@ private:
 
     // Rendering
     std::vector<uint32_t>        visIdx_;
-    uint32_t                     visCount_ = 0;
+    uint32_t                     visCount_    = 0;
+    uint32_t                     prevVisCount_ = 0;   // slots visible last frame
     wi::ecs::Entity              meshEnt_  = wi::ecs::INVALID_ENTITY;
     std::vector<wi::ecs::Entity> instPool_;
 

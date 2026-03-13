@@ -9,6 +9,7 @@ void TrafficLightSystem::Initialize()
     const int N = GS * GS;
     isIntersection_.assign(N, false);
     phase_.assign(N, Phase::NS_THROUGH);
+    prevPhase_.assign(N, static_cast<Phase>(0xFF));  // sentinel: force first visual update
     timer_.assign(N, 0.0f);
     poleVisuals_.resize(N);
 
@@ -55,6 +56,7 @@ void TrafficLightSystem::RebuildIntersections(const CityLayout& city)
             int startPhase = (gx + gz) % NUM_PHASES;
             phase_[key] = static_cast<Phase>(startPhase);
             timer_[key] = 0.0f;
+            prevPhase_[key] = static_cast<Phase>(0xFF);  // force visual update on first frame
             CreatePolesForIntersection(gx, gz, city);
         }
         else if (!isNow && wasIntersection)
@@ -109,6 +111,8 @@ void TrafficLightSystem::UpdateVisuals()
     for (int key = 0; key < N; ++key)
     {
         if (!isIntersection_[key]) continue;
+        if (phase_[key] == prevPhase_[key]) continue;   // phase unchanged — nothing to redraw
+        prevPhase_[key] = phase_[key];
         auto& poles = poleVisuals_[key];
         if (poles.empty()) continue;
 

@@ -138,6 +138,7 @@ public:
 private:
     std::vector<bool>    isIntersection_;
     std::vector<Phase>   phase_;
+    std::vector<Phase>   prevPhase_;    // phase at last visual update; sentinel 0xFF forces first draw
     std::vector<float>   timer_;
 
     struct PoleVisuals {
