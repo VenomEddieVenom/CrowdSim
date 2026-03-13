@@ -32,6 +32,8 @@ void CarSystem::Initialize()
     state_.resize(MAX_CARS, State::PARKED);
     parkTimer_.resize(MAX_CARS, 0.f);
     carColor_.resize(MAX_CARS, {0.82f, 0.82f, 0.82f, 1.f});
+    halfLen_.resize(MAX_CARS, CAR_HL);
+    isBus_.resize(MAX_CARS, false);
     wage_.resize(MAX_CARS, 0.f);
     money_.resize(MAX_CARS, 0.f);
 
@@ -79,7 +81,8 @@ uint32_t CarSystem::SpawnCar(const std::vector<XMFLOAT2>& roadPath, uint32_t col
         if (state_[j] != State::DRIVING && state_[j] != State::ENTERING_PARKING) continue;
         float dx = posX_[j] - spawnX;
         float dz = posZ_[j] - spawnZ;
-        if (dx*dx + dz*dz < MIN_SEP * MIN_SEP)
+        float sep = CAR_HL + halfLen_[j] + 1.5f;
+        if (dx*dx + dz*dz < sep * sep)
             return UINT32_MAX;
     }
 
@@ -119,6 +122,8 @@ uint32_t CarSystem::SpawnCar(const std::vector<XMFLOAT2>& roadPath, uint32_t col
     myParkSlot_[i]= 0xFF;
 
     carColor_[i] = PALETTE[colorSeed % PALETTE_N];
+    halfLen_[i] = CAR_HL;
+    isBus_[i]   = false;
 
     // Wage $0.50 – $2.00 /game-sec
     uint32_t ws = colorSeed * 1103515245u + 12345u;
@@ -178,6 +183,72 @@ void CarSystem::SimplifyPath(XMFLOAT2* wp, uint8_t& count)
     }
     wp[write++] = wp[count - 1];
     count = write;
+}
+
+// ============================================================
+//  SpawnBus – spawn a bus that drives a loop through the city
+// ============================================================
+uint32_t CarSystem::SpawnBus(const std::vector<XMFLOAT2>& roadPath, uint32_t seed)
+{
+    if (activeCount >= MAX_CARS)    return UINT32_MAX;
+    if (roadPath.size() < 2)        return UINT32_MAX;
+
+    // Spawn proximity check (use bus-sized distance)
+    const float busSep = BUS_HL * 2.f + 2.0f;
+    const float spawnX = roadPath[0].x;
+    const float spawnZ = roadPath[0].y;
+    for (uint32_t j = 0; j < activeCount; ++j) {
+        if (state_[j] != State::DRIVING && state_[j] != State::ENTERING_PARKING) continue;
+        float dx = posX_[j] - spawnX;
+        float dz = posZ_[j] - spawnZ;
+        if (dx*dx + dz*dz < busSep * busSep)
+            return UINT32_MAX;
+    }
+
+    const uint32_t i = activeCount++;
+
+    const uint8_t wc = (uint8_t)std::min(roadPath.size(), (size_t)MAX_WP);
+    XMFLOAT2* wp = &wpBuf_[(size_t)i * MAX_WP];
+    for (uint8_t w = 0; w < wc; ++w) wp[w] = roadPath[w];
+    wpCount_[i] = wc;
+    SimplifyPath(wp, wpCount_[i]);
+    wpCurr_[i]  = 1;
+    carDir_[i]  = 0;
+
+    // Buses always use the outermost lane
+    {
+        float lo[3]; int lc;
+        GetLaneOffsets(4, lo, lc);
+        laneIdx_[i] = (int8_t)(lc - 1);
+        laneOff_[i] = lo[lc - 1];
+        laneTarget_[i] = laneOff_[i];
+    }
+
+    XMFLOAT2 d0 = DirTo(wp[0], wp[1]);
+    posX_[i]    = wp[0].x;
+    posZ_[i]    = wp[0].y;
+    speed_[i]   = 0.f;
+    heading_[i] = std::atan2(d0.x, d0.y);
+
+    parkCell_[i]  = UINT32_MAX;
+    myParkSlot_[i]= 0xFF;
+
+    // Bus: start driving immediately, no parking
+    state_[i]     = State::DRIVING;
+    parkTimer_[i] = 0.f;
+
+    // Yellow bus colour
+    carColor_[i] = {0.92f, 0.72f, 0.08f, 1.f};
+    halfLen_[i]  = BUS_HL;
+    isBus_[i]    = true;
+
+    wage_[i]  = 0.f;
+    money_[i] = 0.f;
+    schedDepart_[i] = 0.f;
+    schedReturn_[i] = 0.f;
+    lastDayTrip_[i] = UINT32_MAX; // never triggers schedule logic
+
+    return i;
 }
 
 // ============================================================
@@ -303,7 +374,8 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
                         {
                             float ddx = posX_[j] - posX_[i];
                             float ddz = posZ_[j] - posZ_[i];
-                            if (ddx*ddx + ddz*ddz < MIN_SEP * MIN_SEP)
+                            float sep = halfLen_[i] + halfLen_[j] + 1.5f;
+                            if (ddx*ddx + ddz*ddz < sep * sep)
                             { blocked = true; break; }
                         }
                     }
@@ -416,9 +488,57 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
         uint8_t   wc = wpCount_[i];
         uint8_t&  wn = wpCurr_[i];
 
-        // Reached last waypoint → find parking
+        // Reached last waypoint → buses re-route, cars find parking
         if (wn >= wc)
         {
+            // ---- Bus re-route: pick a random road cell and keep driving ----
+            if (isBus_[i])
+            {
+                int curGX, curGZ;
+                if (city.WorldToGrid(posX_[i], posZ_[i], curGX, curGZ))
+                {
+                    // Collect road cells
+                    constexpr int GS2 = CityLayout::GRID_SIZE;
+                    static thread_local std::vector<int> roadCells;
+                    roadCells.clear();
+                    for (int c = 0; c < GS2 * GS2; ++c)
+                        if (city.GetCellType(c % GS2, c / GS2) == CityLayout::CellType::ROAD)
+                            roadCells.push_back(c);
+                    if (roadCells.size() > 1)
+                    {
+                        // Simple pseudo-random pick
+                        uint32_t rng = (uint32_t)(posX_[i] * 73856093.f) ^ (uint32_t)(posZ_[i] * 19349663.f) ^ (uint32_t)(i * 83492791);
+                        rng ^= rng >> 16; rng *= 0x45d9f3b; rng ^= rng >> 16;
+                        int pick = (int)(rng % (uint32_t)roadCells.size());
+                        int dstGX = roadCells[pick] % GS2;
+                        int dstGZ = roadCells[pick] / GS2;
+                        auto newPath = city.FindPathRoad(curGX, curGZ, dstGX, dstGZ);
+                        if ((int)newPath.size() >= 2)
+                        {
+                            uint8_t nc = (uint8_t)std::min(newPath.size(), (size_t)MAX_WP);
+                            for (uint8_t w = 0; w < nc; ++w) wp[w] = newPath[w];
+                            wpCount_[i] = nc;
+                            SimplifyPath(wp, wpCount_[i]);
+                            wpCurr_[i] = 1;
+                            {
+                                float lo[3]; int lc;
+                                GetLaneOffsets(4, lo, lc);
+                                laneIdx_[i] = (int8_t)(lc - 1);
+                                laneOff_[i] = lo[lc - 1];
+                                laneTarget_[i] = laneOff_[i];
+                            }
+                            continue;
+                        }
+                    }
+                }
+                // Fallback: reverse path
+                for (uint8_t a = 0, b = wc - 1; a < b; ++a, --b)
+                    std::swap(wp[a], wp[b]);
+                wpCurr_[i] = 1;
+                carDir_[i] ^= 1;
+                continue;
+            }
+
             bool parked = false;
 
             {
@@ -792,7 +912,8 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
                     if (fwd <= 0.f) continue;
 
                     float lat = std::abs(odx * myFwdZ - odz * myFwdX);
-                    if (lat > LAT_BAND) continue;
+                    float latBand = LAT_BAND + (isBus_[i] ? 0.5f : 0.f) + (isBus_[j] ? 0.5f : 0.f);
+                    if (lat > latBand) continue;
 
                     // Same-direction check: skip perpendicular & opposing cars
                     float jFwdX = std::sin(heading_[j]);
@@ -807,7 +928,7 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
                         if (laneDiff > 2.0f) continue;
                     }
 
-                    float gap = fwd - MIN_SEP;
+                    float gap = fwd - (halfLen_[i] + halfLen_[j] + 1.5f);
                     if (gap < bestGap)
                     {
                         bestGap = gap;
@@ -851,7 +972,8 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
                 float fwdDist = toCX * dirX + toCZ * dirZ;
                 if (fwdDist < 0.0f) return;
                 // Stop at the traffic light pole (13 m from intersection centre)
-                float stopLine = fwdDist - HALF_CS - 3.0f;
+                // Account for vehicle half-length so the front stops at the line
+                float stopLine = fwdDist - HALF_CS - 3.0f - halfLen_[i];
                 if (stopLine < -1.0f) return; // already well past stop line, committed to crossing
                 float gap = std::max(0.0f, stopLine);
 
@@ -963,17 +1085,17 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
                         ? (CAR_HW + 0.25f + 4.0f)
                         : (CAR_HW + 0.25f + 1.0f);
                     if (fwd > 0.3f && fwd <= scanAhead && lat <= latThresh) {
-                        float stopDist = std::max(0.0f, fwd - CAR_HL - 0.25f - 2.0f);
+                        float stopDist = std::max(0.0f, fwd - halfLen_[i] - 0.25f - 2.0f);
                         if (stopDist < bestGap) { bestGap = stopDist; bestSpd = 0.0f; }
                     }
 
                     // Method 2: Radius check at intersections/turns
                     if (inIntersection || inArc) {
                         float d2 = pdx * pdx + pdz * pdz;
-                        float safeR = CAR_HL + 0.25f + 4.5f;
+                        float safeR = halfLen_[i] + 0.25f + 4.5f;
                         if (d2 < safeR * safeR && d2 > 0.01f) {
                             float dd = std::sqrt(d2);
-                            float stopDist = std::max(0.0f, dd - CAR_HL - 0.25f - 1.0f);
+                            float stopDist = std::max(0.0f, dd - halfLen_[i] - 0.25f - 1.0f);
                             if (stopDist < bestGap) { bestGap = stopDist; bestSpd = 0.0f; }
                         }
                     }
@@ -1159,7 +1281,8 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
         float ddx = posX_[b] - posX_[a];
         float ddz = posZ_[b] - posZ_[a];
         float dd2 = ddx * ddx + ddz * ddz;
-        if (dd2 >= MIN_SEP * MIN_SEP || dd2 < 0.001f) return;
+        float sep = halfLen_[a] + halfLen_[b] + 1.5f;
+        if (dd2 >= sep * sep || dd2 < 0.001f) return;
 
         float hcos = std::sin(heading_[a]) * std::sin(heading_[b])
                    + std::cos(heading_[a]) * std::cos(heading_[b]);
@@ -1170,14 +1293,15 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
         {
             float sinH = std::sin(heading_[a]), cosH = std::cos(heading_[a]);
             float lat  = std::abs(ddx * cosH - ddz * sinH);
-            if (lat > LAT_BAND) return;
+            float pairLatBand = LAT_BAND + (isBus_[a] ? 0.5f : 0.f) + (isBus_[b] ? 0.5f : 0.f);
+            if (lat > pairLatBand) return;
             // Also skip if clearly in different lanes (lane offset difference > 2.0)
             float laneDiff = std::abs(laneOff_[a] - laneOff_[b]);
             if (hcos > 0.5f && laneDiff > 2.0f) return;
         }
 
         float dd = std::sqrt(dd2);
-        float overlap = MIN_SEP - dd;
+        float overlap = sep - dd;
         float nx = ddx / dd, nz = ddz / dd;
 
         // Project push onto the FORWARD axis of car A (longitudinal only)
@@ -1316,7 +1440,7 @@ void CarSystem::RenderCars(const XMFLOAT3& cameraPos, const CityLayout& city)
         // Determine Y position:
         // - PARKED in building (myParkSlot_ encodes floor): use floor Y
         // - Otherwise: ground level
-        float carY = CAR_HH + 0.15f;
+        float carY = (isBus_[i] ? BUS_HH : CAR_HH) + 0.15f;
         if (state_[i] == State::PARKED &&
                  parkCell_[i] != UINT32_MAX &&
                  myParkSlot_[i] != 0xFF)
@@ -1326,9 +1450,15 @@ void CarSystem::RenderCars(const XMFLOAT3& cameraPos, const CityLayout& city)
             if (city.GetCellType(pgx, pgz) == CityLayout::CellType::PARKING)
             {
                 int fl = (int)myParkSlot_[i] / CityLayout::PARKING_SPOTS_PER_FLOOR;
-                carY = CityLayout::PARKING_FLOOR_H * (float)fl + CAR_HH + 0.55f;
+                carY = CityLayout::PARKING_FLOOR_H * (float)fl + CAR_HH + 0.55f; // buses don't park in buildings
             }
         }
+
+        // Per-vehicle scale
+        if (isBus_[i])
+            tr->scale_local = XMFLOAT3(BUS_HW * 2.f, BUS_HH * 2.f, BUS_HL * 2.f);
+        else
+            tr->scale_local = XMFLOAT3(CAR_HW * 2.f, CAR_HH * 2.f, CAR_HL * 2.f);
 
         // Direct SRT write — scale is already set in CreateInstPool and never changes
         float h2 = heading_[i] * 0.5f;

@@ -36,17 +36,21 @@ public:
     static constexpr float CAR_HW      =  0.50f;  // half-width  (~1.0 m)
     static constexpr float CAR_HH      =  0.35f;  // half-height (~0.7 m)
     static constexpr float CAR_HL      =  1.00f;  // half-length (~2.0 m)
+    static constexpr float BUS_HL      =  3.00f;  // half-length (~6.0 m)
+    static constexpr float BUS_HW      =  0.50f;  // half-width  (~1.0 m) – same as car
+    static constexpr float BUS_HH      =  0.70f;  // half-height (~1.4 m) – twice car height
     static constexpr float MIN_SEP     =  CAR_HL * 2.f + 1.5f; // bumper-to-bumper (3.5 m)
     static constexpr float LAT_BAND    =  1.5f;   // lateral collision band (< inter-lane gap of 3m)
 
     // Lane offsets for each road mode (per-direction, from centreline)
-    // 2-lane (1 per dir): centre at 2.5 m
-    // 4-lane (2 per dir): inner 1.5 m, outer 4.5 m
-    // 6-lane (3 per dir): inner 1.5 m, middle 4.0 m, outer 6.5 m
+    // Drivable half-width = HALF_CS - SIDEWALK_W = 10 - 2 = 8 m per side.
+    // 2-lane (1 per dir): centre at 4.0 m  (midpoint of 0..8)
+    // 4-lane (2 per dir): inner 2.0 m, outer 6.0 m  (8/4=2m lane width centres)
+    // 6-lane (3 per dir): inner 1.33, middle 4.0, outer 6.67
     static void GetLaneOffsets(int totalLanes, float* offsets, int& count)
     {
-        if (totalLanes >= 6) { count = 3; offsets[0] = 1.5f; offsets[1] = 4.0f; offsets[2] = 6.5f; }
-        else if (totalLanes >= 4) { count = 2; offsets[0] = 2.5f; offsets[1] = 5.5f; }
+        if (totalLanes >= 6) { count = 3; offsets[0] = 1.33f; offsets[1] = 4.0f; offsets[2] = 6.67f; }
+        else if (totalLanes >= 4) { count = 2; offsets[0] = 2.0f; offsets[1] = 6.0f; }
         else { count = 1; offsets[0] = 4.0f; }
     }
 
@@ -66,6 +70,8 @@ public:
     void     Initialize();
     // Returns car slot, or UINT32_MAX if at capacity / bad path
     uint32_t SpawnCar(const std::vector<XMFLOAT2>& roadPath, uint32_t colorSeed);
+    // Spawn a bus on a random loop through the city
+    uint32_t SpawnBus(const std::vector<XMFLOAT2>& roadPath, uint32_t seed);
     void     Update(float dt, CityLayout& city, const TrafficLightSystem& lights,
                     float timeOfDay = 0.5f, float dayDuration = 86400.0f,
                     const PedestrianView* peds = nullptr);
@@ -79,6 +85,9 @@ public:
     float    DrainTax()                 { float t = taxAccum_; taxAccum_ = 0.f; return t; }
     // For HUD
     float    GetMoney(uint32_t i) const { return i < money_.size() ? money_[i] : 0.f; }
+
+    bool IsBus(uint32_t i) const { return i < isBus_.size() && isBus_[i]; }
+    float GetHalfLen(uint32_t i) const { return i < halfLen_.size() ? halfLen_[i] : CAR_HL; }
 
     // For click-on-car inspection
     State    GetState(uint32_t i)   const { return i < state_.size() ? state_[i] : State::PARKED; }
@@ -135,6 +144,8 @@ private:
     std::vector<State>   state_;
     std::vector<float>   parkTimer_;
     std::vector<XMFLOAT4>carColor_;
+    std::vector<float>   halfLen_;         // per-vehicle half-length
+    std::vector<bool>    isBus_;           // true for buses
 
     // Economy
     std::vector<float>   wage_;           // $/game-sec when returning from work

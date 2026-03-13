@@ -21,6 +21,72 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
+#include <ctime>
+#include <DbgHelp.h>
+#pragma comment(lib, "DbgHelp.lib")
+
+// ---- Crash logger ----
+static void WriteCrashLog(EXCEPTION_POINTERS* ep)
+{
+    std::ofstream f("crash.log", std::ios::trunc);
+    if (!f) return;
+    std::time_t t = std::time(nullptr);
+    char tbuf[64]; std::strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+    f << "=== CRASH " << tbuf << " ===\n";
+    if (ep && ep->ExceptionRecord) {
+        f << "ExceptionCode : 0x" << std::hex << ep->ExceptionRecord->ExceptionCode << "\n";
+        f << "ExceptionAddr : 0x" << std::hex << (uintptr_t)ep->ExceptionRecord->ExceptionAddress << "\n";
+    }
+    // Walk stack
+    HANDLE proc = GetCurrentProcess();
+    HANDLE thrd = GetCurrentThread();
+    SymInitialize(proc, nullptr, TRUE);
+    CONTEXT ctx = ep ? *ep->ContextRecord : CONTEXT{};
+    if (!ep) { ctx.ContextFlags = CONTEXT_FULL; RtlCaptureContext(&ctx); }
+    STACKFRAME64 sf{};
+    sf.AddrPC.Mode = sf.AddrFrame.Mode = sf.AddrStack.Mode = AddrModeFlat;
+#ifdef _M_X64
+    sf.AddrPC.Offset    = ctx.Rip;
+    sf.AddrFrame.Offset = ctx.Rbp;
+    sf.AddrStack.Offset = ctx.Rsp;
+    DWORD mtype = IMAGE_FILE_MACHINE_AMD64;
+#else
+    sf.AddrPC.Offset    = ctx.Eip;
+    sf.AddrFrame.Offset = ctx.Ebp;
+    sf.AddrStack.Offset = ctx.Esp;
+    DWORD mtype = IMAGE_FILE_MACHINE_I386;
+#endif
+    char symBuf[sizeof(SYMBOL_INFO) + MAX_SYM_NAME] = {};
+    SYMBOL_INFO* sym = reinterpret_cast<SYMBOL_INFO*>(symBuf);
+    sym->SizeOfStruct = sizeof(SYMBOL_INFO); sym->MaxNameLen = MAX_SYM_NAME;
+    IMAGEHLP_LINE64 line{}; line.SizeOfStruct = sizeof(line); DWORD disp32 = 0;
+    f << "Stack trace:\n";
+    for (int frame = 0; frame < 64; ++frame) {
+        if (!StackWalk64(mtype, proc, thrd, &sf, &ctx, nullptr,
+                         SymFunctionTableAccess64, SymGetModuleBase64, nullptr)) break;
+        if (!sf.AddrPC.Offset) break;
+        DWORD64 disp64 = 0;
+        f << "  [" << frame << "] 0x" << std::hex << sf.AddrPC.Offset;
+        if (SymFromAddr(proc, sf.AddrPC.Offset, &disp64, sym))
+            f << "  " << sym->Name << " +0x" << std::hex << disp64;
+        if (SymGetLineFromAddr64(proc, sf.AddrPC.Offset, &disp32, &line))
+            f << "  (" << line.FileName << ":" << std::dec << line.LineNumber << ")";
+        f << "\n";
+    }
+    SymCleanup(proc);
+    f.flush();
+}
+// ---- Event log (step-by-step trace, flushed each write) ----
+static std::ofstream g_evlog;
+static void EvLog(const std::string& msg) {
+    if (!g_evlog.is_open()) g_evlog.open("evlog.txt", std::ios::trunc);
+    g_evlog << msg << "\n"; g_evlog.flush();
+}
+static LONG WINAPI UnhandledExFilter(EXCEPTION_POINTERS* ep) {
+    WriteCrashLog(ep);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 
 
 
@@ -61,9 +127,16 @@ public:
     float reproTimer_ = 0.0f;
     static constexpr float REPRO_INTERVAL = 30.0f; // every 30 game-seconds
 
-    // Agent / car selection
+    // Bus spawn timer
+    float busTimer_ = 0.0f;
+    static constexpr float BUS_INTERVAL = 20.0f; // try every 20 game-seconds
+    static constexpr int   MAX_BUSES    = 5;      // bus cap
+    uint32_t busRng_ = 12345;
+
+    // Agent / car / building selection
     int32_t selectedAgent = -1;  // agent index, or -1 for none
     int32_t selectedCar   = -1;  // car index, or -1 for none
+    int32_t inspectGX = -1, inspectGZ = -1;  // inspected building cell, or -1 for none
 
     // Shadow cascade sliders
     float cascadeDist1_     = 30.0f;    // near cascade distance (m)
@@ -73,8 +146,14 @@ public:
 
     // Build mode
     using CellType = CityLayout::CellType;
+    // Deferred scene-modification queue: actions are pushed during input handling
+    // (which runs AFTER wi::RenderPath3D::Update submits render jobs) and drained
+    // at the TOP of the next Update(), BEFORE any render jobs are submitted.
+    // This prevents the render thread from reading scene data that the main thread
+    // is simultaneously mutating (ACCESS_VIOLATION in ComputeObjectLODForView).
+    std::vector<std::function<void()>> pendingPlacementActions_;
     bool     buildModeEnabled = false;
-    int      placeTool        = 0;    // 0=road 1=house 2=workplace 3=tree 4=crosswalk 5=parking
+    int      placeTool        = 0;    // 0=road 1=house 2=workplace 3=tree 4=crosswalk 5=parking 6=lake 7=power_plant 8=water_pump 9=police 10=fire_station 11=hospital
     int      hoverGX = 0, hoverGZ = 0;
     bool     hoverValid = false;
     bool     clickConsumedByPanel = false;  // prevent world-placement when clicking UI
@@ -97,6 +176,11 @@ public:
     bool     savesMenuSaveMode = false;     // true = saving, false = loading
     std::string pendingSaveName;            // for new save typing
     bool     typingSaveName = false;
+
+    // UI scale factor: all pixel sizes are authored for 1080p reference.
+    // Scale proportionally to actual screen height so everything looks right
+    // at any resolution / DPI.
+    float uiScale() const { return (float)height / 1080.0f; }
 
     void RefreshSaveList() {
         saveFiles.clear();
@@ -121,23 +205,28 @@ public:
         for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2)
             city.ClearCell(gx2, gz2);
         std::fill(std::begin(houseHasSpawned), std::end(houseHasSpawned), false);
-        for (int pass = 0; pass < 2; ++pass)
+        // Three passes: roads first, buildings second, crosswalks last.
+        // Crosswalks must be placed after all road/intersection cells are in the grid
+        // so that BuildCrosswalk can correctly detect which neighbor is the intersection
+        // and shift the zebra stripes to the right edge (not leave them at cell center).
+        for (int pass = 0; pass < 3; ++pass)
         for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
         for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2) {
             auto ct = sd.cells[gz2 * CityLayout::GRID_SIZE + gx2];
-            bool isRoad = (ct == CellType::ROAD || ct == CellType::CROSSWALK);
-            if (pass == 0 && !isRoad) continue;
-            if (pass == 1 && isRoad) continue;
             if (ct == CellType::EMPTY) continue;
+            if (pass == 0 && ct != CellType::ROAD) continue;
+            if (pass == 1 && (ct == CellType::ROAD || ct == CellType::CROSSWALK)) continue;
+            if (pass == 2 && ct != CellType::CROSSWALK) continue;
             city.PlaceCell(gx2, gz2, ct);
         }
         trafficLights.RebuildIntersections(city);
         PlaceCrosswalksAroundIntersections();
         city.BuildSidewalkLayer([&](int gx, int gz){ return trafficLights.IsIntersection(gx, gz); });
+        city.RebuildAllLaneMarkings();
         for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
         for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2) {
             int lanes = sd.roadLanes[gz2 * CityLayout::GRID_SIZE + gx2];
-            if (lanes == 2 || lanes == 6)
+            if (lanes == 2 || lanes == 4 || lanes == 6)
                 city.SetRoadLanes(gx2, gz2, lanes);
         }
         for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
@@ -147,6 +236,9 @@ public:
                 city.SetHousePop(gx2, gz2, 0);
                 if (TrySpawnFromHouse(gx2, gz2))
                     houseHasSpawned[idx2] = true;
+                // Restore saved population (TrySpawnFromHouse adds pop as side-effect)
+                city.SetHousePop(gx2, gz2, sd.housePop[idx2]);
+                city.UpdateHouseHeight(gx2, gz2);
             }
         }
         wi::backlog::post("[Load] Loaded: " + path, wi::backlog::LogLevel::Default);
@@ -219,6 +311,15 @@ public:
 
     void Update(float dt) override
     {
+        // Drain deferred scene modifications BEFORE submitting render jobs.
+        // All PlaceCell / RebuildIntersections calls happen here, before the
+        // renderer touches scene object arrays on job threads.
+        if (!pendingPlacementActions_.empty()) {
+            for (auto& action : pendingPlacementActions_) action();
+            pendingPlacementActions_.clear();
+        }
+        if (city.laneMarksDirty_) city.RebuildAllLaneMarkings();
+
         wi::RenderPath3D::Update(dt);
 
         auto& cam  = wi::scene::GetCamera();
@@ -341,14 +442,15 @@ public:
 
         // ---- Shadow cascade sliders (bottom-left panel) ----
         {
+            const float S = uiScale();
             XMFLOAT4 ptr  = wi::input::GetPointer();
             bool lmbDown  = wi::input::Down(wi::input::MOUSE_BUTTON_LEFT);
             bool lmbPress = wi::input::Press(wi::input::MOUSE_BUTTON_LEFT);
 
-            const float sliderX = 15.f, sliderW = 185.f;
-            const float track1Y = (float)cam.height - 85.f;
-            const float track2Y = (float)cam.height - 48.f;
-            const float trackH  = 12.f, hitExtra = 8.f;
+            const float sliderX = 15.f*S, sliderW = 185.f*S;
+            const float track1Y = (float)cam.height - 85.f*S;
+            const float track2Y = (float)cam.height - 48.f*S;
+            const float trackH  = 12.f*S, hitExtra = 8.f*S;
 
             auto hitTrack = [&](float ty) {
                 return ptr.x >= sliderX && ptr.x <= sliderX + sliderW
@@ -381,10 +483,12 @@ public:
 
         if (buildModeEnabled)
         {
-            // Panel click detection (right side of screen, 6 tool buttons)
-            const float panelX  = (float)cam.width - 215.0f;
-            const float btnY[6] = { 145.0f, 215.0f, 285.0f, 355.0f, 425.0f, 495.0f };
-            const float btnH    = 60.0f;
+            const float S = uiScale();
+            // Panel click detection (right side of screen, 12 tool buttons)
+            const float panelX  = (float)cam.width - 215.0f*S;
+            const float btnH    = 46.0f*S;
+            const float btnStart = 145.0f*S;
+            const float btnStep  = 55.0f*S;
 
             XMFLOAT4 ptr = wi::input::GetPointer();
             bool inPanel = ptr.x >= panelX;
@@ -393,9 +497,11 @@ public:
             if (inPanel && wi::input::Press(wi::input::MOUSE_BUTTON_LEFT))
             {
                 clickConsumedByPanel = true;
-                for (int k = 0; k < 6; ++k)
-                    if (ptr.y >= btnY[k] && ptr.y < btnY[k] + btnH)
-                        placeTool = k; // 0=road 1=house 2=workplace 3=tree 4=crosswalk 5=parking
+                for (int k = 0; k < 12; ++k) {
+                    float by = btnStart + k * btnStep;
+                    if (ptr.y >= by && ptr.y < by + btnH)
+                        placeTool = k;
+                }
             }
 
             // Ray → ground plane to find hovered grid cell
@@ -470,31 +576,43 @@ public:
                         roadPlaceActive = true;
                         roadStartGX     = hoverGX;
                         roadStartGZ     = hoverGZ;
-                        // Place start cell immediately
-                        city.PlaceCell(hoverGX, hoverGZ, CellType::ROAD);
-                        trafficLights.RebuildIntersections(city);
-                        city.BuildSidewalkLayer([&](int gx2, int gz2){ return trafficLights.IsIntersection(gx2, gz2); });
-                        TrySpawnAllUnspawnedHouses();
+                        // Defer PlaceCell to next frame so render jobs finish first
+                        int cgx = hoverGX, cgz = hoverGZ;
+                        EvLog("[ROAD-1st] queuing PlaceCell gx=" + std::to_string(cgx) + " gz=" + std::to_string(cgz));
+                        pendingPlacementActions_.push_back([this, cgx, cgz](){
+                            EvLog("[ROAD-1st-def] PlaceCell gx=" + std::to_string(cgx) + " gz=" + std::to_string(cgz));
+                            city.PlaceCell(cgx, cgz, CellType::ROAD);
+                            EvLog("[ROAD-1st-def] PlaceCell done");
+                            PlaceCrosswalksNearCells({{cgx, cgz}});
+                            TrySpawnAllUnspawnedHouses();
+                        });
                         roadPreviewPath.clear();
                     }
                     else
                     {
                         // Second click: place entire preview path
-                        bool anyPlaced = false;
-                        for (auto& [pgx, pgz] : roadPreviewPath)
-                        {
-                            if (city.GetCellType(pgx, pgz) == CellType::EMPTY)
+                        // Defer path placement to next frame
+                        auto capturedPath = roadPreviewPath;
+                        EvLog("[ROAD-2nd] queuing path size=" + std::to_string(capturedPath.size()));
+                        pendingPlacementActions_.push_back([this, capturedPath](){
+                            bool anyPlaced = false;
+                            for (auto& [pgx, pgz] : capturedPath)
                             {
-                                city.PlaceCell(pgx, pgz, CellType::ROAD);
-                                anyPlaced = true;
+                                if (city.GetCellType(pgx, pgz) == CellType::EMPTY)
+                                {
+                                    EvLog("[ROAD-2nd-def] PlaceCell gx=" + std::to_string(pgx) + " gz=" + std::to_string(pgz));
+                                    city.PlaceCell(pgx, pgz, CellType::ROAD);
+                                    anyPlaced = true;
+                                }
                             }
-                        }
-                        if (anyPlaced)
-                        {
-                            trafficLights.RebuildIntersections(city);
-                            city.BuildSidewalkLayer([&](int gx2, int gz2){ return trafficLights.IsIntersection(gx2, gz2); });
-                            TrySpawnAllUnspawnedHouses();
-                        }
+                            if (anyPlaced)
+                            {
+                                EvLog("[ROAD-2nd-def] calling PlaceCrosswalksNearCells");
+                                PlaceCrosswalksNearCells(capturedPath);
+                                EvLog("[ROAD-2nd-def] done");
+                                TrySpawnAllUnspawnedHouses();
+                            }
+                        });
                         roadPlaceActive = false;
                         roadPreviewPath.clear();
                     }
@@ -514,6 +632,7 @@ public:
                 {
                     // Crosswalk can only be placed on existing ROAD cells (not intersections)
                     CellType ct = city.GetCellType(hoverGX, hoverGZ);
+                    EvLog("[CW-manual] click gx=" + std::to_string(hoverGX) + " gz=" + std::to_string(hoverGZ) + " ct=" + std::to_string((int)ct));
                     if (ct == CellType::ROAD)
                     {
                         // Prevent placing on intersection cells (3+ road neighbours)
@@ -526,22 +645,45 @@ public:
                             if (nct == CellType::ROAD || nct == CellType::CROSSWALK)
                                 ++roadNeighbors;
                         }
+                        EvLog("[CW-manual] roadNeighbors=" + std::to_string(roadNeighbors));
                         if (roadNeighbors <= 2)
                         {
-                            city.PlaceCell(hoverGX, hoverGZ, CellType::CROSSWALK);
+                            EvLog("[CW-manual] queuing PlaceCell");
+                        int cgx = hoverGX, cgz = hoverGZ;
+                        pendingPlacementActions_.push_back([this, cgx, cgz](){
+                            EvLog("[CW-manual-def] PlaceCell gx=" + std::to_string(cgx) + " gz=" + std::to_string(cgz));
+                            city.PlaceCell(cgx, cgz, CellType::CROSSWALK);
+                            EvLog("[CW-manual-def] PlaceCell done, calling RebuildIntersections");
                             trafficLights.RebuildIntersections(city);
+                            EvLog("[CW-manual-def] RebuildIntersections done, calling BuildSidewalkLayer");
                             city.BuildSidewalkLayer([&](int gx2, int gz2){ return trafficLights.IsIntersection(gx2, gz2); });
+                            EvLog("[CW-manual-def] done");
+                        });
                         }
                     }
                 }
                 else
                 {
-                    // Tools 1=house, 2=workplace, 5=parking (lmbDown drag)
+                    // Tools 1=house, 2=workplace, 5=parking, 6=lake, 7=power_plant, 8=water_pump, 9=police, 10=fire_station, 11=hospital
                     CellType ct;
-                    if (placeTool == 5)
-                        ct = CellType::PARKING;
+                    if (placeTool == 5)      ct = CellType::PARKING;
+                    else if (placeTool == 6) ct = CellType::LAKE;
+                    else if (placeTool == 7) ct = CellType::POWER_PLANT;
+                    else if (placeTool == 8) {
+                        // Water pump requires adjacent lake
+                        if (!city.HasAdjacentLake(hoverGX, hoverGZ)) {
+                            // Silently refuse — no lake nearby
+                            ct = CellType::EMPTY; // will be skipped
+                        } else {
+                            ct = CellType::WATER_PUMP;
+                        }
+                    }
+                    else if (placeTool == 9)  ct = CellType::POLICE;
+                    else if (placeTool == 10) ct = CellType::FIRE_STATION;
+                    else if (placeTool == 11) ct = CellType::HOSPITAL;
                     else
                         ct = static_cast<CellType>(placeTool + 1);
+                    if (ct != CellType::EMPTY) {
                     bool placed = city.PlaceCell(hoverGX, hoverGZ, ct);
                     if (placed)
                     {
@@ -556,6 +698,7 @@ public:
                         {
                             TrySpawnAllUnspawnedHouses();
                         }
+                    }
                     }
                 }
             }
@@ -625,19 +768,20 @@ public:
         // Handle saves menu interaction
         if (savesMenuOpen)
         {
+            const float S = uiScale();
             float mx = (float)wi::input::GetPointer().x;
             float my = (float)wi::input::GetPointer().y;
-            float menuX = this->width * 0.5f - 200.0f;
-            float menuY = 80.0f;
-            float entryH = 40.0f;
-            float menuW = 400.0f;
+            float menuW = 400.0f*S;
+            float menuX = this->width * 0.5f - menuW * 0.5f;
+            float menuY = 80.0f*S;
+            float entryH = 40.0f*S;
 
             if (wi::input::Press(wi::input::MOUSE_BUTTON_LEFT))
             {
                 // "New Save" button at top (only in save mode)
                 if (savesMenuSaveMode)
                 {
-                    float newBtnY = menuY + 40.0f;
+                    float newBtnY = menuY + 40.0f*S;
                     if (mx >= menuX && mx <= menuX + menuW && my >= newBtnY && my <= newBtnY + entryH)
                     {
                         // Generate auto-name
@@ -655,7 +799,7 @@ public:
                 }
 
                 // Save entries
-                float listStartY = menuY + (savesMenuSaveMode ? 90.0f : 40.0f);
+                float listStartY = menuY + (savesMenuSaveMode ? 90.0f*S : 40.0f*S);
                 int maxShow = 12;
                 for (int si = 0; si < (int)saveFiles.size() && si < maxShow; ++si)
                 {
@@ -717,6 +861,7 @@ public:
                 if (city.GetCellType(gx, gz) != CellType::HOUSE) continue;
                 int pop = city.GetHousePop(gx, gz);
                 if (pop < 2) continue; // need at least 2 to reproduce
+                if (!city.HasFullServiceCoverage(gx, gz)) continue; // needs police, fire, hospital
                 // One new person born (cap at 50 per house)
                 if (pop >= 50) continue;
                 city.AddHousePop(gx, gz, 1);
@@ -724,6 +869,42 @@ public:
 
                 // Spawn the new person with a job
                 TrySpawnOneWorker(gx, gz);
+            }
+        }
+
+        // ---- Bus spawning: periodically add buses on roads ----
+        busTimer_ += dt * simSpeed;
+        if (busTimer_ >= BUS_INTERVAL)
+        {
+            busTimer_ -= BUS_INTERVAL;
+            // Count current buses
+            int busCount = 0;
+            for (uint32_t bi = 0; bi < cars.GetCarCount(); ++bi)
+                if (cars.IsBus(bi)) ++busCount;
+            if (busCount < MAX_BUSES)
+            {
+                constexpr int GS = CityLayout::GRID_SIZE;
+                // Collect road cells
+                std::vector<int> roadCells;
+                for (int c = 0; c < GS * GS; ++c)
+                    if (city.GetCellType(c % GS, c / GS) == CellType::ROAD)
+                        roadCells.push_back(c);
+                if (roadCells.size() >= 2)
+                {
+                    // Pick two distinct random road cells
+                    busRng_ ^= busRng_ << 13; busRng_ ^= busRng_ >> 17; busRng_ ^= busRng_ << 5;
+                    int srcIdx = (int)(busRng_ % (uint32_t)roadCells.size());
+                    busRng_ ^= busRng_ << 13; busRng_ ^= busRng_ >> 17; busRng_ ^= busRng_ << 5;
+                    int dstIdx = (int)(busRng_ % (uint32_t)roadCells.size());
+                    if (srcIdx != dstIdx)
+                    {
+                        int sx = roadCells[srcIdx] % GS, sz = roadCells[srcIdx] / GS;
+                        int dx = roadCells[dstIdx] % GS, dz = roadCells[dstIdx] / GS;
+                        auto path = city.FindPathRoad(sx, sz, dx, dz);
+                        if ((int)path.size() >= 2)
+                            cars.SpawnBus(path, busRng_);
+                    }
+                }
             }
         }
 
@@ -775,21 +956,46 @@ public:
             float bestAgentDist = 5.0f;
             int32_t bestAgentIdx = -1;
 
-            // Prefer cars (bigger), then agents
+            // Prefer cars (bigger), then agents, then buildings
             if (bestCarIdx >= 0 && bestCarDist <= bestAgentDist)
             {
                 selectedCar = bestCarIdx;
                 selectedAgent = -1;
+                inspectGX = inspectGZ = -1;
             }
             else if (bestAgentIdx >= 0)
             {
                 selectedAgent = bestAgentIdx;
                 selectedCar = -1;
+                inspectGX = inspectGZ = -1;
             }
             else
             {
                 selectedCar = -1;
                 selectedAgent = -1;
+                // Try ground-plane hit for building inspection
+                float rDirY3 = XMVectorGetY(rayDir);
+                if (fabsf(rDirY3) > 0.001f) {
+                    float t3 = -XMVectorGetY(rayOrigin) / rDirY3;
+                    if (t3 > 0.0f) {
+                        float hx3 = XMVectorGetX(rayOrigin) + XMVectorGetX(rayDir) * t3;
+                        float hz3 = XMVectorGetZ(rayOrigin) + XMVectorGetZ(rayDir) * t3;
+                        int gx3, gz3;
+                        if (city.WorldToGrid(hx3, hz3, gx3, gz3)) {
+                            auto ct3 = city.GetCellType(gx3, gz3);
+                            bool isIntersection = (ct3 == CellType::ROAD || ct3 == CellType::CROSSWALK)
+                                                  && trafficLights.IsIntersection(gx3, gz3);
+                            if (isIntersection || (ct3 != CellType::EMPTY && ct3 != CellType::ROAD && ct3 != CellType::CROSSWALK)) {
+                                inspectGX = gx3;
+                                inspectGZ = gz3;
+                            } else {
+                                inspectGX = inspectGZ = -1;
+                            }
+                        } else {
+                            inspectGX = inspectGZ = -1;
+                        }
+                    }
+                }
             }
         }
 
@@ -1054,9 +1260,65 @@ public:
         }
     }
 
+    // Targeted helper: after placing road cell(s), check only the immediate
+    // neighbourhood (the placed cells + their 4 neighbours) for newly-formed
+    // intersections and add crosswalks on their straight arms.
+    // Avoids scanning the whole grid during interactive placement (which can
+    // disturb running simulation state and cause crashes).
+    void PlaceCrosswalksNearCells(const std::vector<std::pair<int,int>>& cells)
+    {
+        constexpr int GS = CityLayout::GRID_SIZE;
+        const int ddx[] = { 1, -1, 0, 0 };
+        const int ddz[] = { 0, 0, 1, -1 };
+
+        auto isIntersectionAt = [&](int gx, int gz) -> bool {
+            if (gx < 0 || gx >= GS || gz < 0 || gz >= GS) return false;
+            if (city.GetCellType(gx, gz) != CellType::ROAD) return false;
+            int rn = 0;
+            for (int d = 0; d < 4; ++d)
+                if (city.IsRoadLike(gx + ddx[d], gz + ddz[d])) ++rn;
+            return rn >= 3;
+        };
+
+        bool anyChanged = false;
+        for (auto [cx, cz] : cells) {
+            EvLog("[PCNC] checking cell gx=" + std::to_string(cx) + " gz=" + std::to_string(cz));
+            // Check the placed cell itself, and each of its 4 neighbours,
+            // as potential new intersections.
+            for (int cand = -1; cand < 4; ++cand) {
+                int ix = cx + (cand < 0 ? 0 : ddx[cand]);
+                int iz = cz + (cand < 0 ? 0 : ddz[cand]);
+                if (!isIntersectionAt(ix, iz)) continue;
+                EvLog("[PCNC] found intersection at ix=" + std::to_string(ix) + " iz=" + std::to_string(iz));
+
+                for (int d = 0; d < 4; ++d) {
+                    int nx = ix + ddx[d], nz = iz + ddz[d];
+                    if (nx < 0 || nx >= GS || nz < 0 || nz >= GS) continue;
+                    if (city.GetCellType(nx, nz) != CellType::ROAD) continue;
+                    if (isIntersectionAt(nx, nz)) continue;
+                    int rn2 = 0;
+                    for (int d2 = 0; d2 < 4; ++d2)
+                        if (city.IsRoadLike(nx + ddx[d2], nz + ddz[d2])) ++rn2;
+                    if (rn2 == 2) {
+                        EvLog("[PCNC] PlaceCell CROSSWALK nx=" + std::to_string(nx) + " nz=" + std::to_string(nz));
+                        city.PlaceCell(nx, nz, CellType::CROSSWALK);
+                        EvLog("[PCNC] PlaceCell CROSSWALK done");
+                        anyChanged = true;
+                    }
+                }
+            }
+        }
+        EvLog("[PCNC] calling RebuildIntersections");
+        trafficLights.RebuildIntersections(city);
+        EvLog("[PCNC] calling BuildSidewalkLayer");
+        city.BuildSidewalkLayer([&](int gx2, int gz2){ return trafficLights.IsIntersection(gx2, gz2); });
+        EvLog("[PCNC] done");
+    }
+
     // Automatically place crosswalks on road cells adjacent to intersections.
     // A crosswalk is placed 1 cell away from the intersection on each arm,
     // but only on straight road segments (exactly 2 road-like neighbors).
+    // Used during batch load/init only — not for interactive placement.
     void PlaceCrosswalksAroundIntersections()
     {
         constexpr int GS = CityLayout::GRID_SIZE;
@@ -1322,34 +1584,43 @@ public:
             oss << "\n[1-7]         Sim speed: " << simSpeed << "x";
 
             // ---- Build panel (right side) ----
-            const float px   = (float)this->width - 215.0f;
-            const float btnY[6] = { 145.0f, 215.0f, 285.0f, 355.0f, 425.0f, 495.0f };
-            const float btnH = 55.0f, btnW = 205.0f;
+            const float S = uiScale();
+            const float px   = (float)this->width - 215.0f*S;
+            const float btnH = 46.0f*S, btnW = 205.0f*S;
+            const float btnStart = 145.0f*S;
+            const float btnStep  = 55.0f*S;
             struct BtnDef { const char* label; XMFLOAT4 col; };
-            BtnDef btns[6] = {
-                { "  Road",       {0.40f,0.40f,1.00f,1.0f} },
-                { "  House",      {1.00f,0.50f,0.10f,1.0f} },
-                { "  Workplace",  {0.20f,0.55f,1.00f,1.0f} },
-                { "  Tree",       {0.20f,0.80f,0.20f,1.0f} },
-                { "  Crosswalk",  {0.90f,0.90f,0.40f,1.0f} },
-                { "  Parking",    {0.55f,0.53f,0.75f,1.0f} },
+            BtnDef btns[12] = {
+                { "  Road",         {0.40f,0.40f,1.00f,1.0f} },
+                { "  House",        {1.00f,0.50f,0.10f,1.0f} },
+                { "  Workplace",    {0.20f,0.55f,1.00f,1.0f} },
+                { "  Tree",         {0.20f,0.80f,0.20f,1.0f} },
+                { "  Crosswalk",    {0.90f,0.90f,0.40f,1.0f} },
+                { "  Parking",      {0.55f,0.53f,0.75f,1.0f} },
+                { "  Lake",         {0.10f,0.45f,0.85f,1.0f} },
+                { "  Power Plant",  {0.85f,0.65f,0.10f,1.0f} },
+                { "  Water Pump",   {0.15f,0.60f,0.80f,1.0f} },
+                { "  Police",       {0.15f,0.20f,0.55f,1.0f} },
+                { "  Fire Station", {0.75f,0.15f,0.10f,1.0f} },
+                { "  Hospital",     {0.90f,0.90f,0.95f,1.0f} },
             };
 
             // Panel title
             wi::font::Params title;
             title.posX  = px;
-            title.posY  = 108.0f;
-            title.size  = 22;
+            title.posY  = 108.0f*S;
+            title.size  = (int)(22*S);
             title.color = wi::Color(220, 220, 220, 230);
             wi::font::Draw("BUILD TOOLS", title, cmd);
 
-            for (int k = 0; k < 6; ++k)
+            for (int k = 0; k < 12; ++k)
             {
                 bool sel = (placeTool == k);
+                float by = btnStart + k * btnStep;
 
                 // Button background
                 wi::image::Params bg;
-                bg.pos  = XMFLOAT3(px - 5.0f, btnY[k], 0.0f);
+                bg.pos  = XMFLOAT3(px - 5.0f*S, by, 0.0f);
                 bg.siz  = XMFLOAT2(btnW, btnH);
                 bg.color = sel
                     ? XMFLOAT4(btns[k].col.x*0.6f, btns[k].col.y*0.6f, btns[k].col.z*0.6f, 0.90f)
@@ -1360,17 +1631,17 @@ public:
                 if (sel)
                 {
                     wi::image::Params bar;
-                    bar.pos  = XMFLOAT3(px - 5.0f, btnY[k], 0.0f);
-                    bar.siz  = XMFLOAT2(5.0f, btnH);
+                    bar.pos  = XMFLOAT3(px - 5.0f*S, by, 0.0f);
+                    bar.siz  = XMFLOAT2(5.0f*S, btnH);
                     bar.color = btns[k].col;
                     wi::image::Draw(nullptr, bar, cmd);
                 }
 
                 // Label
                 wi::font::Params fp;
-                fp.posX  = px + 12.0f;
-                fp.posY  = btnY[k] + 13.0f;
-                fp.size  = 26;
+                fp.posX  = px + 12.0f*S;
+                fp.posY  = by + 13.0f*S;
+                fp.size  = (int)(26*S);
                 fp.color = sel
                     ? wi::Color(255, 240, 80,  255)
                     : wi::Color(
@@ -1384,8 +1655,8 @@ public:
             // Hover cell info below buttons
             wi::font::Params hfp;
             hfp.posX  = px;
-            hfp.posY  = 500.0f + 65.0f;
-            hfp.size  = 18;
+            hfp.posY  = btnStart + 12 * btnStep + 10.0f*S;
+            hfp.size  = (int)(18*S);
             hfp.color = wi::Color(180, 180, 180, 180);
             if (hoverValid)
             {
@@ -1408,11 +1679,12 @@ public:
 
         // ---- Shadow cascade slider panel (bottom-left, always visible) ----
         {
-            const float panX = 10.f, panW = 215.f, panH = 105.f;
-            const float panY = (float)height - panH - 10.f;
-            const float sliderX = panX + 5.f, sliderW = 185.f, trackH = 12.f;
-            const float track1Y = panY + 30.f;
-            const float track2Y = panY + 67.f;
+            const float S = uiScale();
+            const float panX = 10.f*S, panW = 215.f*S, panH = 105.f*S;
+            const float panY = (float)height - panH - 10.f*S;
+            const float sliderX = panX + 5.f*S, sliderW = 185.f*S, trackH = 12.f*S;
+            const float track1Y = panY + 30.f*S;
+            const float track2Y = panY + 67.f*S;
 
             // Panel background
             wi::image::Params bg;
@@ -1423,8 +1695,8 @@ public:
 
             // Title
             wi::font::Params tp;
-            tp.posX  = panX + 6.f; tp.posY = panY + 6.f;
-            tp.size  = 16; tp.color = wi::Color(160, 180, 255, 220);
+            tp.posX  = panX + 6.f*S; tp.posY = panY + 6.f*S;
+            tp.size  = (int)(16*S); tp.color = wi::Color(160, 180, 255, 220);
             wi::font::Draw("Shadow Cascades", tp, cmd);
 
             auto drawSlider = [&](float trackY, float val, float minV, float maxV,
@@ -1448,8 +1720,8 @@ public:
 
                 // Thumb
                 wi::image::Params thumb;
-                thumb.pos   = XMFLOAT3(sliderX + sliderW * t - 5.f, trackY - 3.f, 0.f);
-                thumb.siz   = XMFLOAT2(10.f, trackH + 6.f);
+                thumb.pos   = XMFLOAT3(sliderX + sliderW * t - 5.f*S, trackY - 3.f*S, 0.f);
+                thumb.siz   = XMFLOAT2(10.f*S, trackH + 6.f*S);
                 thumb.color = XMFLOAT4(1.f, 1.f, 1.f, 0.95f);
                 wi::image::Draw(nullptr, thumb, cmd);
 
@@ -1457,8 +1729,8 @@ public:
                 std::ostringstream los;
                 los << label << ": " << std::fixed << std::setprecision(0) << val << " m";
                 wi::font::Params lp;
-                lp.posX  = sliderX; lp.posY = trackY + trackH + 2.f;
-                lp.size  = 14; lp.color = wi::Color(190, 190, 190, 200);
+                lp.posX  = sliderX; lp.posY = trackY + trackH + 2.f*S;
+                lp.size  = (int)(14*S); lp.color = wi::Color(190, 190, 190, 200);
                 wi::font::Draw(los.str(), lp, cmd);
             };
 
@@ -1540,33 +1812,175 @@ public:
             sel << "└──────────────────┘";
             oss << sel.str();
         }
+        else if (inspectGX >= 0 && inspectGZ >= 0)
+        {
+            auto ict = city.GetCellType(inspectGX, inspectGZ);
+            std::ostringstream ip;
+            ip << std::fixed << std::setprecision(0);
+            ip << "\n\n┌── INSPECT (" << inspectGX << "," << inspectGZ << ") ──┐\n";
+            switch (ict) {
+            case CellType::HOUSE:
+                ip << "| Type:     House\n"
+                   << "| Pop:      " << city.GetHousePop(inspectGX, inspectGZ) << "\n"
+                   << "| Services: " << (city.HasFullServiceCoverage(inspectGX, inspectGZ) ? "OK" : "MISSING") << "\n"
+                   << "| Power:    " << CityLayout::POWER_PER_HOUSE << " needed\n"
+                   << "| Water:    " << CityLayout::WATER_PER_HOUSE << " needed\n";
+                break;
+            case CellType::WORKPLACE:
+                ip << "| Type:     Workplace\n"
+                   << "| Workers:  " << city.GetWorkCount(inspectGX, inspectGZ)
+                   << "/" << city.GetWorkCap(inspectGX, inspectGZ) << "\n"
+                   << "| Power:    " << CityLayout::POWER_PER_WORKPLACE << " needed\n"
+                   << "| Water:    " << CityLayout::WATER_PER_WORKPLACE << " needed\n";
+                break;
+            case CellType::PARKING:
+                ip << "| Type:     Parking\n"
+                   << "| Cars:     " << city.GetParkOcc(inspectGX, inspectGZ)
+                   << "/" << city.GetParkCap(inspectGX, inspectGZ) << "\n";
+                break;
+            case CellType::LAKE:
+                ip << "| Type:     Lake\n";
+                break;
+            case CellType::POWER_PLANT:
+                ip << "| Type:     Power Plant\n"
+                   << "| Output:   " << CityLayout::POWER_PER_PLANT << " power\n";
+                break;
+            case CellType::WATER_PUMP:
+                ip << "| Type:     Water Pump\n"
+                   << "| Output:   " << CityLayout::WATER_PER_PUMP << " water\n";
+                break;
+            case CellType::POLICE:
+                ip << "| Type:     Police Station\n"
+                   << "| Range:    " << CityLayout::SERVICE_RADIUS << " cells\n"
+                   << "| Power:    " << CityLayout::POWER_PER_SERVICE << " needed\n"
+                   << "| Water:    " << CityLayout::WATER_PER_SERVICE << " needed\n";
+                break;
+            case CellType::FIRE_STATION:
+                ip << "| Type:     Fire Station\n"
+                   << "| Range:    " << CityLayout::SERVICE_RADIUS << " cells\n"
+                   << "| Power:    " << CityLayout::POWER_PER_SERVICE << " needed\n"
+                   << "| Water:    " << CityLayout::WATER_PER_SERVICE << " needed\n";
+                break;
+            case CellType::HOSPITAL:
+                ip << "| Type:     Hospital\n"
+                   << "| Range:    " << CityLayout::SERVICE_RADIUS << " cells\n"
+                   << "| Power:    " << CityLayout::POWER_PER_SERVICE << " needed\n"
+                   << "| Water:    " << CityLayout::WATER_PER_SERVICE << " needed\n";
+                break;
+            case CellType::ROAD:
+                ip << "| Type:     Intersection\n"
+                   << "| Lanes:    " << city.GetRoadLanes(inspectGX, inspectGZ) << "\n";
+                break;
+            case CellType::CROSSWALK:
+                ip << "| Type:     Crosswalk\n";
+                break;
+            default:
+                ip << "| Type:     " << (int)ict << "\n";
+                break;
+            }
+
+            // ── Intersection info (if this cell is a traffic-light intersection) ──
+            if (trafficLights.IsIntersection(inspectGX, inspectGZ))
+            {
+                using TLS = TrafficLightSystem;
+                using TI  = TLS::TurnIntent;
+                auto ph = trafficLights.GetPhase(inspectGX, inspectGZ);
+                float timer = trafficLights.GetPhaseTimer(inspectGX, inspectGZ);
+                float dur   = trafficLights.GetPhaseTotalDuration(inspectGX, inspectGZ);
+                ip << "|\n"
+                   << "| Phase: " << TLS::PhaseName(ph)
+                   << " (" << std::setprecision(1) << timer << "/" << dur << "s)\n";
+
+                // Show per-direction light state (N/E/S/W approach)
+                auto lStr = [&](float dx, float dz, TI ti) {
+                    return TLS::LightStr(trafficLights.GetLight(inspectGX, inspectGZ, dx, dz, ti));
+                };
+                ip << "|\n"
+                   << "| From N: S=" << lStr(0,1,TI::STRAIGHT)
+                   << " R=" << lStr(0,1,TI::RIGHT)
+                   << " L=" << lStr(0,1,TI::LEFT) << "\n"
+                   << "| From E: S=" << lStr(-1,0,TI::STRAIGHT)
+                   << " R=" << lStr(-1,0,TI::RIGHT)
+                   << " L=" << lStr(-1,0,TI::LEFT) << "\n"
+                   << "| From S: S=" << lStr(0,-1,TI::STRAIGHT)
+                   << " R=" << lStr(0,-1,TI::RIGHT)
+                   << " L=" << lStr(0,-1,TI::LEFT) << "\n"
+                   << "| From W: S=" << lStr(1,0,TI::STRAIGHT)
+                   << " R=" << lStr(1,0,TI::RIGHT)
+                   << " L=" << lStr(1,0,TI::LEFT) << "\n";
+            }
+
+            ip << "└──────────────────────┘";
+            oss << ip.str();
+        }
         else
         {
-            oss << "\n\n[LMB] Click any agent or car to inspect";
+            oss << "\n\n[LMB] Click anything to inspect";
         }
 
         {
+            const float S = uiScale();
             wi::font::Params shadow;
-            shadow.posX  = 12.5f;  shadow.posY  = 12.5f;
-            shadow.size  = 22;
+            shadow.posX  = 12.5f*S;  shadow.posY  = 12.5f*S;
+            shadow.size  = (int)(22*S);
             shadow.color = wi::Color(0, 0, 0, 180);
             wi::font::Draw(oss.str(), shadow, cmd);
         }
         {
+            const float S = uiScale();
             wi::font::Params fp;
-            fp.posX  = 10.0f;  fp.posY  = 10.0f;
-            fp.size  = 22;
+            fp.posX  = 10.0f*S;  fp.posY  = 10.0f*S;
+            fp.size  = (int)(22*S);
             fp.color = wi::Color(240, 240, 60, 255);
             wi::font::Draw(oss.str(), fp, cmd);
+        }
+
+        // ---- Utility supply/demand HUD (top-right, always visible) ----
+        {
+            int pSup, pDem, wSup, wDem;
+            city.ComputeUtilities(pSup, pDem, wSup, wDem);
+
+            const float S = uiScale();
+            float uhX = (float)this->width - 260.0f*S;
+            float uhY = 10.0f*S;
+
+            // Background panel
+            wi::image::Params ubg;
+            ubg.pos   = XMFLOAT3(uhX - 5.f*S, uhY, 0.f);
+            ubg.siz   = XMFLOAT2(255.f*S, 60.f*S);
+            ubg.color = XMFLOAT4(0.05f, 0.05f, 0.10f, 0.80f);
+            wi::image::Draw(nullptr, ubg, cmd);
+
+            // Power line
+            {
+                std::ostringstream ps;
+                ps << "Power: " << pSup << " / " << pDem;
+                wi::font::Params pfp;
+                pfp.posX = uhX; pfp.posY = uhY + 6.f*S;
+                pfp.size = (int)(20*S);
+                pfp.color = (pSup >= pDem) ? wi::Color(80, 255, 80, 240) : wi::Color(255, 80, 80, 240);
+                wi::font::Draw(ps.str(), pfp, cmd);
+            }
+            // Water line
+            {
+                std::ostringstream ws;
+                ws << "Water: " << wSup << " / " << wDem;
+                wi::font::Params wfp;
+                wfp.posX = uhX; wfp.posY = uhY + 32.f*S;
+                wfp.size = (int)(20*S);
+                wfp.color = (wSup >= wDem) ? wi::Color(80, 200, 255, 240) : wi::Color(255, 80, 80, 240);
+                wi::font::Draw(ws.str(), wfp, cmd);
+            }
         }
 
         // ---- Saves Menu Overlay ----
         if (savesMenuOpen)
         {
-            float menuW = 400.0f;
+            const float S = uiScale();
+            float menuW = 400.0f*S;
             float menuX = (float)this->width * 0.5f - menuW * 0.5f;
-            float menuY = 80.0f;
-            float entryH = 40.0f;
+            float menuY = 80.0f*S;
+            float entryH = 40.0f*S;
             int maxShow = 12;
 
             // Dim background
@@ -1582,12 +1996,12 @@ public:
             {
                 wi::font::Params tp;
                 tp.posX = menuX; tp.posY = menuY;
-                tp.size = 28;
+                tp.size = (int)(28*S);
                 tp.color = wi::Color(255, 255, 255, 255);
                 wi::font::Draw(savesMenuSaveMode ? "SAVE GAME" : "LOAD GAME", tp, cmd);
             }
 
-            float listStartY = menuY + 40.0f;
+            float listStartY = menuY + 40.0f*S;
 
             // "New Save" button (save mode only)
             if (savesMenuSaveMode)
@@ -1599,11 +2013,11 @@ public:
                 wi::image::Draw(nullptr, bg, cmd);
 
                 wi::font::Params fp2;
-                fp2.posX = menuX + 12.0f; fp2.posY = listStartY + 8.0f;
-                fp2.size = 22;
+                fp2.posX = menuX + 12.0f*S; fp2.posY = listStartY + 8.0f*S;
+                fp2.size = (int)(22*S);
                 fp2.color = wi::Color(255, 255, 255, 255);
                 wi::font::Draw("+ New Save", fp2, cmd);
-                listStartY += entryH + 10.0f;
+                listStartY += entryH + 10.0f*S;
             }
 
             // List existing saves
@@ -1618,20 +2032,20 @@ public:
 
                 wi::image::Params bg;
                 bg.pos = XMFLOAT3(menuX, ey, 0);
-                bg.siz = XMFLOAT2(menuW, entryH - 2.0f);
+                bg.siz = XMFLOAT2(menuW, entryH - 2.0f*S);
                 bg.color = hover ? XMFLOAT4(0.3f, 0.3f, 0.6f, 0.9f) : XMFLOAT4(0.1f, 0.1f, 0.15f, 0.85f);
                 wi::image::Draw(nullptr, bg, cmd);
 
                 wi::font::Params fp2;
-                fp2.posX = menuX + 12.0f; fp2.posY = ey + 8.0f;
-                fp2.size = 22;
+                fp2.posX = menuX + 12.0f*S; fp2.posY = ey + 8.0f*S;
+                fp2.size = (int)(22*S);
                 fp2.color = hover ? wi::Color(255, 255, 80, 255) : wi::Color(220, 220, 220, 230);
                 wi::font::Draw(saveFiles[si], fp2, cmd);
 
                 if (savesMenuSaveMode) {
                     wi::font::Params ov;
-                    ov.posX = menuX + menuW - 100.0f; ov.posY = ey + 8.0f;
-                    ov.size = 18;
+                    ov.posX = menuX + menuW - 100.0f*S; ov.posY = ey + 8.0f*S;
+                    ov.size = (int)(18*S);
                     ov.color = wi::Color(255, 120, 120, 200);
                     wi::font::Draw("overwrite", ov, cmd);
                 }
@@ -1639,10 +2053,10 @@ public:
 
             // Footer
             {
-                float footY = listStartY + (float)std::min((int)saveFiles.size(), maxShow) * entryH + 10.0f;
+                float footY = listStartY + (float)std::min((int)saveFiles.size(), maxShow) * entryH + 10.0f*S;
                 wi::font::Params fp2;
                 fp2.posX = menuX; fp2.posY = footY;
-                fp2.size = 18;
+                fp2.size = (int)(18*S);
                 fp2.color = wi::Color(180, 180, 180, 180);
                 wi::font::Draw("[ESC] Close", fp2, cmd);
             }
@@ -1730,6 +2144,7 @@ int WINAPI wWinMain(
     LPWSTR    lpCmdLine,
     int       nCmdShow)
 {
+    SetUnhandledExceptionFilter(UnhandledExFilter);
     wi::arguments::Parse(lpCmdLine);
 
     // Opt in to per-monitor DPI scaling (matches the template)
@@ -1747,8 +2162,14 @@ int WINAPI wWinMain(
     wc.lpszClassName = L"CrowdSimClass";
     RegisterClassExW(&wc);
 
-    // ---- Create window (1920 × 1080) ----
-    RECT rc{ 0, 0, 1920, 1080 };
+    // ---- Create window (80% of primary monitor work area) ----
+    RECT workArea;
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+    int monW = workArea.right  - workArea.left;
+    int monH = workArea.bottom - workArea.top;
+    int winW = (int)(monW * 0.8);
+    int winH = (int)(monH * 0.8);
+    RECT rc{ 0, 0, winW, winH };
     AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
 
     HWND hWnd = CreateWindowExW(

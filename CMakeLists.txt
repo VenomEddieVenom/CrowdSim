@@ -73,11 +73,13 @@ if(MSVC)
         /Ot          # Favour fast code
         /arch:AVX2   # AVX2 SIMD
         /MP          # Parallel compilation
+        /Zi          # PDB debug info (needed for crash log symbols)
         /W3
         /wd4100      # Unreferenced formal parameter
         /wd4201      # Nameless struct/union
         /wd4127      # Conditional expression is constant
     )
+    target_link_options(CrowdSim PRIVATE /DEBUG:FULL)
     target_compile_definitions(CrowdSim PRIVATE
         WIN32_LEAN_AND_MEAN
         NOMINMAX

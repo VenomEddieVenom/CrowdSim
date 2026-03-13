@@ -7,6 +7,7 @@
 #include <cstring>
 #include <functional>
 #include <fstream>
+#include <utility>
 
 // ============================================================
 //  CityLayout  –  user-editable grid city
@@ -31,7 +32,7 @@ public:
     static constexpr int   SW_DIM      = GRID_SIZE * SW_SUB;          // 400
     bool sidewalkLayer[SW_DIM * SW_DIM] = {};
 
-    enum class CellType : uint8_t { EMPTY = 0, ROAD, HOUSE, WORKPLACE, CROSSWALK, PARKING };
+    enum class CellType : uint8_t { EMPTY = 0, ROAD, HOUSE, WORKPLACE, CROSSWALK, PARKING, LAKE, POWER_PLANT, WATER_PUMP, POLICE, FIRE_STATION, HOSPITAL };
 
     // Flat arrays indexed [gz * GRID_SIZE + gx]
     CellType                     cellType   [GRID_SIZE * GRID_SIZE] = {};
@@ -46,10 +47,14 @@ public:
     // Per-cell lane count: 2, 4, or 6 total lanes.  Default = 4.
     int roadLanes_[GRID_SIZE * GRID_SIZE] = {};
 
+    // Global lane marking entities (not per-cell — rebuilt as full-road-network runs).
+    std::vector<wi::ecs::Entity> laneMarkEntities_;
+    bool laneMarksDirty_ = false;
+
     int  GetRoadLanes(int gx, int gz) const {
-        if (gx < 0 || gx >= GRID_SIZE || gz < 0 || gz >= GRID_SIZE) return 4;
+        if (gx < 0 || gx >= GRID_SIZE || gz < 0 || gz >= GRID_SIZE) return 6;
         int v = roadLanes_[gz * GRID_SIZE + gx];
-        return (v == 2 || v == 6) ? v : 4;
+        return (v == 2 || v == 4) ? v : 6;
     }
     void SetRoadLanes(int gx, int gz, int lanes) {
         if (gx >= 0 && gx < GRID_SIZE && gz >= 0 && gz < GRID_SIZE)
@@ -59,6 +64,15 @@ public:
         int cur = GetRoadLanes(gx, gz);
         int next = (cur == 2) ? 4 : (cur == 4) ? 6 : 2;
         SetRoadLanes(gx, gz, next);
+        // Propagate to adjacent crosswalk cells so cars stay consistent
+        const int ddx[] = {1,-1,0,0};
+        const int ddz[] = {0,0,1,-1};
+        for (int d = 0; d < 4; ++d) {
+            int nx = gx + ddx[d], nz = gz + ddz[d];
+            if (InBounds(nx, nz) && GetCellType(nx, nz) == CellType::CROSSWALK)
+                SetRoadLanes(nx, nz, next);
+        }
+        laneMarksDirty_ = true;
     }
 
     // Legacy occupancy (kept for API compat)
@@ -84,6 +98,20 @@ public:
         if (!InBounds(gx, gz)) return false;
         auto t = cellType[gz * GRID_SIZE + gx];
         return t == CellType::ROAD || t == CellType::CROSSWALK;
+    }
+
+    bool IsLake(int gx, int gz) const
+    {
+        if (!InBounds(gx, gz)) return false;
+        return cellType[gz * GRID_SIZE + gx] == CellType::LAKE;
+    }
+
+    bool HasAdjacentLake(int gx, int gz) const
+    {
+        const int ddx[] = {1,-1,0,0}; const int ddz[] = {0,0,1,-1};
+        for (int d = 0; d < 4; ++d)
+            if (IsLake(gx+ddx[d], gz+ddz[d])) return true;
+        return false;
     }
 
     // ----------------------------------------------------------
@@ -313,6 +341,12 @@ public:
         case CellType::WORKPLACE: BuildWorkplace(idx, gx, gz, c, s); break;
         case CellType::CROSSWALK: BuildCrosswalk(idx, gx, gz, c, s); break;
         case CellType::PARKING:   BuildParking(idx, gx, gz, c, s);   break;
+        case CellType::LAKE:         BuildLake(idx, gx, gz, c, s);       break;
+        case CellType::POWER_PLANT:  BuildPowerPlant(idx, gx, gz, c, s); break;
+        case CellType::WATER_PUMP:   BuildWaterPump(idx, gx, gz, c, s);  break;
+        case CellType::POLICE:       BuildPolice(idx, gx, gz, c, s);     break;
+        case CellType::FIRE_STATION: BuildFireStation(idx, gx, gz, c, s); break;
+        case CellType::HOSPITAL:     BuildHospital(idx, gx, gz, c, s);  break;
         default: break;
         }
         // Rebuild neighboring roads so they update their sidewalk open-sides
@@ -320,6 +354,7 @@ public:
         const int ddz[4] = { 0, 0, 1,-1 };
         for (int d = 0; d < 4; ++d)
             RebuildRoadCell(gx + ddx[d], gz + ddz[d]);
+        laneMarksDirty_ = true;
         return true;
     }
 
@@ -331,6 +366,7 @@ public:
         for (auto e : cellEntities[idx]) s.Entity_Remove(e);
         cellEntities[idx].clear();
         cellType[idx] = CellType::EMPTY;
+        roadLanes_[idx] = 0;
         // Reset the sidewalk entity cache so BuildRoad creates fresh ones if reused.
         for (int d = 0; d < 4; ++d) roadSidewalks[idx][d] = wi::ecs::INVALID_ENTITY;
         for (int d = 0; d < 4; ++d) roadCorners[idx][d] = wi::ecs::INVALID_ENTITY;
@@ -702,8 +738,306 @@ private:
                 roadCorners[idx][d] = ce;
             }
         }
+
+        // Lane markings are drawn globally by RebuildAllLaneMarkings().
     }
 
+public:
+    // ── Global lane marking rebuild ─────────────────────────────────────
+    // Scans all road cells, groups them into maximal straight runs per axis,
+    // and draws one long continuous stripe per run.  No per-cell seams.
+    // Turns are handled because each cell's axis membership is computed from
+    // the CURRENT connectivity (not stale placement-time state).
+    void RebuildAllLaneMarkings()
+    {
+        auto& s = wi::scene::GetScene();
+        for (auto e : laneMarkEntities_) s.Entity_Remove(e);
+        laneMarkEntities_.clear();
+        laneMarksDirty_ = false;
+
+        const float h         = CELL_SIZE * 0.5f;
+        const float STRIPE_HW = 0.12f;
+        const float STRIPE_HH = 0.005f;
+        const float STRIPE_Y  = 0.21f;
+        const float driveH    = h - SIDEWALK_W;  // 8 m
+        const float DASH_LEN  = 3.0f;
+        const float DASH_GAP  = 3.0f;
+        const float DASH_PERIOD = DASH_LEN + DASH_GAP;
+
+        auto isRL = [&](int gx, int gz) -> bool {
+            if (gx < 0 || gx >= GRID_SIZE || gz < 0 || gz >= GRID_SIZE) return false;
+            auto t = cellType[gz * GRID_SIZE + gx];
+            return t == CellType::ROAD || t == CellType::CROSSWALK;
+        };
+
+        // Which axes a cell needs markings on (ROAD *and* CROSSWALK).
+        auto cellAxes = [&](int gx, int gz) -> std::pair<bool,bool> {
+            if (gx < 0 || gx >= GRID_SIZE || gz < 0 || gz >= GRID_SIZE)
+                return {false, false};
+            auto ct = cellType[gz * GRID_SIZE + gx];
+            if (ct != CellType::ROAD && ct != CellType::CROSSWALK)
+                return {false, false};
+            bool cN = isRL(gx, gz-1), cS = isRL(gx, gz+1);
+            bool cE = isRL(gx+1, gz), cW = isRL(gx-1, gz);
+            bool ns = (cN || cS);
+            bool ew = (cE || cW);
+            if (!ns && !ew) ns = true;
+            return {ns, ew};
+        };
+
+        auto isIntersection = [&](int gx, int gz) -> bool {
+            int n = (int)isRL(gx+1,gz) + (int)isRL(gx-1,gz)
+                  + (int)isRL(gx,gz+1) + (int)isRL(gx,gz-1);
+            return n >= 3;
+        };
+
+        // Bend = exactly 2 perpendicular (non-opposite) connections.
+        auto isBend = [&](int gx, int gz) -> bool {
+            if (gx < 0 || gx >= GRID_SIZE || gz < 0 || gz >= GRID_SIZE) return false;
+            auto ct = cellType[gz * GRID_SIZE + gx];
+            if (ct != CellType::ROAD && ct != CellType::CROSSWALK) return false;
+            bool cN = isRL(gx, gz-1), cS = isRL(gx, gz+1);
+            bool cE = isRL(gx+1, gz), cW = isRL(gx-1, gz);
+            int n = (int)cN + (int)cS + (int)cE + (int)cW;
+            if (n != 2) return false;
+            return !((cN && cS) || (cE && cW));
+        };
+
+        // Sign of the perpendicular offset that faces the inner corner.
+        // NS axis: +1 if bend connects E, -1 if W.
+        // EW axis: +1 if bend connects S, -1 if N.
+        auto bendInnerSign = [&](int gx, int gz, bool axisNS) -> float {
+            if (axisNS) {
+                if (isRL(gx+1, gz)) return  1.f;
+                if (isRL(gx-1, gz)) return -1.f;
+            } else {
+                if (isRL(gx, gz+1)) return  1.f;
+                if (isRL(gx, gz-1)) return -1.f;
+            }
+            return 0.f;
+        };
+
+        auto makeSolid = [&](float cx, float cz, float halfLen,
+                             float offPerp, bool axisNS,
+                             float r, float g, float b)
+        {
+            if (halfLen < 0.05f) return;
+            auto e = s.Entity_CreateCube("lane_line");
+            auto* tr = s.transforms.GetComponent(e);
+            if (tr) {
+                if (axisNS) {
+                    tr->Scale(XMFLOAT3(STRIPE_HW, STRIPE_HH, halfLen));
+                    tr->Translate(XMFLOAT3(cx + offPerp, STRIPE_Y, cz));
+                } else {
+                    tr->Scale(XMFLOAT3(halfLen, STRIPE_HH, STRIPE_HW));
+                    tr->Translate(XMFLOAT3(cx, STRIPE_Y, cz + offPerp));
+                }
+                tr->UpdateTransform();
+            }
+            auto* mat = s.materials.GetComponent(e);
+            if (mat) mat->SetBaseColor(XMFLOAT4(r, g, b, 1.f));
+            laneMarkEntities_.push_back(e);
+        };
+
+        auto makeDashed = [&](float runStart, float runEnd,
+                              float fixedCoord, float offPerp,
+                              bool axisNS, float r, float g, float b)
+        {
+            if (runEnd <= runStart + 0.1f) return;
+            float pos = std::floor(runStart / DASH_PERIOD) * DASH_PERIOD;
+            while (pos < runEnd) {
+                float dStart = pos;
+                float dEnd   = pos + DASH_LEN;
+                if (dStart < runStart) dStart = runStart;
+                if (dEnd   > runEnd)   dEnd   = runEnd;
+                if (dEnd > dStart + 0.1f) {
+                    float dHL = (dEnd - dStart) * 0.5f;
+                    float dMid = (dStart + dEnd) * 0.5f;
+                    auto e = s.Entity_CreateCube("lane_dash");
+                    auto* tr = s.transforms.GetComponent(e);
+                    if (tr) {
+                        if (axisNS) {
+                            tr->Scale(XMFLOAT3(STRIPE_HW, STRIPE_HH, dHL));
+                            tr->Translate(XMFLOAT3(fixedCoord + offPerp, STRIPE_Y, dMid));
+                        } else {
+                            tr->Scale(XMFLOAT3(dHL, STRIPE_HH, STRIPE_HW));
+                            tr->Translate(XMFLOAT3(dMid, STRIPE_Y, fixedCoord + offPerp));
+                        }
+                        tr->UpdateTransform();
+                    }
+                    auto* mat = s.materials.GetComponent(e);
+                    if (mat) mat->SetBaseColor(XMFLOAT4(r, g, b, 1.f));
+                    laneMarkEntities_.push_back(e);
+                }
+                pos += DASH_PERIOD;
+            }
+        };
+
+        // Compute axis-bounds for a given perpendicular offset in an NS run.
+        // At bend endpoints the "inner" offset (toward the perpendicular arm)
+        // is clipped to exclude the bend cell entirely, preventing the grid
+        // pattern at inside corners.  Other offsets clip to cell center.
+        auto nsBounds = [&](int gx, int rStart, int rEnd,
+                            float cfZ, float clZ, float off)
+            -> std::pair<float,float>
+        {
+            float lo, hi;
+            if (isBend(gx, rStart)) {
+                float sgn = bendInnerSign(gx, rStart, true);
+                bool inner = (off > 0.f && sgn > 0.f) || (off < 0.f && sgn < 0.f);
+                lo = inner ? (cfZ + h) : cfZ;   // inner: skip bend cell
+            } else {
+                lo = cfZ - h;
+            }
+            if (isBend(gx, rEnd)) {
+                float sgn = bendInnerSign(gx, rEnd, true);
+                bool inner = (off > 0.f && sgn > 0.f) || (off < 0.f && sgn < 0.f);
+                hi = inner ? (clZ - h) : clZ;
+            } else {
+                hi = clZ + h;
+            }
+            return {lo, hi};
+        };
+
+        auto ewBounds = [&](int gz, int rStart, int rEnd,
+                            float cfX, float clX, float off)
+            -> std::pair<float,float>
+        {
+            float lo, hi;
+            if (isBend(rStart, gz)) {
+                float sgn = bendInnerSign(rStart, gz, false);
+                bool inner = (off > 0.f && sgn > 0.f) || (off < 0.f && sgn < 0.f);
+                lo = inner ? (cfX + h) : cfX;
+            } else {
+                lo = cfX - h;
+            }
+            if (isBend(rEnd, gz)) {
+                float sgn = bendInnerSign(rEnd, gz, false);
+                bool inner = (off > 0.f && sgn > 0.f) || (off < 0.f && sgn < 0.f);
+                hi = inner ? (clX - h) : clX;
+            } else {
+                hi = clX + h;
+            }
+            return {lo, hi};
+        };
+
+        // --- Scan columns for NS runs ---
+        for (int gx = 0; gx < GRID_SIZE; ++gx) {
+            int runStart = -1;
+            for (int gz = 0; gz <= GRID_SIZE; ++gz) {
+                bool ns = (gz < GRID_SIZE) && cellAxes(gx, gz).first;
+                if (ns && runStart < 0) runStart = gz;
+                if (!ns && runStart >= 0) {
+                    int runEnd = gz - 1;
+                    float cfZ = GridCellCenter(gx, runStart).y;
+                    float clZ = GridCellCenter(gx, runEnd).y;
+                    float cx  = GridCellCenter(gx, runStart).x;
+
+                    // Center yellow
+                    std::pair<float,float> bc = nsBounds(gx, runStart, runEnd, cfZ, clZ, 0.f);
+                    makeSolid(cx, (bc.first+bc.second)*0.5f, (bc.second-bc.first)*0.5f,
+                              0.f, true, 0.95f, 0.80f, 0.10f);
+
+                    // Edge whites
+                    std::pair<float,float> ep = nsBounds(gx, runStart, runEnd, cfZ, clZ, driveH);
+                    makeSolid(cx, (ep.first+ep.second)*0.5f, (ep.second-ep.first)*0.5f,
+                              driveH, true, 0.90f, 0.90f, 0.90f);
+                    std::pair<float,float> en = nsBounds(gx, runStart, runEnd, cfZ, clZ, -driveH);
+                    makeSolid(cx, (en.first+en.second)*0.5f, (en.second-en.first)*0.5f,
+                              -driveH, true, 0.90f, 0.90f, 0.90f);
+
+                    // Dashed dividers per cell (skip intersections and crosswalks)
+                    for (int rz = runStart; rz <= runEnd; ++rz) {
+                        if (isIntersection(gx, rz)) continue;
+                        if (cellType[rz * GRID_SIZE + gx] == CellType::CROSSWALK) continue;
+                        int lanes = GetRoadLanes(gx, rz);
+                        float divs[4]; int nDiv = 0;
+                        if (lanes >= 6) {
+                            divs[nDiv++] = 2.67f; divs[nDiv++] = -2.67f;
+                            divs[nDiv++] = 5.33f; divs[nDiv++] = -5.33f;
+                        } else if (lanes >= 4) {
+                            divs[nDiv++] = 4.0f;  divs[nDiv++] = -4.0f;
+                        }
+                        XMFLOAT2 cc = GridCellCenter(gx, rz);
+                        for (int d = 0; d < nDiv; ++d) {
+                            float zLo, zHi;
+                            if (rz == runStart && isBend(gx, rz)) {
+                                float si = bendInnerSign(gx, rz, true);
+                                bool inn = (divs[d] > 0.f && si > 0.f) || (divs[d] < 0.f && si < 0.f);
+                                zLo = inn ? (cc.y + h) : cc.y;
+                            } else zLo = cc.y - h;
+                            if (rz == runEnd && isBend(gx, rz)) {
+                                float si = bendInnerSign(gx, rz, true);
+                                bool inn = (divs[d] > 0.f && si > 0.f) || (divs[d] < 0.f && si < 0.f);
+                                zHi = inn ? (cc.y - h) : cc.y;
+                            } else zHi = cc.y + h;
+                            makeDashed(zLo, zHi, cx, divs[d],
+                                       true, 0.90f, 0.90f, 0.90f);
+                        }
+                    }
+                    runStart = -1;
+                }
+            }
+        }
+
+        // --- Scan rows for EW runs ---
+        for (int gz = 0; gz < GRID_SIZE; ++gz) {
+            int runStart = -1;
+            for (int gx = 0; gx <= GRID_SIZE; ++gx) {
+                bool ew = (gx < GRID_SIZE) && cellAxes(gx, gz).second;
+                if (ew && runStart < 0) runStart = gx;
+                if (!ew && runStart >= 0) {
+                    int runEnd = gx - 1;
+                    float cfX = GridCellCenter(runStart, gz).x;
+                    float clX = GridCellCenter(runEnd, gz).x;
+                    float cz  = GridCellCenter(runStart, gz).y;
+
+                    std::pair<float,float> bc = ewBounds(gz, runStart, runEnd, cfX, clX, 0.f);
+                    makeSolid((bc.first+bc.second)*0.5f, cz, (bc.second-bc.first)*0.5f,
+                              0.f, false, 0.95f, 0.80f, 0.10f);
+
+                    std::pair<float,float> ep = ewBounds(gz, runStart, runEnd, cfX, clX, driveH);
+                    makeSolid((ep.first+ep.second)*0.5f, cz, (ep.second-ep.first)*0.5f,
+                              driveH, false, 0.90f, 0.90f, 0.90f);
+                    std::pair<float,float> en = ewBounds(gz, runStart, runEnd, cfX, clX, -driveH);
+                    makeSolid((en.first+en.second)*0.5f, cz, (en.second-en.first)*0.5f,
+                              -driveH, false, 0.90f, 0.90f, 0.90f);
+
+                    for (int rx = runStart; rx <= runEnd; ++rx) {
+                        if (isIntersection(rx, gz)) continue;
+                        if (cellType[gz * GRID_SIZE + rx] == CellType::CROSSWALK) continue;
+                        int lanes = GetRoadLanes(rx, gz);
+                        float divs[4]; int nDiv = 0;
+                        if (lanes >= 6) {
+                            divs[nDiv++] = 2.67f; divs[nDiv++] = -2.67f;
+                            divs[nDiv++] = 5.33f; divs[nDiv++] = -5.33f;
+                        } else if (lanes >= 4) {
+                            divs[nDiv++] = 4.0f;  divs[nDiv++] = -4.0f;
+                        }
+                        XMFLOAT2 cc = GridCellCenter(rx, gz);
+                        for (int d = 0; d < nDiv; ++d) {
+                            float xLo, xHi;
+                            if (rx == runStart && isBend(rx, gz)) {
+                                float si = bendInnerSign(rx, gz, false);
+                                bool inn = (divs[d] > 0.f && si > 0.f) || (divs[d] < 0.f && si < 0.f);
+                                xLo = inn ? (cc.x + h) : cc.x;
+                            } else xLo = cc.x - h;
+                            if (rx == runEnd && isBend(rx, gz)) {
+                                float si = bendInnerSign(rx, gz, false);
+                                bool inn = (divs[d] > 0.f && si > 0.f) || (divs[d] < 0.f && si < 0.f);
+                                xHi = inn ? (cc.x - h) : cc.x;
+                            } else xHi = cc.x + h;
+                            makeDashed(xLo, xHi, cz, divs[d],
+                                       false, 0.90f, 0.90f, 0.90f);
+                        }
+                    }
+                    runStart = -1;
+                }
+            }
+        }
+    }
+
+private:
     void BuildCrosswalk(int idx, int gx, int gz, XMFLOAT2 c, wi::scene::Scene& s)
     {
         const float h   = CELL_SIZE * 0.5f;
@@ -870,6 +1204,65 @@ public:
     int parkingOccupancy_[GRID_SIZE * GRID_SIZE] = {};
     // Per-floor occupancy count
     int parkingFloorOcc_[GRID_SIZE * GRID_SIZE][PARKING_FLOORS] = {};
+
+    // Service coverage radius (in grid cells, Manhattan distance)
+    static constexpr int SERVICE_RADIUS = 10;
+
+    // Check whether a house cell is covered by all three services
+    bool HasFullServiceCoverage(int hx, int hz) const
+    {
+        bool police = false, fire = false, hospital = false;
+        int r = SERVICE_RADIUS;
+        for (int dz = -r; dz <= r && !(police && fire && hospital); ++dz)
+        for (int dx = -r; dx <= r && !(police && fire && hospital); ++dx) {
+            if (std::abs(dx) + std::abs(dz) > r) continue;
+            int nx = hx + dx, nz = hz + dz;
+            if (!InBounds(nx, nz)) continue;
+            auto ct = cellType[nz * GRID_SIZE + nx];
+            if (ct == CellType::POLICE)       police   = true;
+            if (ct == CellType::FIRE_STATION) fire     = true;
+            if (ct == CellType::HOSPITAL)     hospital = true;
+        }
+        return police && fire && hospital;
+    }
+
+    // Utility system tracking
+    static constexpr int POWER_PER_PLANT = 50;
+    static constexpr int WATER_PER_PUMP  = 50;
+    static constexpr int POWER_PER_HOUSE = 3;
+    static constexpr int WATER_PER_HOUSE = 2;
+    static constexpr int POWER_PER_WORKPLACE = 5;
+    static constexpr int WATER_PER_WORKPLACE = 3;
+    static constexpr int POWER_PER_SERVICE = 4;
+    static constexpr int WATER_PER_SERVICE = 3;
+
+    // Returns totals
+    void ComputeUtilities(int& powerSupply, int& powerDemand,
+                          int& waterSupply, int& waterDemand) const
+    {
+        powerSupply = powerDemand = waterSupply = waterDemand = 0;
+        for (int i = 0; i < GRID_SIZE * GRID_SIZE; ++i) {
+            switch (cellType[i]) {
+            case CellType::POWER_PLANT: powerSupply += POWER_PER_PLANT; break;
+            case CellType::WATER_PUMP:  waterSupply += WATER_PER_PUMP;  break;
+            case CellType::HOUSE:
+                powerDemand += POWER_PER_HOUSE;
+                waterDemand += WATER_PER_HOUSE;
+                break;
+            case CellType::WORKPLACE:
+                powerDemand += POWER_PER_WORKPLACE;
+                waterDemand += WATER_PER_WORKPLACE;
+                break;
+            case CellType::POLICE:
+            case CellType::FIRE_STATION:
+            case CellType::HOSPITAL:
+                powerDemand += POWER_PER_SERVICE;
+                waterDemand += WATER_PER_SERVICE;
+                break;
+            default: break;
+            }
+        }
+    }
 
     int  GetParkCap(int gx, int gz) const { return InBounds(gx,gz) ? parkingCapacity_[gz*GRID_SIZE+gx] : 0; }
     int  GetParkOcc(int gx, int gz) const { return InBounds(gx,gz) ? parkingOccupancy_[gz*GRID_SIZE+gx] : 0; }
@@ -1133,6 +1526,285 @@ private:
             pm->SetBaseColor(XMFLOAT4(0.10f, 0.28f, 0.82f, 1.0f));
             pm->SetEmissiveColor(XMFLOAT4(0.10f, 0.28f, 0.82f, 3.0f));
             cellEntities[idx].push_back(p);
+        }
+    }
+
+    void BuildLake(int idx, int gx, int gz, XMFLOAT2 c, wi::scene::Scene& s)
+    {
+        float hw = CELL_SIZE * 0.50f;
+        // Dark lake bed recessed below ground
+        {
+            auto e = s.Entity_CreateCube("lake_bed");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(hw, 0.8f, hw));
+            tr->Translate(XMFLOAT3(c.x, -1.6f, c.y));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.02f, 0.05f, 0.04f, 1.0f));
+            cellEntities[idx].push_back(e);
+        }
+        // Water surface using engine's WATER shader (reflections + Fresnel)
+        {
+            auto e = s.Entity_CreateCube("lake_water");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(hw, 0.02f, hw));
+            tr->Translate(XMFLOAT3(c.x, -0.02f, c.y));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->shaderType = wi::scene::MaterialComponent::SHADERTYPE_WATER;
+            mat->SetBaseColor(XMFLOAT4(0.02f, 0.10f, 0.18f, 0.85f));
+            mat->SetEmissiveColor(XMFLOAT4(0.01f, 0.06f, 0.14f, 0.5f));
+            mat->SetRoughness(0.02f);
+            mat->SetReflectance(0.8f);
+            mat->SetNormalMapStrength(1.0f);
+            cellEntities[idx].push_back(e);
+        }
+        // Shore edges where no adjacent lake
+        const int ddx[] = {1,-1,0,0};
+        const int ddz[] = {0,0,1,-1};
+        const float eOX[] = { hw - 0.5f, -(hw - 0.5f), 0.f, 0.f };
+        const float eOZ[] = { 0.f, 0.f, hw - 0.5f, -(hw - 0.5f) };
+        const float eSX[] = { 0.5f, 0.5f, hw, hw };
+        const float eSZ[] = { hw, hw, 0.5f, 0.5f };
+        for (int d = 0; d < 4; ++d) {
+            if (IsLake(gx + ddx[d], gz + ddz[d])) continue;
+            auto e = s.Entity_CreateCube("lake_shore");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(eSX[d], 0.35f, eSZ[d]));
+            tr->Translate(XMFLOAT3(c.x + eOX[d], -0.45f, c.y + eOZ[d]));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.12f, 0.22f, 0.10f, 1.0f));
+            cellEntities[idx].push_back(e);
+        }
+    }
+
+    void BuildPowerPlant(int idx, int gx, int gz, XMFLOAT2 c, wi::scene::Scene& s)
+    {
+        float bw = CELL_SIZE * 0.42f;
+        float bh = CELL_SIZE * 0.45f;
+        // Main factory building (dark gray)
+        {
+            auto e = s.Entity_CreateCube("power_main");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(bw, bh, bw));
+            tr->Translate(XMFLOAT3(c.x, bh, c.y));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.30f, 0.28f, 0.26f, 1.0f));
+            cellEntities[idx].push_back(e);
+        }
+        // Smokestack
+        {
+            float sr = bw * 0.18f;
+            float sh = bh * 1.8f;
+            auto e = s.Entity_CreateCube("power_stack");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(sr, sh, sr));
+            tr->Translate(XMFLOAT3(c.x + bw * 0.5f, sh, c.y + bw * 0.4f));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.45f, 0.42f, 0.40f, 1.0f));
+            cellEntities[idx].push_back(e);
+        }
+        // Yellow warning stripe at base
+        {
+            auto e = s.Entity_CreateCube("power_stripe");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(bw * 1.02f, bh * 0.08f, bw * 1.02f));
+            tr->Translate(XMFLOAT3(c.x, bh * 0.08f, c.y));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.85f, 0.75f, 0.10f, 1.0f));
+            mat->SetEmissiveColor(XMFLOAT4(0.85f, 0.75f, 0.10f, 1.5f));
+            cellEntities[idx].push_back(e);
+        }
+    }
+
+    void BuildWaterPump(int idx, int gx, int gz, XMFLOAT2 c, wi::scene::Scene& s)
+    {
+        float bw = CELL_SIZE * 0.35f;
+        float bh = CELL_SIZE * 0.30f;
+        // Pump station base (light blue-gray)
+        {
+            auto e = s.Entity_CreateCube("wpump_base");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(bw, bh, bw));
+            tr->Translate(XMFLOAT3(c.x, bh, c.y));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.35f, 0.50f, 0.65f, 1.0f));
+            cellEntities[idx].push_back(e);
+        }
+        // Pipe going down (cylinder-ish cube)
+        {
+            float pr = bw * 0.15f;
+            float ph = bh * 0.6f;
+            auto e = s.Entity_CreateCube("wpump_pipe");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(pr, ph, pr));
+            tr->Translate(XMFLOAT3(c.x - bw * 0.4f, ph, c.y));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.20f, 0.35f, 0.55f, 1.0f));
+            cellEntities[idx].push_back(e);
+        }
+        // Blue indicator on top
+        {
+            auto e = s.Entity_CreateCube("wpump_indicator");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(bw * 0.3f, bh * 0.12f, bw * 0.3f));
+            tr->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.12f, c.y));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.10f, 0.40f, 0.90f, 1.0f));
+            mat->SetEmissiveColor(XMFLOAT4(0.10f, 0.40f, 0.90f, 2.0f));
+            cellEntities[idx].push_back(e);
+        }
+    }
+
+    void BuildPolice(int idx, int gx, int gz, XMFLOAT2 c, wi::scene::Scene& s)
+    {
+        float bw = CELL_SIZE * 0.40f;
+        float bh = CELL_SIZE * 0.38f;
+        // Main building (dark blue)
+        {
+            auto e = s.Entity_CreateCube("police_main");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(bw, bh, bw));
+            tr->Translate(XMFLOAT3(c.x, bh, c.y));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.15f, 0.20f, 0.45f, 1.0f));
+            cellEntities[idx].push_back(e);
+        }
+        // Roof stripe (white)
+        {
+            auto e = s.Entity_CreateCube("police_roof");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(bw * 1.04f, bh * 0.08f, bw * 1.04f));
+            tr->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.08f, c.y));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.85f, 0.85f, 0.90f, 1.0f));
+            cellEntities[idx].push_back(e);
+        }
+        // Blue light on top
+        {
+            auto e = s.Entity_CreateCube("police_light");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(bw * 0.12f, bh * 0.10f, bw * 0.12f));
+            tr->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.26f, c.y));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.10f, 0.30f, 0.95f, 1.0f));
+            mat->SetEmissiveColor(XMFLOAT4(0.10f, 0.30f, 0.95f, 3.0f));
+            cellEntities[idx].push_back(e);
+        }
+    }
+
+    void BuildFireStation(int idx, int gx, int gz, XMFLOAT2 c, wi::scene::Scene& s)
+    {
+        float bw = CELL_SIZE * 0.42f;
+        float bh = CELL_SIZE * 0.35f;
+        // Main building (dark red)
+        {
+            auto e = s.Entity_CreateCube("fire_main");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(bw, bh, bw));
+            tr->Translate(XMFLOAT3(c.x, bh, c.y));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.65f, 0.12f, 0.10f, 1.0f));
+            cellEntities[idx].push_back(e);
+        }
+        // Garage door (lighter red stripe at base)
+        {
+            auto e = s.Entity_CreateCube("fire_door");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(bw * 0.6f, bh * 0.55f, 0.15f));
+            tr->Translate(XMFLOAT3(c.x, bh * 0.55f, c.y - bw - 0.16f));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.80f, 0.25f, 0.20f, 1.0f));
+            cellEntities[idx].push_back(e);
+        }
+        // Tower (hose tower)
+        {
+            float tw = bw * 0.20f;
+            float th = bh * 1.8f;
+            auto e = s.Entity_CreateCube("fire_tower");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(tw, th, tw));
+            tr->Translate(XMFLOAT3(c.x + bw * 0.55f, th, c.y + bw * 0.45f));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.55f, 0.10f, 0.08f, 1.0f));
+            cellEntities[idx].push_back(e);
+        }
+        // Red light on top
+        {
+            auto e = s.Entity_CreateCube("fire_light");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(bw * 0.12f, bh * 0.10f, bw * 0.12f));
+            tr->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.18f, c.y));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.95f, 0.15f, 0.10f, 1.0f));
+            mat->SetEmissiveColor(XMFLOAT4(0.95f, 0.15f, 0.10f, 3.0f));
+            cellEntities[idx].push_back(e);
+        }
+    }
+
+    void BuildHospital(int idx, int gx, int gz, XMFLOAT2 c, wi::scene::Scene& s)
+    {
+        float bw = CELL_SIZE * 0.43f;
+        float bh = CELL_SIZE * 0.45f;
+        // Main building (white)
+        {
+            auto e = s.Entity_CreateCube("hospital_main");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(bw, bh, bw));
+            tr->Translate(XMFLOAT3(c.x, bh, c.y));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.90f, 0.90f, 0.92f, 1.0f));
+            cellEntities[idx].push_back(e);
+        }
+        // Red cross – horizontal bar
+        {
+            auto e = s.Entity_CreateCube("hospital_crossH");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(bw * 0.40f, bh * 0.12f, 0.16f));
+            tr->Translate(XMFLOAT3(c.x, bh * 1.35f, c.y - bw - 0.17f));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.90f, 0.10f, 0.10f, 1.0f));
+            mat->SetEmissiveColor(XMFLOAT4(0.90f, 0.10f, 0.10f, 1.5f));
+            cellEntities[idx].push_back(e);
+        }
+        // Red cross – vertical bar
+        {
+            auto e = s.Entity_CreateCube("hospital_crossV");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(bw * 0.12f, bh * 0.35f, 0.16f));
+            tr->Translate(XMFLOAT3(c.x, bh * 1.35f, c.y - bw - 0.17f));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.90f, 0.10f, 0.10f, 1.0f));
+            mat->SetEmissiveColor(XMFLOAT4(0.90f, 0.10f, 0.10f, 1.5f));
+            cellEntities[idx].push_back(e);
+        }
+        // Roof cap
+        {
+            auto e = s.Entity_CreateCube("hospital_roof");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(bw * 1.05f, bh * 0.06f, bw * 1.05f));
+            tr->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.06f, c.y));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.75f, 0.78f, 0.80f, 1.0f));
+            cellEntities[idx].push_back(e);
         }
     }
 };

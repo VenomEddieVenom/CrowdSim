@@ -8,12 +8,12 @@ void TrafficLightSystem::Initialize()
 {
     const int N = GS * GS;
     isIntersection_.assign(N, false);
-    phase_.assign(N, Phase::NS_THROUGH);
-    prevPhase_.assign(N, static_cast<Phase>(0xFF));  // sentinel: force first visual update
+    phase_.assign(N, Phase::N_GREEN);
+    prevPhase_.assign(N, static_cast<Phase>(0xFF));
     timer_.assign(N, 0.0f);
     poleVisuals_.resize(N);
 
-    wi::backlog::post("[TrafficLightSystem] Ready", wi::backlog::LogLevel::Default);
+    wi::backlog::post("[TrafficLightSystem] Ready (4-phase collision-free)", wi::backlog::LogLevel::Default);
 }
 
 // ============================================================
@@ -108,56 +108,48 @@ void TrafficLightSystem::UpdateVisuals()
         mat->SetEmissiveColor(XMFLOAT4(color.x, color.y, color.z, emStr));
     };
 
+    // Pole → ApproachDir mapping: pole 0=S, 1=E, 2=W, 3=N
+    const ApproachDir poleDir[4] = {
+        ApproachDir::S, ApproachDir::E, ApproachDir::W, ApproachDir::N
+    };
+
     for (int key = 0; key < N; ++key)
     {
         if (!isIntersection_[key]) continue;
-        if (phase_[key] == prevPhase_[key]) continue;   // phase unchanged — nothing to redraw
+        if (phase_[key] == prevPhase_[key]) continue;
         prevPhase_[key] = phase_[key];
         auto& poles = poleVisuals_[key];
         if (poles.empty()) continue;
 
         Phase ph = phase_[key];
+        int phIdx = static_cast<int>(ph);
+        bool isYellow = (phIdx & 1) != 0;
+        int greenIdx = isYellow ? (phIdx - 1) : phIdx;
+        ApproachDir dominant  = static_cast<ApproachDir>(greenIdx / 2);
+        ApproachDir companion = static_cast<ApproachDir>((static_cast<int>(dominant) + 3) % 4);
 
         for (int p = 0; p < (int)poles.size(); ++p)
         {
             if (poles[p].pole == wi::ecs::INVALID_ENTITY) continue;
 
-            bool isNS = (p == 0 || p == 3);
+            ApproachDir ad = poleDir[p];
             XMFLOAT4 leftC = RED, straightC = RED, rightC = RED;
 
-            switch (ph)
-            {
-            case Phase::NS_THROUGH:
-                if (isNS) { straightC = GREEN; rightC = GREEN; }
-                else      { rightC = GREEN; }
-                break;
-            case Phase::NS_YELLOW:
-                if (isNS) { straightC = YELLOW; rightC = YELLOW; }
-                break;
-            case Phase::NS_LEFT:
-                if (isNS) { leftC = GREEN; }
-                break;
-            case Phase::ALL_RED_1:
-            case Phase::ALL_RED_2:
-                break;
-            case Phase::EW_THROUGH:
-                if (!isNS) { straightC = GREEN; rightC = GREEN; }
-                else       { rightC = GREEN; }
-                break;
-            case Phase::EW_YELLOW:
-                if (!isNS) { straightC = YELLOW; rightC = YELLOW; }
-                break;
-            case Phase::EW_LEFT:
-                if (!isNS) { leftC = GREEN; }
-                break;
+            if (ad == dominant) {
+                // All turns green/yellow
+                XMFLOAT4 c = isYellow ? YELLOW : GREEN;
+                leftC = c; straightC = c; rightC = c;
+            } else if (ad == companion) {
+                // Right turn only
+                XMFLOAT4 c = isYellow ? YELLOW : GREEN;
+                rightC = c;
             }
+            // else: all RED (default)
 
-            // Update light colors
             if (poles[p].hasLeft)     setLight(poles[p].lightLeft, leftC);
             if (poles[p].hasStraight) setLight(poles[p].lightStraight, straightC);
             if (poles[p].hasRight)    setLight(poles[p].lightRight, rightC);
 
-            // Update arrow indicator colors (bright when green/yellow, dim when red)
             auto arrowCol = [&](const XMFLOAT4& lc) -> XMFLOAT4 {
                 return (lc.y > 0.5f || lc.x > 0.5f) ? XMFLOAT4(1.f, 1.f, 1.f, 1.f) : DIM;
             };
@@ -185,19 +177,19 @@ void TrafficLightSystem::CreatePolesForIntersection(int gx, int gz,
     XMFLOAT2 center = city.GridCellCenter(gx, gz);
     float h = CS * 0.5f;
 
-    // Near-side signal placement: poles right behind the crosswalk zebra,
-    // on the right side of the road for approaching traffic.
+    // Near-side signal placement: poles on the LEFT side of the road,
+    // arm extends RIGHT over the road so lights hang on driver's right.
     // Order seen by driver: traffic light → crosswalk → intersection.
-    const float pOff  = h - 1.5f;   // 8.5  perpendicular (right side of road)
-    const float cwOff = h + 3.0f;   // 13.0 along approach  (2 tiles closer to crossroad)
-    const float offX[4] = {  pOff,  cwOff, -cwOff, -pOff };
-    const float offZ[4] = { cwOff, -pOff,   pOff, -cwOff };
+    const float pOff  = h - 1.5f;   // 8.5  perpendicular offset
+    const float cwOff = h + 3.0f;   // 13.0 along approach
+    const float offX[4] = { -pOff,  cwOff, -cwOff,  pOff };
+    const float offZ[4] = { cwOff,  pOff,  -pOff, -cwOff };
 
-    // Mast arm directions: from pole toward road center
-    // Pole 0 (NE): arm → -X   Pole 1 (NW): arm → +Z
-    // Pole 2 (SE): arm → -Z   Pole 3 (SW): arm → +X
-    const float armDX[4] = { -1.f,  0.f,  0.f,  1.f };
-    const float armDZ[4] = {  0.f,  1.f, -1.f,  0.f };
+    // Mast arm directions: from pole toward driver's RIGHT (across road)
+    // Pole 0 (NW): arm → +X   Pole 1 (SE): arm → -Z
+    // Pole 2 (NE): arm → +Z   Pole 3 (SW): arm → -X
+    const float armDX[4] = {  1.f,  0.f,  0.f, -1.f };
+    const float armDZ[4] = {  0.f, -1.f,  1.f,  0.f };
     const float armLen = 5.5f;
     const float poleH  = 7.0f;
 
@@ -207,10 +199,10 @@ void TrafficLightSystem::CreatePolesForIntersection(int gx, int gz,
     const int lDX[4] = { -1,  0,  0,  1 }, lDZ[4] = {  0,  1, -1,  0 };
     const int rDX[4] = {  1,  0,  0, -1 }, rDZ[4] = {  0, -1,  1,  0 };
 
-    // Light arrangement: along the arm direction
-    //   Left light = further along arm (driver's left)
+    // Light arrangement: arm extends toward driver's right
+    //   Right light = further along arm (driver's right)
     //   Straight = center
-    //   Right light = closer to pole (driver's right)
+    //   Left light = closer to pole (driver's left)
     const float spacing = 0.80f;
 
     for (int p = 0; p < 4; ++p)
@@ -264,7 +256,7 @@ void TrafficLightSystem::CreatePolesForIntersection(int gx, int gz,
         float lightY = poleH - 0.55f;
         float arrowY = lightY - 0.45f;
 
-        // Offset directions for left/right lights (along arm direction)
+        // Offset directions for left/right lights relative to driver
         float leftOX  =  armDX[p] * spacing, leftOZ  =  armDZ[p] * spacing;
         float rightOX = -armDX[p] * spacing, rightOZ = -armDZ[p] * spacing;
 

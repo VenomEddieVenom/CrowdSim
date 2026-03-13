@@ -5,21 +5,17 @@
 #include <cmath>
 
 // ============================================================
-//  TrafficLightSystem  –  8-phase protected-left-turn lights
+//  TrafficLightSystem  –  Collision-free 4×(green+yellow) phases
 //
-//  Auto-detects intersections (road cells with 3+ road neighbors).
-//  8-phase cycle (32 s total):
-//    Phase 0 – NS through  (NS straight+right GREEN)                  8 s
-//    Phase 1 – NS yellow                                               2 s
-//    Phase 2 – NS left     (NS left GREEN only)                        4 s
-//    Phase 3 – ALL RED clearance                                       2 s
-//    Phase 4 – EW through  (EW straight+right GREEN)                   8 s
-//    Phase 5 – EW yellow                                               2 s
-//    Phase 6 – EW left     (EW left GREEN only)                        4 s
-//    Phase 7 – ALL RED clearance                                       2 s
-//
-//  Cars pass TurnIntent (STRAIGHT/RIGHT/LEFT) so the system
-//  can grant or deny passage based on conflict analysis.
+//  Phase 0 (N_GREEN):  N all turns,  W right-only          8 s
+//  Phase 1 (N_YELLOW): yellow for above                    2 s
+//  Phase 2 (E_GREEN):  E all turns,  N right-only          8 s
+//  Phase 3 (E_YELLOW): yellow for above                    2 s
+//  Phase 4 (S_GREEN):  S all turns,  E right-only          8 s
+//  Phase 5 (S_YELLOW): yellow for above                    2 s
+//  Phase 6 (W_GREEN):  W all turns,  S right-only          8 s
+//  Phase 7 (W_YELLOW): yellow for above                    2 s
+//  Total cycle: 40 s
 // ============================================================
 class TrafficLightSystem
 {
@@ -28,26 +24,26 @@ public:
     static constexpr float CS = CityLayout::CELL_SIZE;
 
     // Phase durations (seconds)
-    static constexpr float THROUGH_DUR  = 8.0f;
-    static constexpr float YELLOW_DUR   = 2.0f;
-    static constexpr float LEFT_DUR     = 4.0f;
-    static constexpr float ALL_RED_DUR  = 3.0f;
-    static constexpr float CYCLE_DUR    = (THROUGH_DUR + YELLOW_DUR + LEFT_DUR + ALL_RED_DUR) * 2.0f; // 34 s
-    static constexpr int   NUM_PHASES   = 8;
+    static constexpr float GREEN_DUR   = 8.0f;
+    static constexpr float YELLOW_DUR  = 2.0f;
+    static constexpr float CYCLE_DUR   = (GREEN_DUR + YELLOW_DUR) * 4.0f; // 40 s
+    static constexpr int   NUM_PHASES  = 8;
 
-    // Phase identifiers
     enum class Phase : uint8_t {
-        NS_THROUGH  = 0,
-        NS_YELLOW   = 1,
-        NS_LEFT     = 2,
-        ALL_RED_1   = 3,
-        EW_THROUGH  = 4,
-        EW_YELLOW   = 5,
-        EW_LEFT     = 6,
-        ALL_RED_2   = 7
+        N_GREEN  = 0,   // N dominant + W right-turn
+        N_YELLOW = 1,
+        E_GREEN  = 2,   // E dominant + N right-turn
+        E_YELLOW = 3,
+        S_GREEN  = 4,   // S dominant + E right-turn
+        S_YELLOW = 5,
+        W_GREEN  = 6,   // W dominant + S right-turn
+        W_YELLOW = 7
     };
 
-    // Traffic direction (axis of travel)
+    // Approach direction as seen by the car
+    enum class ApproachDir : uint8_t { N, E, S, W };
+
+    // Traffic direction (axis of travel) – kept for pedestrian API
     enum class Axis : uint8_t { NS, EW };
 
     // Car's intended movement at the intersection
@@ -67,8 +63,16 @@ public:
         return isIntersection_[gz * GS + gx];
     }
 
-    // Query light color for a car with given approach direction and turn intent.
-    // dx,dz = normalised segment direction (approach heading).
+    // Derive approach direction from movement vector.
+    // A car moving in +Z is approaching from the NORTH (heading south).
+    static ApproachDir GetApproachDir(float dx, float dz)
+    {
+        if (std::abs(dz) >= std::abs(dx))
+            return (dz > 0.f) ? ApproachDir::N : ApproachDir::S;
+        else
+            return (dx > 0.f) ? ApproachDir::W : ApproachDir::E;
+    }
+
     LightColor GetLight(int gx, int gz, float dx, float dz,
                         TurnIntent intent = TurnIntent::STRAIGHT) const
     {
@@ -76,48 +80,70 @@ public:
         int key = gz * GS + gx;
         if (!isIntersection_[key]) return LightColor::GREEN;
 
-        Axis carAxis = (std::abs(dz) > std::abs(dx)) ? Axis::NS : Axis::EW;
+        ApproachDir ad = GetApproachDir(dx, dz);
         Phase ph = phase_[key];
 
-        switch (ph)
-        {
-        case Phase::NS_THROUGH:
-            if (carAxis == Axis::NS)
-                return (intent == TurnIntent::LEFT) ? LightColor::RED : LightColor::GREEN;
-            return LightColor::RED;
+        // Dominant direction per green phase: N,E,S,W
+        // Companion right-turn: W,N,E,S (turns into dominant's road)
+        // Green phases are 0,2,4,6; yellow phases are 1,3,5,7.
+        int phIdx = static_cast<int>(ph);
+        bool isYellow = (phIdx & 1) != 0;
+        int greenIdx = isYellow ? (phIdx - 1) : phIdx;
 
-        case Phase::NS_YELLOW:
-            if (carAxis == Axis::NS && intent != TurnIntent::LEFT)
-                return LightColor::YELLOW;
-            return LightColor::RED;
+        // Map greenIdx → dominant approach dir
+        // 0→N, 2→E, 4→S, 6→W
+        ApproachDir dominant   = static_cast<ApproachDir>(greenIdx / 2);
+        // Companion = prev CW direction: N→W, E→N, S→E, W→S
+        ApproachDir companion  = static_cast<ApproachDir>((static_cast<int>(dominant) + 3) % 4);
 
-        case Phase::NS_LEFT:
-            if (carAxis == Axis::NS && intent == TurnIntent::LEFT)
-                return LightColor::GREEN;
-            return LightColor::RED;
-
-        case Phase::ALL_RED_1:
-            return LightColor::RED;
-
-        case Phase::EW_THROUGH:
-            if (carAxis == Axis::EW)
-                return (intent == TurnIntent::LEFT) ? LightColor::RED : LightColor::GREEN;
-            return LightColor::RED;
-
-        case Phase::EW_YELLOW:
-            if (carAxis == Axis::EW && intent != TurnIntent::LEFT)
-                return LightColor::YELLOW;
-            return LightColor::RED;
-
-        case Phase::EW_LEFT:
-            if (carAxis == Axis::EW && intent == TurnIntent::LEFT)
-                return LightColor::GREEN;
-            return LightColor::RED;
-
-        case Phase::ALL_RED_2:
-            return LightColor::RED;
+        if (ad == dominant) {
+            // Dominant direction: all turns allowed
+            return isYellow ? LightColor::YELLOW : LightColor::GREEN;
+        }
+        if (ad == companion && intent == TurnIntent::RIGHT) {
+            // Companion: right turn only
+            return isYellow ? LightColor::YELLOW : LightColor::GREEN;
         }
         return LightColor::RED;
+    }
+
+    // ---- Inspection helpers ----
+    Phase GetPhase(int gx, int gz) const
+    {
+        if (gx < 0 || gx >= GS || gz < 0 || gz >= GS) return Phase::N_GREEN;
+        return phase_[gz * GS + gx];
+    }
+    float GetPhaseTimer(int gx, int gz) const
+    {
+        if (gx < 0 || gx >= GS || gz < 0 || gz >= GS) return 0.f;
+        return timer_[gz * GS + gx];
+    }
+    float GetPhaseTotalDuration(int gx, int gz) const
+    {
+        return PhaseDuration(GetPhase(gx, gz));
+    }
+    static const char* PhaseName(Phase p)
+    {
+        switch (p) {
+        case Phase::N_GREEN:  return "N Green (+W right)";
+        case Phase::N_YELLOW: return "N Yellow";
+        case Phase::E_GREEN:  return "E Green (+N right)";
+        case Phase::E_YELLOW: return "E Yellow";
+        case Phase::S_GREEN:  return "S Green (+E right)";
+        case Phase::S_YELLOW: return "S Yellow";
+        case Phase::W_GREEN:  return "W Green (+S right)";
+        case Phase::W_YELLOW: return "W Yellow";
+        }
+        return "?";
+    }
+    static const char* LightStr(LightColor lc)
+    {
+        switch (lc) {
+        case LightColor::GREEN:  return "GREEN";
+        case LightColor::YELLOW: return "YELLOW";
+        case LightColor::RED:    return "RED";
+        }
+        return "?";
     }
 
     bool CanPedestrianCross(int gx, int gz, Axis crossAxis) const
@@ -127,12 +153,19 @@ public:
         if (!isIntersection_[key]) return true;
 
         Phase ph = phase_[key];
-        if (crossAxis == Axis::NS)
-            return (ph == Phase::EW_THROUGH || ph == Phase::EW_YELLOW ||
-                    ph == Phase::EW_LEFT    || ph == Phase::ALL_RED_1 || ph == Phase::ALL_RED_2);
-        else
-            return (ph == Phase::NS_THROUGH || ph == Phase::NS_YELLOW ||
-                    ph == Phase::NS_LEFT    || ph == Phase::ALL_RED_1 || ph == Phase::ALL_RED_2);
+        int phIdx = static_cast<int>(ph);
+        int greenIdx = (phIdx & 1) ? (phIdx - 1) : phIdx;
+        ApproachDir dominant = static_cast<ApproachDir>(greenIdx / 2);
+
+        // Pedestrians crossing NS can walk when no NS traffic is dominant
+        // Pedestrians crossing EW can walk when no EW traffic is dominant
+        if (crossAxis == Axis::NS) {
+            // Safe when dominant is E or W (no NS traffic)
+            return (dominant == ApproachDir::E || dominant == ApproachDir::W);
+        } else {
+            // Safe when dominant is N or S (no EW traffic)
+            return (dominant == ApproachDir::N || dominant == ApproachDir::S);
+        }
     }
 
 private:
@@ -163,17 +196,7 @@ private:
     }
     static float PhaseDuration(Phase p)
     {
-        switch (p)
-        {
-        case Phase::NS_THROUGH: return THROUGH_DUR;
-        case Phase::NS_YELLOW:  return YELLOW_DUR;
-        case Phase::NS_LEFT:    return LEFT_DUR;
-        case Phase::ALL_RED_1:  return ALL_RED_DUR;
-        case Phase::EW_THROUGH: return THROUGH_DUR;
-        case Phase::EW_YELLOW:  return YELLOW_DUR;
-        case Phase::EW_LEFT:    return LEFT_DUR;
-        case Phase::ALL_RED_2:  return ALL_RED_DUR;
-        }
-        return THROUGH_DUR;
+        int phIdx = static_cast<int>(p);
+        return (phIdx & 1) ? YELLOW_DUR : GREEN_DUR;
     }
 };
