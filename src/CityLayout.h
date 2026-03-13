@@ -134,9 +134,12 @@ public:
             }
             // Merge meshes + materials (and everything else) into main scene
             scene.Merge(domPrefab_);
-            // Remove the prototype instances (object/transform entities) – shared meshes stay
+            // Remove only the ObjectComponent from prototype placement entities so they
+            // don't render at the origin. MeshComponent must stay – it is the shared mesh
+            // that all house instances reference via meshID. Entity_Remove would also kill
+            // the MeshComponent when mesh and object live on the same entity.
             for (auto e : protoEnts)
-                scene.Entity_Remove(e);
+                scene.objects.Remove(e);
             wi::backlog::post("[CityLayout] dom.wiscene merged – GPU instancing enabled",
                               wi::backlog::LogLevel::Default);
         } else {
