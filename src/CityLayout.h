@@ -32,7 +32,7 @@ public:
     static constexpr int   SW_DIM      = GRID_SIZE * SW_SUB;          // 400
     bool sidewalkLayer[SW_DIM * SW_DIM] = {};
 
-    enum class CellType : uint8_t { EMPTY = 0, ROAD, HOUSE, WORKPLACE, CROSSWALK, PARKING, LAKE, POWER_PLANT, WATER_PUMP, POLICE, FIRE_STATION, HOSPITAL };
+    enum class CellType : uint8_t { EMPTY = 0, ROAD, HOUSE, WORKPLACE, CROSSWALK, PARKING, LAKE, POWER_PLANT, WATER_PUMP, POLICE, FIRE_STATION, HOSPITAL, BUS_DEPOT, BUS_STOP };
 
     // Flat arrays indexed [gz * GRID_SIZE + gx]
     CellType                     cellType   [GRID_SIZE * GRID_SIZE] = {};
@@ -331,7 +331,7 @@ public:
         ClearCell(gx, gz);
         cellType[idx] = type;
         if (type == CellType::ROAD || type == CellType::CROSSWALK)
-            if (roadLanes_[idx] == 0) roadLanes_[idx] = 4;  // default 4-lane
+            if (roadLanes_[idx] == 0) roadLanes_[idx] = 6;  // default 6-lane (triple)
         auto c  = GridCellCenter(gx, gz);
         auto& s = wi::scene::GetScene();
         switch (type)
@@ -347,6 +347,8 @@ public:
         case CellType::POLICE:       BuildPolice(idx, gx, gz, c, s);     break;
         case CellType::FIRE_STATION: BuildFireStation(idx, gx, gz, c, s); break;
         case CellType::HOSPITAL:     BuildHospital(idx, gx, gz, c, s);  break;
+        case CellType::BUS_DEPOT:    BuildBusDepot(idx, gx, gz, c, s);  break;
+        case CellType::BUS_STOP:     BuildBusStop(idx, gx, gz, c, s);   break;
         default: break;
         }
         // Rebuild neighboring roads so they update their sidewalk open-sides
@@ -528,8 +530,10 @@ public:
         if (!InBounds(srcRX, srcRZ) || !InBounds(dstRX, dstRZ)) return {};
         auto srcCT = cellType[srcRZ * GRID_SIZE + srcRX];
         auto dstCT = cellType[dstRZ * GRID_SIZE + dstRX];
-        if (srcCT != CellType::ROAD && srcCT != CellType::CROSSWALK) return {};
-        if (dstCT != CellType::ROAD && dstCT != CellType::CROSSWALK) return {};
+        auto isEndpoint = [](CellType ct) {
+            return ct == CellType::ROAD || ct == CellType::CROSSWALK || ct == CellType::BUS_DEPOT;
+        };
+        if (!isEndpoint(srcCT) || !isEndpoint(dstCT)) return {};
 
         int srcId = srcRZ * GRID_SIZE + srcRX;
         int dstId = dstRZ * GRID_SIZE + dstRX;
@@ -558,7 +562,8 @@ public:
                 int nx = cx + ddx[d], nz = cz + ddz[d];
                 if (!InBounds(nx, nz)) continue;
                 int nid = nz * GRID_SIZE + nx;
-                if (cellType[nid] != CellType::ROAD && cellType[nid] != CellType::CROSSWALK) continue;
+                if (cellType[nid] != CellType::ROAD && cellType[nid] != CellType::CROSSWALK
+                    && nid != srcId && nid != dstId) continue;
                 float edgeCost = 1.0f + 0.5f * (float)trafficCount_[nid];
                 float newCost = curCost + edgeCost;
                 if (newCost < cost[nid])
@@ -586,6 +591,7 @@ private:
         return gx >= 0 && gx < GRID_SIZE && gz >= 0 && gz < GRID_SIZE;
     }
 
+public:
     // Rebuild an existing road cell's connectivity display — NO entity removal.
     // Just moves each of the 4 pre-allocated sidewalk entities above or below ground.
     void RebuildRoadCell(int gx, int gz)
@@ -656,6 +662,7 @@ private:
         }
     }
 
+private:
     void BuildRoad(int idx, int gx, int gz, XMFLOAT2 c, wi::scene::Scene& s)
     {
         const float h   = CELL_SIZE * 0.5f;
@@ -1256,6 +1263,7 @@ public:
             case CellType::POLICE:
             case CellType::FIRE_STATION:
             case CellType::HOSPITAL:
+            case CellType::BUS_DEPOT:
                 powerDemand += POWER_PER_SERVICE;
                 waterDemand += WATER_PER_SERVICE;
                 break;
@@ -1543,7 +1551,7 @@ private:
             mat->SetBaseColor(XMFLOAT4(0.02f, 0.05f, 0.04f, 1.0f));
             cellEntities[idx].push_back(e);
         }
-        // Water surface using engine's WATER shader (reflections + Fresnel)
+        // Water surface – translucent PBR (no planar reflections, cheap)
         {
             auto e = s.Entity_CreateCube("lake_water");
             auto* tr = s.transforms.GetComponent(e);
@@ -1551,12 +1559,13 @@ private:
             tr->Translate(XMFLOAT3(c.x, -0.02f, c.y));
             tr->UpdateTransform();
             auto* mat = s.materials.GetComponent(e);
-            mat->shaderType = wi::scene::MaterialComponent::SHADERTYPE_WATER;
-            mat->SetBaseColor(XMFLOAT4(0.02f, 0.10f, 0.18f, 0.85f));
-            mat->SetEmissiveColor(XMFLOAT4(0.01f, 0.06f, 0.14f, 0.5f));
-            mat->SetRoughness(0.02f);
-            mat->SetReflectance(0.8f);
-            mat->SetNormalMapStrength(1.0f);
+            mat->shaderType = wi::scene::MaterialComponent::SHADERTYPE_PBR;
+            mat->SetBaseColor(XMFLOAT4(0.01f, 0.08f, 0.18f, 0.70f));
+            mat->SetEmissiveColor(XMFLOAT4(0.005f, 0.04f, 0.12f, 0.35f));
+            mat->SetRoughness(0.15f);
+            mat->SetReflectance(0.6f);
+            mat->SetMetalness(0.3f);
+            mat->userBlendMode = wi::enums::BLENDMODE_ALPHA;
             cellEntities[idx].push_back(e);
         }
         // Shore edges where no adjacent lake
@@ -1804,6 +1813,77 @@ private:
             tr->UpdateTransform();
             auto* mat = s.materials.GetComponent(e);
             mat->SetBaseColor(XMFLOAT4(0.75f, 0.78f, 0.80f, 1.0f));
+            cellEntities[idx].push_back(e);
+        }
+    }
+
+    void BuildBusDepot(int idx, int gx, int gz, XMFLOAT2 c, wi::scene::Scene& s)
+    {
+        float bw = CELL_SIZE * 0.44f;
+        float bh = CELL_SIZE * 0.30f;
+        // Main building (dark yellow / industrial)
+        {
+            auto e = s.Entity_CreateCube("busdepot_main");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(bw, bh, bw));
+            tr->Translate(XMFLOAT3(c.x, bh, c.y));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.75f, 0.60f, 0.15f, 1.0f));
+            cellEntities[idx].push_back(e);
+        }
+        // Flat roof overhang
+        {
+            auto e = s.Entity_CreateCube("busdepot_roof");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(bw * 1.10f, bh * 0.06f, bw * 1.10f));
+            tr->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.06f, c.y));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.55f, 0.45f, 0.10f, 1.0f));
+            cellEntities[idx].push_back(e);
+        }
+        // Bus icon on front (yellow stripe)
+        {
+            auto e = s.Entity_CreateCube("busdepot_icon");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(bw * 0.50f, bh * 0.25f, 0.15f));
+            tr->Translate(XMFLOAT3(c.x, bh * 1.2f, c.y - bw - 0.16f));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.95f, 0.80f, 0.10f, 1.0f));
+            mat->SetEmissiveColor(XMFLOAT4(0.95f, 0.80f, 0.05f, 2.0f));
+            cellEntities[idx].push_back(e);
+        }
+    }
+
+    void BuildBusStop(int idx, int gx, int gz, XMFLOAT2 c, wi::scene::Scene& s)
+    {
+        // Bus stop is placed on road cells — build a small shelter sign
+        // First build the road surface underneath
+        BuildRoad(idx, gx, gz, c, s);
+        // Add a small pole + sign at the sidewalk edge
+        float poleH = 3.5f;
+        {
+            auto e = s.Entity_CreateCube("busstop_pole");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(0.08f, poleH * 0.5f, 0.08f));
+            tr->Translate(XMFLOAT3(c.x + 8.5f, poleH * 0.5f, c.y));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.40f, 0.40f, 0.45f, 1.0f));
+            cellEntities[idx].push_back(e);
+        }
+        // Sign board
+        {
+            auto e = s.Entity_CreateCube("busstop_sign");
+            auto* tr = s.transforms.GetComponent(e);
+            tr->Scale(XMFLOAT3(0.40f, 0.30f, 0.05f));
+            tr->Translate(XMFLOAT3(c.x + 8.5f, poleH, c.y));
+            tr->UpdateTransform();
+            auto* mat = s.materials.GetComponent(e);
+            mat->SetBaseColor(XMFLOAT4(0.10f, 0.60f, 0.90f, 1.0f));
+            mat->SetEmissiveColor(XMFLOAT4(0.10f, 0.60f, 0.90f, 1.5f));
             cellEntities[idx].push_back(e);
         }
     }

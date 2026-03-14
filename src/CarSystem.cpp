@@ -34,6 +34,11 @@ void CarSystem::Initialize()
     carColor_.resize(MAX_CARS, {0.82f, 0.82f, 0.82f, 1.f});
     halfLen_.resize(MAX_CARS, CAR_HL);
     isBus_.resize(MAX_CARS, false);
+    busRouteIdx_.resize(MAX_CARS, -1);
+    busDirection_.resize(MAX_CARS, 0);
+    busNextStop_.resize(MAX_CARS, -1);
+    busStopTimer_.resize(MAX_CARS, 0.f);
+    busPassengers_.resize(MAX_CARS, 0);
     wage_.resize(MAX_CARS, 0.f);
     money_.resize(MAX_CARS, 0.f);
 
@@ -41,6 +46,7 @@ void CarSystem::Initialize()
     wpCount_.resize(MAX_CARS, 0);
     wpCurr_.resize(MAX_CARS, 0);
     carDir_.resize(MAX_CARS, 0);
+    wandering_.resize(MAX_CARS, false);
     laneOff_.resize(MAX_CARS, 4.5f);
     laneTarget_.resize(MAX_CARS, 4.5f);
     laneIdx_.resize(MAX_CARS, 0);
@@ -69,7 +75,7 @@ void CarSystem::Initialize()
 // ============================================================
 //  SpawnCar
 // ============================================================
-uint32_t CarSystem::SpawnCar(const std::vector<XMFLOAT2>& roadPath, uint32_t colorSeed)
+uint32_t CarSystem::SpawnCar(const std::vector<XMFLOAT2>& roadPath, uint32_t colorSeed, int spawnLanes)
 {
     if (activeCount >= MAX_CARS)    return UINT32_MAX;
     if (roadPath.size() < 2)        return UINT32_MAX;
@@ -96,19 +102,20 @@ uint32_t CarSystem::SpawnCar(const std::vector<XMFLOAT2>& roadPath, uint32_t col
     wpCurr_[i]  = 1;
     carDir_[i]  = 0;
 
-    // Assign lane: 50/50 inner/outer for balanced distribution
+    // Assign lane: distribute evenly across all lanes
     {
         float lo[3]; int lc;
-        GetLaneOffsets(4, lo, lc); // default to 4-lane; will snap later
-        laneIdx_[i] = (int8_t)((colorSeed % 2 == 0) ? 0 : lc - 1);
-        laneOff_[i] = lo[std::min((int)laneIdx_[i], lc - 1)];
+        GetLaneOffsets(spawnLanes, lo, lc);
+        laneIdx_[i] = (int8_t)(colorSeed % lc);
+        laneOff_[i] = lo[laneIdx_[i]];
         laneTarget_[i] = laneOff_[i];
     }
 
-    // Spawn parked at home waypoint (will find parking building when departing)
+    // Spawn at lane-offset position (not centreline) so cars start centered
     XMFLOAT2 d0 = DirTo(wp[0], wp[1]);
-    posX_[i]    = wp[0].x;
-    posZ_[i]    = wp[0].y;
+    float spawnRX = d0.y, spawnRZ = -d0.x; // right of travel
+    posX_[i]    = wp[0].x + spawnRX * laneOff_[i];
+    posZ_[i]    = wp[0].y + spawnRZ * laneOff_[i];
     speed_[i]   = 0.f;
     heading_[i] = std::atan2(d0.x, d0.y);
 
@@ -218,15 +225,16 @@ uint32_t CarSystem::SpawnBus(const std::vector<XMFLOAT2>& roadPath, uint32_t see
     // Buses always use the outermost lane
     {
         float lo[3]; int lc;
-        GetLaneOffsets(4, lo, lc);
+        GetLaneOffsets(6, lo, lc);
         laneIdx_[i] = (int8_t)(lc - 1);
         laneOff_[i] = lo[lc - 1];
         laneTarget_[i] = laneOff_[i];
     }
 
     XMFLOAT2 d0 = DirTo(wp[0], wp[1]);
-    posX_[i]    = wp[0].x;
-    posZ_[i]    = wp[0].y;
+    float busRX = d0.y, busRZ = -d0.x;
+    posX_[i]    = wp[0].x + busRX * laneOff_[i];
+    posZ_[i]    = wp[0].y + busRZ * laneOff_[i];
     speed_[i]   = 0.f;
     heading_[i] = std::atan2(d0.x, d0.y);
 
@@ -249,6 +257,128 @@ uint32_t CarSystem::SpawnBus(const std::vector<XMFLOAT2>& roadPath, uint32_t see
     lastDayTrip_[i] = UINT32_MAX; // never triggers schedule logic
 
     return i;
+}
+
+// ============================================================
+//  SpawnRouteBus – spawn a bus that follows a specific route
+// ============================================================
+uint32_t CarSystem::SpawnRouteBus(int routeIdx, CityLayout& city, int direction)
+{
+    if (routeIdx < 0 || routeIdx >= (int)busRoutes_.size()) return UINT32_MAX;
+    auto& route = busRoutes_[routeIdx];
+    if (!route.active) return UINT32_MAX;
+
+    const auto& path = (direction == 0) ? route.fullPathAB : route.fullPathBA;
+    if (path.size() < 2) return UINT32_MAX;
+
+    // Use existing SpawnBus to handle the actual spawning
+    uint32_t i = SpawnBus(path, (uint32_t)(routeIdx * 1337 + direction * 7919));
+    if (i == UINT32_MAX) return UINT32_MAX;
+
+    // Tag with route info
+    busRouteIdx_[i] = (int8_t)routeIdx;
+    busDirection_[i] = (int8_t)direction;
+    busNextStop_[i] = 0;
+    busStopTimer_[i] = 0.f;
+    busPassengers_[i] = 0;
+
+    return i;
+}
+
+// ============================================================
+//  UpdateBusRoutes – spawn buses for active routes, handle stops
+// ============================================================
+void CarSystem::UpdateBusRoutes(float dt, CityLayout& city)
+{
+    // For each active route, ensure at least one bus exists in each direction
+    for (int ri = 0; ri < (int)busRoutes_.size(); ++ri)
+    {
+        auto& route = busRoutes_[ri];
+        if (!route.active) continue;
+
+        // Count buses on this route per direction
+        int countAB = 0, countBA = 0;
+        for (uint32_t j = 0; j < activeCount; ++j)
+        {
+            if (!isBus_[j]) continue;
+            if (busRouteIdx_[j] != ri) continue;
+            if (busDirection_[j] == 0) ++countAB;
+            else ++countBA;
+        }
+
+        // Spawn if needed (1 bus per direction per route)
+        if (countAB == 0) SpawnRouteBus(ri, city, 0);
+        if (countBA == 0) SpawnRouteBus(ri, city, 1);
+    }
+
+    // Handle bus stop detection and timers (position-based)
+    for (uint32_t i = 0; i < activeCount; ++i)
+    {
+        if (!isBus_[i] || busRouteIdx_[i] < 0) continue;
+        if (state_[i] != State::DRIVING) continue;
+
+        int ri = busRouteIdx_[i];
+        if (ri >= (int)busRoutes_.size()) continue;
+        auto& route = busRoutes_[ri];
+
+        int dir = busDirection_[i];
+        int nextStop = busNextStop_[i];
+
+        // Stop timer active — bus is paused at a stop
+        if (busStopTimer_[i] > 0.f)
+        {
+            busStopTimer_[i] -= dt;
+            speed_[i] = 0.f; // hold still
+            if (busStopTimer_[i] <= 0.f)
+            {
+                busStopTimer_[i] = 0.f;
+                busNextStop_[i]++;
+            }
+            continue;
+        }
+
+        // Determine which stop list and index to use for current direction
+        const auto& stopList = (dir == 0) ? route.stops :
+            (route.circular && !route.stopsBA.empty()) ? route.stopsBA : route.stops;
+        int totalStops = (int)stopList.size();
+
+        // For non-circular B→A, reverse the index
+        int stopListIdx;
+        if (dir == 0) {
+            stopListIdx = nextStop;
+        } else if (route.circular && !route.stopsBA.empty()) {
+            stopListIdx = nextStop;
+        } else {
+            stopListIdx = totalStops - 1 - nextStop;
+        }
+
+        if (nextStop >= 0 && nextStop < totalStops && stopListIdx >= 0 && stopListIdx < totalStops)
+        {
+            XMFLOAT2 stopPos = city.GridCellCenter(stopList[stopListIdx].gx, stopList[stopListIdx].gz);
+            float dx = posX_[i] - stopPos.x;
+            float dz = posZ_[i] - stopPos.y;
+            float dist2 = dx*dx + dz*dz;
+
+            if (dist2 < 12.0f * 12.0f)
+            {
+                // Arrived at stop — pause for 5 seconds
+                busStopTimer_[i] = 5.0f;
+                speed_[i] = 0.f;
+                // Passengers board/exit (simple: random 0-3 board, 0-2 exit)
+                uint8_t boarding = (uint8_t)(rand() % 4);
+                uint8_t exiting = std::min(busPassengers_[i], (uint8_t)(rand() % 3));
+                busPassengers_[i] = (uint8_t)std::min(40, (int)busPassengers_[i] + boarding - exiting);
+            }
+            else if (dist2 < 40.0f * 40.0f)
+            {
+                // Decelerate when approaching stop
+                float dist = std::sqrt(dist2);
+                float approach = dist / 40.0f;
+                float maxSpd = MAX_SPEED * approach;
+                if (speed_[i] > maxSpd) speed_[i] = maxSpd;
+            }
+        }
+    }
 }
 
 // ============================================================
@@ -320,9 +450,9 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
             }
 
             // Check if it's time to depart based on schedule
-            bool shouldDepart = false;
+            bool shouldDepart = wandering_[i]; // wandering cars depart immediately
 
-            if (carDir_[i] == 0)
+            if (!shouldDepart && carDir_[i] == 0)
             {
                 float dep = schedDepart_[i];
                 float diff = currentHour - dep;
@@ -340,10 +470,13 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
                     float jRand = (float)(jHash & 0xFFFF) / 65535.f;
                     float hourFrac = dt / (dayDuration / 24.0f);
                     if (jRand < JOYRIDE_CHANCE * hourFrac)
+                    {
                         shouldDepart = true;
+                        wandering_[i] = true;  // mark as wandering trip
+                    }
                 }
             }
-            else
+            else if (!shouldDepart && carDir_[i] == 1)
             {
                 float ret = schedReturn_[i];
                 float diff = currentHour - ret;
@@ -418,38 +551,74 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
             XMFLOAT2* wp = &wpBuf_[(size_t)i * MAX_WP];
             uint8_t   wc = wpCount_[i];
 
-            float d0sq = (posX_[i] - wp[0].x) * (posX_[i] - wp[0].x)
-                       + (posZ_[i] - wp[0].y) * (posZ_[i] - wp[0].y);
-            float dNsq = (posX_[i] - wp[wc-1].x) * (posX_[i] - wp[wc-1].x)
-                       + (posZ_[i] - wp[wc-1].y) * (posZ_[i] - wp[wc-1].y);
-            bool nearStart = (d0sq <= dNsq);
-
-            XMFLOAT2 dstPt = nearStart ? wp[wc-1] : wp[0];
-
             int srcGX, srcGZ, dstGX, dstGZ;
             bool haveSrc = city.WorldToGrid(posX_[i], posZ_[i], srcGX, srcGZ);
-            bool haveDst = city.WorldToGrid(dstPt.x, dstPt.y, dstGX, dstGZ);
 
             bool rerouted = false;
-            if (haveSrc && haveDst && !(srcGX == dstGX && srcGZ == dstGZ))
+
+            // Wandering cars pick a random road cell as destination
+            if (wandering_[i] && haveSrc)
             {
-                auto newPath = city.FindPathRoad(srcGX, srcGZ, dstGX, dstGZ);
-                if (newPath.size() >= 2)
+                constexpr int GS2 = CityLayout::GRID_SIZE;
+                // Hash-based random road cell search
+                uint32_t rh = (uint32_t)(i * 2654435761u + dayCounter_ * 997u +
+                              (uint32_t)(currentHour * 1000.f));
+                for (int attempt = 0; attempt < 20; ++attempt)
                 {
-                    uint8_t nwc = (uint8_t)std::min(newPath.size(), (size_t)MAX_WP);
-                    for (uint8_t w = 0; w < nwc; ++w) wp[w] = newPath[w];
-                    wpCount_[i] = nwc;
-                    SimplifyPath(wp, wpCount_[i]);
-                    rerouted = true;
+                    rh = rh * 1664525u + 1013904223u;
+                    int rx = (int)(rh % GS2);
+                    rh = rh * 1664525u + 1013904223u;
+                    int rz = (int)(rh % GS2);
+                    auto ct = city.GetCellType(rx, rz);
+                    if (ct != CityLayout::CellType::ROAD && ct != CityLayout::CellType::BUS_STOP)
+                        continue;
+                    // Must be at least 5 cells away for a meaningful trip
+                    if (std::abs(rx - srcGX) + std::abs(rz - srcGZ) < 5)
+                        continue;
+                    auto newPath = city.FindPathRoad(srcGX, srcGZ, rx, rz);
+                    if (newPath.size() >= 2)
+                    {
+                        uint8_t nwc = (uint8_t)std::min(newPath.size(), (size_t)MAX_WP);
+                        for (uint8_t w = 0; w < nwc; ++w) wp[w] = newPath[w];
+                        wpCount_[i] = nwc;
+                        SimplifyPath(wp, wpCount_[i]);
+                        rerouted = true;
+                        break;
+                    }
                 }
             }
 
-            if (!rerouted)
+            // Normal commute: re-route to original home/work destination
+            if (!rerouted && haveSrc)
             {
-                if (!nearStart)
+                float d0sq = (posX_[i] - wp[0].x) * (posX_[i] - wp[0].x)
+                           + (posZ_[i] - wp[0].y) * (posZ_[i] - wp[0].y);
+                float dNsq = (posX_[i] - wp[wc-1].x) * (posX_[i] - wp[wc-1].x)
+                           + (posZ_[i] - wp[wc-1].y) * (posZ_[i] - wp[wc-1].y);
+                bool nearStart = (d0sq <= dNsq);
+                XMFLOAT2 dstPt = nearStart ? wp[wc-1] : wp[0];
+
+                bool haveDst = city.WorldToGrid(dstPt.x, dstPt.y, dstGX, dstGZ);
+                if (haveDst && !(srcGX == dstGX && srcGZ == dstGZ))
                 {
-                    for (uint8_t a = 0, b = wc-1; a < b; ++a, --b)
-                        std::swap(wp[a], wp[b]);
+                    auto newPath = city.FindPathRoad(srcGX, srcGZ, dstGX, dstGZ);
+                    if (newPath.size() >= 2)
+                    {
+                        uint8_t nwc = (uint8_t)std::min(newPath.size(), (size_t)MAX_WP);
+                        for (uint8_t w = 0; w < nwc; ++w) wp[w] = newPath[w];
+                        wpCount_[i] = nwc;
+                        SimplifyPath(wp, wpCount_[i]);
+                        rerouted = true;
+                    }
+                }
+
+                if (!rerouted)
+                {
+                    if (!nearStart)
+                    {
+                        for (uint8_t a = 0, b = wc-1; a < b; ++a, --b)
+                            std::swap(wp[a], wp[b]);
+                    }
                 }
             }
 
@@ -491,46 +660,35 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
         // Reached last waypoint → buses re-route, cars find parking
         if (wn >= wc)
         {
-            // ---- Bus re-route: pick a random road cell and keep driving ----
+            // ---- Bus re-route: route buses reverse, random buses pick new destination ----
             if (isBus_[i])
             {
-                int curGX, curGZ;
-                if (city.WorldToGrid(posX_[i], posZ_[i], curGX, curGZ))
+                // Route bus: reverse direction
+                if (busRouteIdx_[i] >= 0 && busRouteIdx_[i] < (int)busRoutes_.size())
                 {
-                    // Collect road cells
-                    constexpr int GS2 = CityLayout::GRID_SIZE;
-                    static thread_local std::vector<int> roadCells;
-                    roadCells.clear();
-                    for (int c = 0; c < GS2 * GS2; ++c)
-                        if (city.GetCellType(c % GS2, c / GS2) == CityLayout::CellType::ROAD)
-                            roadCells.push_back(c);
-                    if (roadCells.size() > 1)
-                    {
-                        // Simple pseudo-random pick
-                        uint32_t rng = (uint32_t)(posX_[i] * 73856093.f) ^ (uint32_t)(posZ_[i] * 19349663.f) ^ (uint32_t)(i * 83492791);
-                        rng ^= rng >> 16; rng *= 0x45d9f3b; rng ^= rng >> 16;
-                        int pick = (int)(rng % (uint32_t)roadCells.size());
-                        int dstGX = roadCells[pick] % GS2;
-                        int dstGZ = roadCells[pick] / GS2;
-                        auto newPath = city.FindPathRoad(curGX, curGZ, dstGX, dstGZ);
-                        if ((int)newPath.size() >= 2)
+                    auto& route = busRoutes_[busRouteIdx_[i]];
+                    int newDir = (busDirection_[i] == 0) ? 1 : 0;
+                    busDirection_[i] = (int8_t)newDir;
+                    busNextStop_[i] = 0;
+                    busStopTimer_[i] = 0.f;
+                    const auto& newPath = (newDir == 0) ? route.fullPathAB : route.fullPathBA;
+                    if ((int)newPath.size() >= 2) {
+                        uint8_t nc = (uint8_t)std::min(newPath.size(), (size_t)MAX_WP);
+                        for (uint8_t w = 0; w < nc; ++w) wp[w] = newPath[w];
+                        wpCount_[i] = nc;
+                        SimplifyPath(wp, wpCount_[i]);
+                        wpCurr_[i] = 1;
                         {
-                            uint8_t nc = (uint8_t)std::min(newPath.size(), (size_t)MAX_WP);
-                            for (uint8_t w = 0; w < nc; ++w) wp[w] = newPath[w];
-                            wpCount_[i] = nc;
-                            SimplifyPath(wp, wpCount_[i]);
-                            wpCurr_[i] = 1;
-                            {
-                                float lo[3]; int lc;
-                                GetLaneOffsets(4, lo, lc);
-                                laneIdx_[i] = (int8_t)(lc - 1);
-                                laneOff_[i] = lo[lc - 1];
-                                laneTarget_[i] = laneOff_[i];
-                            }
-                            continue;
+                            float lo[3]; int lc;
+                            GetLaneOffsets(6, lo, lc);
+                            laneIdx_[i] = (int8_t)(lc - 1);
+                            laneOff_[i] = lo[lc - 1];
+                            laneTarget_[i] = laneOff_[i];
                         }
+                        continue;
                     }
                 }
+
                 // Fallback: reverse path
                 for (uint8_t a = 0, b = wc - 1; a < b; ++a, --b)
                     std::swap(wp[a], wp[b]);
@@ -587,6 +745,17 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
                         parkCell_[i]   = (uint32_t)pidx;
                         myParkSlot_[i] = (uint8_t)(freeFl * CityLayout::PARKING_SPOTS_PER_FLOOR + slotN);
                         parked = true;
+
+                        // Wandering cars: short stop, then maybe keep wandering
+                        if (wandering_[i])
+                        {
+                            parkTimer_[i] = 3.0f + (float)(i % 5) * 2.0f; // 3-13s stop
+                            // Chance to go home
+                            uint32_t wh = (uint32_t)(i * 2654435761u + dayCounter_ * 53u);
+                            float goHome = (float)(wh & 0xFFFF) / 65535.f;
+                            if (goHome < WANDER_HOME_CHANCE)
+                                wandering_[i] = false; // will re-route home normally
+                        }
                     }
                 }
             }
@@ -627,9 +796,31 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
         bool isTurn = (cornerCos < 0.3f);
 
         // ---- Dynamic lane offsets ----
+        // At intersections where two roads with different lane counts cross,
+        // use the lane count from the road the car is actually traveling on
+        // (look at the adjacent cell behind us along the segment direction).
         float cellLaneOffs[3]; int cellLaneCount = 0;
         {
-            int totalLanes = onGrid ? city.GetRoadLanes(myGX, myGZ) : 4;
+            int totalLanes = 6;
+            if (onGrid) {
+                totalLanes = city.GetRoadLanes(myGX, myGZ);
+                // If at an intersection, resolve lane count from the road
+                // behind us so we keep the same lane config through the crossing
+                if (lights.IsIntersection(myGX, myGZ)) {
+                    int stepX = (int)std::round(segDir.x);
+                    int stepZ = (int)std::round(segDir.y);
+                    for (int s = 1; s <= 3; ++s) {
+                        int backGX = myGX - stepX * s;
+                        int backGZ = myGZ - stepZ * s;
+                        auto bct = city.GetCellType(backGX, backGZ);
+                        if (bct == CityLayout::CellType::ROAD &&
+                            !lights.IsIntersection(backGX, backGZ)) {
+                            totalLanes = city.GetRoadLanes(backGX, backGZ);
+                            break;
+                        }
+                    }
+                }
+            }
             GetLaneOffsets(totalLanes, cellLaneOffs, cellLaneCount);
         }
 
@@ -643,7 +834,7 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
         // Smooth lane transition: blend laneOff toward laneTarget
         {
             float laneDiff = laneTarget_[i] - laneOff_[i];
-            float maxLateral = 3.0f * dt;
+            float maxLateral = 5.0f * dt;
             if (std::abs(laneDiff) > maxLateral)
                 laneOff_[i] += (laneDiff > 0.0f ? maxLateral : -maxLateral);
             else

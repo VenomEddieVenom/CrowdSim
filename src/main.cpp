@@ -125,12 +125,14 @@ public:
 
     // Reproduction timer
     float reproTimer_ = 0.0f;
-    static constexpr float REPRO_INTERVAL = 30.0f; // every 30 game-seconds
+    static constexpr float REPRO_INTERVAL = 90.0f; // every 90 game-seconds
 
-    // Bus spawn timer
-    float busTimer_ = 0.0f;
-    static constexpr float BUS_INTERVAL = 20.0f; // try every 20 game-seconds
-    static constexpr int   MAX_BUSES    = 5;      // bus cap
+    // Car-population sync timer (1 car per 3 people)
+    float carSyncTimer_ = 0.0f;
+    static constexpr float CAR_SYNC_INTERVAL = 2.0f; // check every 2 game-seconds
+    static constexpr int   POP_PER_CAR       = 3;    // 1 car per 3 people
+
+    // Bus system (only route-based, no random)
     uint32_t busRng_ = 12345;
 
     // Agent / car / building selection
@@ -153,7 +155,21 @@ public:
     // is simultaneously mutating (ACCESS_VIOLATION in ComputeObjectLODForView).
     std::vector<std::function<void()>> pendingPlacementActions_;
     bool     buildModeEnabled = false;
-    int      placeTool        = 0;    // 0=road 1=house 2=workplace 3=tree 4=crosswalk 5=parking 6=lake 7=power_plant 8=water_pump 9=police 10=fire_station 11=hospital
+    int      placeTool        = 0;    // 0=road 1=house 2=workplace 3=tree 4=crosswalk 5=parking 6=lake 7=power_plant 8=water_pump 9=police 10=fire_station 11=hospital 12=bus_depot
+
+    // Bus depot menu & line creation (mutable: modified in Compose for UI click handling)
+    mutable bool     depotMenuOpen = false;         // true = showing depot management menu
+    mutable int      depotMenuGX = -1, depotMenuGZ = -1;  // which depot cell the menu refers to
+    mutable bool     lineCreationMode = false;      // true = placing stops for a new line
+    mutable int      newLineNumber = 1;             // line number being created
+    mutable int      lineCreationDepotGX = -1, lineCreationDepotGZ = -1; // origin depot
+    mutable int      lineCreationLeg = 0;            // 0 = outbound, 1 = return (circular only)
+    mutable std::vector<std::pair<int,int>> lineStops;  // stops placed so far (gx,gz)
+    mutable std::vector<std::vector<XMFLOAT2>> linePreviewPaths; // path segments for preview
+    mutable std::vector<std::pair<int,int>> lineStopsLeg1;  // leg 1 stops (saved when starting leg 2)
+    mutable std::vector<std::vector<XMFLOAT2>> linePreviewPathsLeg1; // leg 1 preview paths
+    mutable int      pendingRouteDelete = -1;        // route index queued for deletion
+    std::vector<wi::ecs::Entity> busStopSignEntities_; // sign entities placed on sidewalks
     int      hoverGX = 0, hoverGZ = 0;
     bool     hoverValid = false;
     bool     clickConsumedByPanel = false;  // prevent world-placement when clicking UI
@@ -166,6 +182,14 @@ public:
     // Saves menu
     bool     savesMenuOpen = false;
     bool     showSidewalkDebug = false;  // F8 toggle: visualise sidewalk layer
+    bool     showProfiler = false;        // F3 toggle: profiler overlay + logging
+    float    profilerLogTimer_ = 0.0f;    // seconds until next log dump
+    float    profilerLogInterval_ = 5.0f; // dump every 5 seconds
+    int      profilerLogCount_ = 0;       // number of snapshots written
+    wi::Timer profFrameTimer_;            // per-frame CPU timer
+    float    profFrameTimes_[120] = {};   // rolling frame time buffer (ms)
+    int      profFrameIdx_ = 0;
+    mutable std::string cachedProfilerText_;  // captured in Compose where GPU ranges are live
     float    hoverWorldX = 0.f, hoverWorldZ = 0.f;  // world-space hit position
     bool     swDebugClickActive = false;
     float    swDebugClickX = 0.f, swDebugClickZ = 0.f;
@@ -193,6 +217,155 @@ public:
         std::sort(saveFiles.begin(), saveFiles.end());
     }
 
+    void SaveBusRoutes(const std::string& basePath) {
+        std::string rpath = basePath + ".routes";
+        std::ofstream f(rpath, std::ios::binary);
+        if (!f) return;
+        uint32_t magic = 0x42555332; // "BUS2" format marker
+        f.write(reinterpret_cast<const char*>(&magic), 4);
+        uint32_t count = (uint32_t)cars.busRoutes_.size();
+        f.write(reinterpret_cast<const char*>(&count), 4);
+        for (auto& r : cars.busRoutes_) {
+            f.write(reinterpret_cast<const char*>(&r.lineNumber), 4);
+            f.write(reinterpret_cast<const char*>(&r.depotA_gx), 4);
+            f.write(reinterpret_cast<const char*>(&r.depotA_gz), 4);
+            f.write(reinterpret_cast<const char*>(&r.depotB_gx), 4);
+            f.write(reinterpret_cast<const char*>(&r.depotB_gz), 4);
+            uint8_t circ = r.circular ? 1 : 0;
+            f.write(reinterpret_cast<const char*>(&circ), 1);
+            uint32_t sc = (uint32_t)r.stops.size();
+            f.write(reinterpret_cast<const char*>(&sc), 4);
+            for (auto& s : r.stops) {
+                f.write(reinterpret_cast<const char*>(&s.gx), 4);
+                f.write(reinterpret_cast<const char*>(&s.gz), 4);
+                f.write(s.name, 32);
+            }
+            uint8_t act = r.active ? 1 : 0;
+            f.write(reinterpret_cast<const char*>(&act), 1);
+            // v2: write return stops
+            uint32_t sbc = (uint32_t)r.stopsBA.size();
+            f.write(reinterpret_cast<const char*>(&sbc), 4);
+            for (auto& s : r.stopsBA) {
+                f.write(reinterpret_cast<const char*>(&s.gx), 4);
+                f.write(reinterpret_cast<const char*>(&s.gz), 4);
+                f.write(s.name, 32);
+            }
+        }
+    }
+
+    void LoadBusRoutes(const std::string& basePath) {
+        std::string rpath = basePath + ".routes";
+        std::ifstream f(rpath, std::ios::binary);
+        if (!f) return;
+        cars.busRoutes_.clear();
+        // Detect format: old = first u32 is count (<=1000), new = 0x42555332 magic
+        uint32_t first = 0;
+        f.read(reinterpret_cast<char*>(&first), 4);
+        bool newFormat = (first == 0x42555332);
+        uint32_t count = 0;
+        if (newFormat) {
+            f.read(reinterpret_cast<char*>(&count), 4);
+        } else {
+            count = first;
+        }
+        if (count > 1000) return; // sanity check
+        for (uint32_t i = 0; i < count; ++i) {
+            BusRoute r;
+            f.read(reinterpret_cast<char*>(&r.lineNumber), 4);
+            f.read(reinterpret_cast<char*>(&r.depotA_gx), 4);
+            f.read(reinterpret_cast<char*>(&r.depotA_gz), 4);
+            f.read(reinterpret_cast<char*>(&r.depotB_gx), 4);
+            f.read(reinterpret_cast<char*>(&r.depotB_gz), 4);
+            uint8_t circ = 0;
+            f.read(reinterpret_cast<char*>(&circ), 1);
+            r.circular = (circ != 0);
+            uint32_t sc = 0;
+            f.read(reinterpret_cast<char*>(&sc), 4);
+            if (sc > 200) break; // sanity
+            for (uint32_t si = 0; si < sc; ++si) {
+                BusRoute::Stop s;
+                f.read(reinterpret_cast<char*>(&s.gx), 4);
+                f.read(reinterpret_cast<char*>(&s.gz), 4);
+                f.read(s.name, 32);
+                s.name[31] = '\0';
+                r.stops.push_back(s);
+            }
+            uint8_t act = 0;
+            f.read(reinterpret_cast<char*>(&act), 1);
+            // v2: read return stops
+            if (newFormat) {
+                uint32_t sbc = 0;
+                f.read(reinterpret_cast<char*>(&sbc), 4);
+                if (sbc <= 200) {
+                    for (uint32_t si = 0; si < sbc; ++si) {
+                        BusRoute::Stop s;
+                        f.read(reinterpret_cast<char*>(&s.gx), 4);
+                        f.read(reinterpret_cast<char*>(&s.gz), 4);
+                        f.read(s.name, 32);
+                        s.name[31] = '\0';
+                        r.stopsBA.push_back(s);
+                    }
+                }
+            }
+            // Rebuild fullPathAB by pathfinding
+            {
+                std::vector<XMFLOAT2> full;
+                std::vector<int> stopIdx;
+                int prevGX = r.depotA_gx, prevGZ = r.depotA_gz;
+                for (auto& stop : r.stops) {
+                    auto seg = city.FindPathRoad(prevGX, prevGZ, stop.gx, stop.gz);
+                    if (seg.empty()) continue;
+                    for (size_t j = (full.empty() ? 0 : 1); j < seg.size(); ++j)
+                        full.push_back(seg[j]);
+                    stopIdx.push_back((int)full.size() - 1);
+                    prevGX = stop.gx; prevGZ = stop.gz;
+                }
+                auto seg = city.FindPathRoad(prevGX, prevGZ, r.depotB_gx, r.depotB_gz);
+                if (!seg.empty()) {
+                    for (size_t j = (full.empty() ? 0 : 1); j < seg.size(); ++j)
+                        full.push_back(seg[j]);
+                }
+                r.fullPathAB = full;
+                r.stopWpIdxAB = stopIdx;
+            }
+            // Rebuild fullPathBA from stopsBA (circular) or reverse
+            if (r.circular && !r.stopsBA.empty()) {
+                std::vector<XMFLOAT2> fullBA;
+                std::vector<int> stopIdxBA;
+                int prevGX = r.depotB_gx, prevGZ = r.depotB_gz;
+                for (auto& stop : r.stopsBA) {
+                    auto seg = city.FindPathRoad(prevGX, prevGZ, stop.gx, stop.gz);
+                    if (seg.empty()) continue;
+                    for (size_t j = (fullBA.empty() ? 0 : 1); j < seg.size(); ++j)
+                        fullBA.push_back(seg[j]);
+                    stopIdxBA.push_back((int)fullBA.size() - 1);
+                    prevGX = stop.gx; prevGZ = stop.gz;
+                }
+                auto seg = city.FindPathRoad(prevGX, prevGZ, r.depotA_gx, r.depotA_gz);
+                if (!seg.empty()) {
+                    for (size_t j = (fullBA.empty() ? 0 : 1); j < seg.size(); ++j)
+                        fullBA.push_back(seg[j]);
+                }
+                r.fullPathBA = fullBA;
+                r.stopWpIdxBA = stopIdxBA;
+            } else {
+                r.fullPathBA.assign(r.fullPathAB.rbegin(), r.fullPathAB.rend());
+                int totalWp = (int)r.fullPathAB.size();
+                for (int si2 = (int)r.stopWpIdxAB.size() - 1; si2 >= 0; --si2)
+                    r.stopWpIdxBA.push_back(totalWp - 1 - r.stopWpIdxAB[si2]);
+            }
+            r.active = act && !r.fullPathAB.empty();
+            cars.busRoutes_.push_back(r);
+        }
+        // Rebuild bus stop signs for all loaded routes
+        for (auto& r : cars.busRoutes_) {
+            for (auto& stop : r.stops)
+                PlaceBusStopSign(stop.gx, stop.gz);
+            for (auto& stop : r.stopsBA)
+                PlaceBusStopSign(stop.gx, stop.gz);
+        }
+    }
+
     void DoLoadSave(const std::string& name) {
         std::string path = "saves/" + name + ".city";
         auto sd = CityLayout::LoadFromFile(path.c_str());
@@ -201,23 +374,31 @@ public:
             return;
         }
         trafficLights.RebuildIntersections(city);
+        // Remove old bus stop sign entities
+        {
+            auto& sc = wi::scene::GetScene();
+            for (auto e : busStopSignEntities_) sc.Entity_Remove(e);
+            busStopSignEntities_.clear();
+        }
         for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
         for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2)
             city.ClearCell(gx2, gz2);
         std::fill(std::begin(houseHasSpawned), std::end(houseHasSpawned), false);
-        // Three passes: roads first, buildings second, crosswalks last.
-        // Crosswalks must be placed after all road/intersection cells are in the grid
-        // so that BuildCrosswalk can correctly detect which neighbor is the intersection
-        // and shift the zebra stripes to the right edge (not leave them at cell center).
+        // Three passes: roads first (including crosswalks as temporary ROAD),
+        // buildings second, then upgrade crosswalks.
+        // Pass 0 places both ROAD and CROSSWALK cells as ROAD so every road-like
+        // cell exists before pass 2 converts crosswalks.  This ensures
+        // BuildCrosswalk's countRN correctly detects all intersection arms.
         for (int pass = 0; pass < 3; ++pass)
         for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
         for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2) {
             auto ct = sd.cells[gz2 * CityLayout::GRID_SIZE + gx2];
             if (ct == CellType::EMPTY) continue;
-            if (pass == 0 && ct != CellType::ROAD) continue;
+            if (pass == 0 && ct != CellType::ROAD && ct != CellType::CROSSWALK) continue;
             if (pass == 1 && (ct == CellType::ROAD || ct == CellType::CROSSWALK)) continue;
             if (pass == 2 && ct != CellType::CROSSWALK) continue;
-            city.PlaceCell(gx2, gz2, ct);
+            // Pass 0: place crosswalks as ROAD temporarily
+            city.PlaceCell(gx2, gz2, (pass == 0 && ct == CellType::CROSSWALK) ? CellType::ROAD : ct);
         }
         trafficLights.RebuildIntersections(city);
         PlaceCrosswalksAroundIntersections();
@@ -233,15 +414,65 @@ public:
         for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2) {
             int idx2 = gz2 * CityLayout::GRID_SIZE + gx2;
             if (sd.cells[idx2] == CellType::HOUSE) {
-                city.SetHousePop(gx2, gz2, 0);
-                if (TrySpawnFromHouse(gx2, gz2))
-                    houseHasSpawned[idx2] = true;
-                // Restore saved population (TrySpawnFromHouse adds pop as side-effect)
+                // Restore saved population first
                 city.SetHousePop(gx2, gz2, sd.housePop[idx2]);
                 city.UpdateHouseHeight(gx2, gz2);
             }
         }
+        // Spawn initial car fleet proportional to population
+        {
+            constexpr int GS = CityLayout::GRID_SIZE;
+            int totalPop = 0;
+            for (int gz2 = 0; gz2 < GS; ++gz2)
+            for (int gx2 = 0; gx2 < GS; ++gx2)
+                if (city.GetCellType(gx2, gz2) == CellType::HOUSE)
+                    totalPop += city.GetHousePop(gx2, gz2);
+            int targetCars = totalPop / POP_PER_CAR;
+
+            // Collect houses with population
+            struct HI { int gx, gz, pop; };
+            std::vector<HI> houses;
+            for (int gz2 = 0; gz2 < GS; ++gz2)
+            for (int gx2 = 0; gx2 < GS; ++gx2)
+                if (city.GetCellType(gx2, gz2) == CellType::HOUSE && city.GetHousePop(gx2, gz2) > 0)
+                    houses.push_back({gx2, gz2, city.GetHousePop(gx2, gz2)});
+
+            // Spawn cars distributed across houses proportionally
+            if (!houses.empty())
+            {
+                uint32_t rng = 42u;
+                for (int c = 0; c < targetCars; ++c)
+                {
+                    rng = rng * 1664525u + 1013904223u;
+                    int idx2 = (int)(rng % houses.size());
+                    TrySpawnOneWorker(houses[idx2].gx, houses[idx2].gz);
+                }
+                // Also spawn pedestrians — ~1 ped per 5 people
+                int targetPeds = totalPop / 5;
+                // Collect workplaces for random assignment
+                struct WI { int gx, gz; };
+                std::vector<WI> workplaces;
+                for (int wz = 0; wz < GS; ++wz)
+                for (int wx = 0; wx < GS; ++wx)
+                    if (city.GetCellType(wx, wz) == CellType::WORKPLACE)
+                        workplaces.push_back({wx, wz});
+                if (!workplaces.empty())
+                {
+                    for (int p = 0; p < targetPeds; ++p)
+                    {
+                        rng = rng * 1664525u + 1013904223u;
+                        int hi = (int)(rng % houses.size());
+                        rng = rng * 1664525u + 1013904223u;
+                        int wi2 = (int)(rng % workplaces.size());
+                        crowd.SpawnPed(houses[hi].gx, houses[hi].gz,
+                                       workplaces[wi2].gx, workplaces[wi2].gz, city);
+                    }
+                }
+            }
+        }
         wi::backlog::post("[Load] Loaded: " + path, wi::backlog::LogLevel::Default);
+        // Load bus routes if they exist
+        LoadBusRoutes("saves/" + name);
         savesMenuOpen = false;
     }
 
@@ -317,6 +548,19 @@ public:
         if (!pendingPlacementActions_.empty()) {
             for (auto& action : pendingPlacementActions_) action();
             pendingPlacementActions_.clear();
+        }
+        // Process deferred route deletion (queued from Compose UI click)
+        if (pendingRouteDelete >= 0 && pendingRouteDelete < (int)cars.busRoutes_.size()) {
+            int ri = pendingRouteDelete;
+            // Orphan buses on this route and fix up indices for shifted routes
+            for (uint32_t j = 0; j < cars.GetCarCount(); ++j) {
+                if (!cars.IsBus(j)) continue;
+                int8_t bri = cars.GetBusRouteIdx(j);
+                if (bri == ri) cars.SetBusRouteIdx(j, -1);
+                else if (bri > ri) cars.SetBusRouteIdx(j, bri - 1);
+            }
+            cars.busRoutes_.erase(cars.busRoutes_.begin() + ri);
+            pendingRouteDelete = -1;
         }
         if (city.laneMarksDirty_) city.RebuildAllLaneMarkings();
 
@@ -479,12 +723,241 @@ public:
 
         // ---- Build mode toggle ----
         if (wi::input::Press((wi::input::BUTTON)'B'))
+        {
             buildModeEnabled = !buildModeEnabled;
+            if (buildModeEnabled) { lineCreationMode = false; depotMenuOpen = false; }
+        }
+
+        // ---- Cancel line creation / depot menu (always active, regardless of build mode) ----
+        if (lineCreationMode && (wi::input::Press(wi::input::MOUSE_BUTTON_RIGHT) || wi::input::Press(wi::input::KEYBOARD_BUTTON_ESCAPE)))
+        {
+            lineCreationMode = false;
+            lineCreationLeg = 0;
+            lineCreationDepotGX = -1; lineCreationDepotGZ = -1;
+            lineStops.clear();
+            linePreviewPaths.clear();
+            lineStopsLeg1.clear();
+            linePreviewPathsLeg1.clear();
+        }
+        if (depotMenuOpen && wi::input::Press(wi::input::KEYBOARD_BUTTON_ESCAPE))
+        {
+            depotMenuOpen = false;
+        }
+
+        // ---- Line creation mode handling (works in normal mode, outside build mode) ----
+        bool lineClickConsumed = false;
+        if (lineCreationMode && !buildModeEnabled)
+        {
+            // Compute hover grid cell via ground-plane raycast
+            XMFLOAT4 lcPtr = wi::input::GetPointer();
+            hoverValid = false;
+            XMMATRIX lcInvVP = XMMatrixInverse(nullptr, cam.GetViewProjection());
+            float lcNdcX =  (lcPtr.x / static_cast<float>(cam.width))  * 2.0f - 1.0f;
+            float lcNdcY = 1.0f - (lcPtr.y / static_cast<float>(cam.height)) * 2.0f;
+            XMVECTOR lcNear = XMVector3TransformCoord(XMVectorSet(lcNdcX, lcNdcY, 0.f, 1.f), lcInvVP);
+            XMVECTOR lcFar  = XMVector3TransformCoord(XMVectorSet(lcNdcX, lcNdcY, 1.f, 1.f), lcInvVP);
+            XMVECTOR lcRDir = XMVector3Normalize(lcFar - lcNear);
+            float lcRDirY = XMVectorGetY(lcRDir);
+            if (fabsf(lcRDirY) > 0.001f)
+            {
+                float t = -XMVectorGetY(lcNear) / lcRDirY;
+                if (t > 0.0f)
+                {
+                    float hx = XMVectorGetX(lcNear) + XMVectorGetX(lcRDir) * t;
+                    float hz = XMVectorGetZ(lcNear) + XMVectorGetZ(lcRDir) * t;
+                    hoverWorldX = hx; hoverWorldZ = hz;
+                    hoverValid = city.WorldToGrid(hx, hz, hoverGX, hoverGZ);
+                }
+            }
+
+            bool lcPress = wi::input::Press(wi::input::MOUSE_BUTTON_LEFT) &&
+                           !wi::input::Down(wi::input::MOUSE_BUTTON_RIGHT);
+            if (hoverValid && lcPress)
+            {
+                auto ct = city.GetCellType(hoverGX, hoverGZ);
+                bool isDepot = (ct == CellType::BUS_DEPOT);
+                bool isSameDepot = isDepot && (hoverGX == lineCreationDepotGX && hoverGZ == lineCreationDepotGZ);
+                bool isDiffDepot = isDepot && !isSameDepot;
+
+                // Circular leg 1 → leg 2 transition: click same depot after placing outbound stops
+                if (isSameDepot && !lineStops.empty() && lineCreationLeg == 0)
+                {
+                    lineStopsLeg1 = lineStops;
+                    linePreviewPathsLeg1 = linePreviewPaths;
+                    lineStops.clear();
+                    linePreviewPaths.clear();
+                    lineCreationLeg = 1;
+                    lineClickConsumed = true;
+                }
+                // Circular leg 2 finish: click same depot to complete circular route
+                else if (isSameDepot && lineCreationLeg == 1)
+                {
+                    BusRoute route;
+                    route.lineNumber = newLineNumber;
+                    route.depotA_gx = lineCreationDepotGX; route.depotA_gz = lineCreationDepotGZ;
+                    route.circular = true;
+                    route.depotB_gx = lineCreationDepotGX; route.depotB_gz = lineCreationDepotGZ;
+                    for (size_t si = 0; si < lineStopsLeg1.size(); ++si) {
+                        BusRoute::Stop s;
+                        s.gx = lineStopsLeg1[si].first; s.gz = lineStopsLeg1[si].second;
+                        snprintf(s.name, sizeof(s.name), "Stop %d", (int)(si + 1));
+                        route.stops.push_back(s);
+                    }
+                    for (size_t si = 0; si < lineStops.size(); ++si) {
+                        BusRoute::Stop s;
+                        s.gx = lineStops[si].first; s.gz = lineStops[si].second;
+                        snprintf(s.name, sizeof(s.name), "Ret %d", (int)(si + 1));
+                        route.stopsBA.push_back(s);
+                    }
+                    // Build fullPathAB from outbound stops
+                    {
+                        std::vector<XMFLOAT2> full;
+                        std::vector<int> stopIdx;
+                        int prevGX2 = route.depotA_gx, prevGZ2 = route.depotA_gz;
+                        for (auto& stop : route.stops) {
+                            auto seg = city.FindPathRoad(prevGX2, prevGZ2, stop.gx, stop.gz);
+                            if (seg.empty()) continue;
+                            for (size_t j = (full.empty() ? 0 : 1); j < seg.size(); ++j)
+                                full.push_back(seg[j]);
+                            stopIdx.push_back((int)full.size() - 1);
+                            prevGX2 = stop.gx; prevGZ2 = stop.gz;
+                        }
+                        auto seg = city.FindPathRoad(prevGX2, prevGZ2, route.depotB_gx, route.depotB_gz);
+                        if (!seg.empty()) {
+                            for (size_t j = (full.empty() ? 0 : 1); j < seg.size(); ++j)
+                                full.push_back(seg[j]);
+                        }
+                        route.fullPathAB = full;
+                        route.stopWpIdxAB = stopIdx;
+                    }
+                    // Build fullPathBA from return stops (or reverse if none)
+                    if (!route.stopsBA.empty()) {
+                        std::vector<XMFLOAT2> fullBA;
+                        std::vector<int> stopIdxBA;
+                        int prevGX2 = route.depotB_gx, prevGZ2 = route.depotB_gz;
+                        for (auto& stop : route.stopsBA) {
+                            auto seg = city.FindPathRoad(prevGX2, prevGZ2, stop.gx, stop.gz);
+                            if (seg.empty()) continue;
+                            for (size_t j = (fullBA.empty() ? 0 : 1); j < seg.size(); ++j)
+                                fullBA.push_back(seg[j]);
+                            stopIdxBA.push_back((int)fullBA.size() - 1);
+                            prevGX2 = stop.gx; prevGZ2 = stop.gz;
+                        }
+                        auto seg = city.FindPathRoad(prevGX2, prevGZ2, route.depotA_gx, route.depotA_gz);
+                        if (!seg.empty()) {
+                            for (size_t j = (fullBA.empty() ? 0 : 1); j < seg.size(); ++j)
+                                fullBA.push_back(seg[j]);
+                        }
+                        route.fullPathBA = fullBA;
+                        route.stopWpIdxBA = stopIdxBA;
+                    } else {
+                        route.fullPathBA.assign(route.fullPathAB.rbegin(), route.fullPathAB.rend());
+                        route.stopWpIdxBA.clear();
+                        int totalWp = (int)route.fullPathAB.size();
+                        for (int si2 = (int)route.stopWpIdxAB.size() - 1; si2 >= 0; --si2)
+                            route.stopWpIdxBA.push_back(totalWp - 1 - route.stopWpIdxAB[si2]);
+                    }
+                    route.active = !route.fullPathAB.empty();
+                    cars.busRoutes_.push_back(route);
+                    lineClickConsumed = true;
+                    lineCreationMode = false;
+                    lineCreationLeg = 0;
+                    lineCreationDepotGX = -1; lineCreationDepotGZ = -1;
+                    lineStops.clear(); lineStopsLeg1.clear();
+                    linePreviewPaths.clear(); linePreviewPathsLeg1.clear();
+                }
+                // Non-circular finish: click different depot
+                else if (isDiffDepot && (!lineStops.empty() || !lineStopsLeg1.empty()))
+                {
+                    BusRoute route;
+                    route.lineNumber = newLineNumber;
+                    route.depotA_gx = lineCreationDepotGX; route.depotA_gz = lineCreationDepotGZ;
+                    route.circular = false;
+                    route.depotB_gx = hoverGX; route.depotB_gz = hoverGZ;
+                    // Combine leg 1 + current stops if user was mid-leg
+                    std::vector<std::pair<int,int>> allStops;
+                    if (!lineStopsLeg1.empty()) {
+                        allStops = lineStopsLeg1;
+                        allStops.insert(allStops.end(), lineStops.begin(), lineStops.end());
+                    } else {
+                        allStops = lineStops;
+                    }
+                    for (size_t si = 0; si < allStops.size(); ++si) {
+                        BusRoute::Stop s;
+                        s.gx = allStops[si].first; s.gz = allStops[si].second;
+                        snprintf(s.name, sizeof(s.name), "Stop %d", (int)(si + 1));
+                        route.stops.push_back(s);
+                    }
+                    {
+                        std::vector<XMFLOAT2> full;
+                        std::vector<int> stopIdx;
+                        int prevGX2 = route.depotA_gx, prevGZ2 = route.depotA_gz;
+                        for (auto& stop : route.stops) {
+                            auto seg = city.FindPathRoad(prevGX2, prevGZ2, stop.gx, stop.gz);
+                            if (seg.empty()) continue;
+                            for (size_t j = (full.empty() ? 0 : 1); j < seg.size(); ++j)
+                                full.push_back(seg[j]);
+                            stopIdx.push_back((int)full.size() - 1);
+                            prevGX2 = stop.gx; prevGZ2 = stop.gz;
+                        }
+                        auto seg = city.FindPathRoad(prevGX2, prevGZ2, route.depotB_gx, route.depotB_gz);
+                        if (!seg.empty()) {
+                            for (size_t j = (full.empty() ? 0 : 1); j < seg.size(); ++j)
+                                full.push_back(seg[j]);
+                        }
+                        route.fullPathAB = full;
+                        route.stopWpIdxAB = stopIdx;
+                        route.fullPathBA.assign(full.rbegin(), full.rend());
+                        route.stopWpIdxBA.clear();
+                        int totalWp = (int)full.size();
+                        for (int si2 = (int)stopIdx.size() - 1; si2 >= 0; --si2)
+                            route.stopWpIdxBA.push_back(totalWp - 1 - stopIdx[si2]);
+                    }
+                    route.active = !route.fullPathAB.empty();
+                    cars.busRoutes_.push_back(route);
+                    lineClickConsumed = true;
+                    lineCreationMode = false;
+                    lineCreationLeg = 0;
+                    lineCreationDepotGX = -1; lineCreationDepotGZ = -1;
+                    lineStops.clear(); lineStopsLeg1.clear();
+                    linePreviewPaths.clear(); linePreviewPathsLeg1.clear();
+                }
+                else if (ct == CellType::ROAD || ct == CellType::CROSSWALK)
+                {
+                    // Determine which sidewalk side the user clicked on
+                    XMFLOAT2 cellC = city.GridCellCenter(hoverGX, hoverGZ);
+                    float dx = hoverWorldX - cellC.x;
+                    float dz = hoverWorldZ - cellC.y;
+                    int clickSide;
+                    if (fabsf(dx) >= fabsf(dz))
+                        clickSide = (dx >= 0.f) ? 0 : 1;  // E or W
+                    else
+                        clickSide = (dz >= 0.f) ? 2 : 3;  // S or N
+
+                    // Place a bus stop sign on the chosen sidewalk side
+                    int cgx = hoverGX, cgz = hoverGZ;
+                    pendingPlacementActions_.push_back([this, cgx, cgz, clickSide](){
+                        PlaceBusStopSign(cgx, cgz, clickSide);
+                    });
+                    lineClickConsumed = true;
+                    lineStops.push_back({hoverGX, hoverGZ});
+                    int prevGX2, prevGZ2;
+                    if (lineStops.size() == 1) {
+                        prevGX2 = lineCreationDepotGX; prevGZ2 = lineCreationDepotGZ;
+                    } else {
+                        prevGX2 = lineStops[lineStops.size()-2].first;
+                        prevGZ2 = lineStops[lineStops.size()-2].second;
+                    }
+                    auto seg = city.FindPathRoad(prevGX2, prevGZ2, hoverGX, hoverGZ);
+                    linePreviewPaths.push_back(seg);
+                }
+            }
+        }
 
         if (buildModeEnabled)
         {
             const float S = uiScale();
-            // Panel click detection (right side of screen, 12 tool buttons)
+            // Panel click detection (right side of screen, 14 tool buttons)
             const float panelX  = (float)cam.width - 215.0f*S;
             const float btnH    = 46.0f*S;
             const float btnStart = 145.0f*S;
@@ -497,7 +970,7 @@ public:
             if (inPanel && wi::input::Press(wi::input::MOUSE_BUTTON_LEFT))
             {
                 clickConsumedByPanel = true;
-                for (int k = 0; k < 12; ++k) {
+                for (int k = 0; k < 14; ++k) {
                     float by = btnStart + k * btnStep;
                     if (ptr.y >= by && ptr.y < by + btnH)
                         placeTool = k;
@@ -568,11 +1041,19 @@ public:
 
             if (hoverValid && lmbPress)
             {
-                if (placeTool == 0) // ROAD — click-start / click-end
+                // Skip build-mode placement if in line creation mode
+                if (lineCreationMode)
+                {
+                    // handled above, outside build mode block
+                }
+                else if (placeTool == 0) // ROAD — click-start / click-end
                 {
                     if (!roadPlaceActive)
                     {
-                        // First click: record start
+                        // First click: record start — only on empty or existing road
+                        auto existCt = city.GetCellType(hoverGX, hoverGZ);
+                        if (existCt != CellType::EMPTY && existCt != CellType::ROAD && existCt != CellType::CROSSWALK) { /* refuse */ }
+                        else {
                         roadPlaceActive = true;
                         roadStartGX     = hoverGX;
                         roadStartGZ     = hoverGZ;
@@ -587,6 +1068,7 @@ public:
                             TrySpawnAllUnspawnedHouses();
                         });
                         roadPreviewPath.clear();
+                        }
                     }
                     else
                     {
@@ -662,18 +1144,37 @@ public:
                         }
                     }
                 }
+                else if (placeTool == 13) // DESTROY
+                {
+                    CellType existing = city.GetCellType(hoverGX, hoverGZ);
+                    if (existing != CellType::EMPTY) {
+                        int cgx = hoverGX, cgz = hoverGZ;
+                        pendingPlacementActions_.push_back([this, cgx, cgz](){
+                            city.ClearCell(cgx, cgz);
+                            trafficLights.RebuildIntersections(city);
+                            city.BuildSidewalkLayer([&](int gx2, int gz2){ return trafficLights.IsIntersection(gx2, gz2); });
+                            // Rebuild visuals for neighboring roads
+                            const int ddx3[] = { 1,-1, 0, 0 };
+                            const int ddz3[] = { 0, 0, 1,-1 };
+                            for (int d = 0; d < 4; ++d)
+                                city.RebuildRoadCell(cgx + ddx3[d], cgz + ddz3[d]);
+                        });
+                    }
+                }
                 else
                 {
-                    // Tools 1=house, 2=workplace, 5=parking, 6=lake, 7=power_plant, 8=water_pump, 9=police, 10=fire_station, 11=hospital
+                    // Tools 1=house, 2=workplace, 5=parking, 6=lake, 7=power_plant, 8=water_pump, 9=police, 10=fire_station, 11=hospital, 12=bus_depot
+                    // Only place on EMPTY cells to avoid crashing
+                    CellType existing = city.GetCellType(hoverGX, hoverGZ);
+                    if (existing != CellType::EMPTY) { /* silently refuse */ }
+                    else {
                     CellType ct;
                     if (placeTool == 5)      ct = CellType::PARKING;
                     else if (placeTool == 6) ct = CellType::LAKE;
                     else if (placeTool == 7) ct = CellType::POWER_PLANT;
                     else if (placeTool == 8) {
-                        // Water pump requires adjacent lake
                         if (!city.HasAdjacentLake(hoverGX, hoverGZ)) {
-                            // Silently refuse — no lake nearby
-                            ct = CellType::EMPTY; // will be skipped
+                            ct = CellType::EMPTY;
                         } else {
                             ct = CellType::WATER_PUMP;
                         }
@@ -681,6 +1182,7 @@ public:
                     else if (placeTool == 9)  ct = CellType::POLICE;
                     else if (placeTool == 10) ct = CellType::FIRE_STATION;
                     else if (placeTool == 11) ct = CellType::HOSPITAL;
+                    else if (placeTool == 12) ct = CellType::BUS_DEPOT;
                     else
                         ct = static_cast<CellType>(placeTool + 1);
                     if (ct != CellType::EMPTY) {
@@ -691,6 +1193,8 @@ public:
                         if (ct == CellType::HOUSE)
                         {
                             houseHasSpawned[cellIdx] = false;
+                            // Give new house initial population; car sync will spawn cars
+                            city.AddHousePop(hoverGX, hoverGZ, 3);
                             if (TrySpawnFromHouse(hoverGX, hoverGZ))
                                 houseHasSpawned[cellIdx] = true;
                         }
@@ -700,11 +1204,14 @@ public:
                         }
                     }
                     }
+                    }
                 }
             }
             else if (hoverValid && lmbDown && placeTool >= 1 && placeTool <= 2)
             {
-                // Allow dragging for house/workplace placement
+                // Allow dragging for house/workplace placement — only on EMPTY cells
+                if (city.GetCellType(hoverGX, hoverGZ) != CellType::EMPTY) { /* skip */ }
+                else {
                 CellType ct = static_cast<CellType>(placeTool + 1);
                 bool placed = city.PlaceCell(hoverGX, hoverGZ, ct);
                 if (placed)
@@ -713,6 +1220,7 @@ public:
                     if (ct == CellType::HOUSE)
                     {
                         houseHasSpawned[cellIdx] = false;
+                        city.AddHousePop(hoverGX, hoverGZ, 3);
                         if (TrySpawnFromHouse(hoverGX, hoverGZ))
                             houseHasSpawned[cellIdx] = true;
                     }
@@ -720,6 +1228,25 @@ public:
                     {
                         TrySpawnAllUnspawnedHouses();
                     }
+                }
+                }
+            }
+
+            // Also support drag for destroy tool
+            if (hoverValid && lmbDown && placeTool == 13)
+            {
+                CellType existing = city.GetCellType(hoverGX, hoverGZ);
+                if (existing != CellType::EMPTY) {
+                    int cgx = hoverGX, cgz = hoverGZ;
+                    pendingPlacementActions_.push_back([this, cgx, cgz](){
+                        city.ClearCell(cgx, cgz);
+                        trafficLights.RebuildIntersections(city);
+                        city.BuildSidewalkLayer([&](int gx2, int gz2){ return trafficLights.IsIntersection(gx2, gz2); });
+                        const int ddx3[] = { 1,-1, 0, 0 };
+                        const int ddz3[] = { 0, 0, 1,-1 };
+                        for (int d = 0; d < 4; ++d)
+                            city.RebuildRoadCell(cgx + ddx3[d], cgz + ddz3[d]);
+                    });
                 }
             }
 
@@ -745,6 +1272,22 @@ public:
             pendingSaveName.clear();
             RefreshSaveList();
             savesMenuOpen = true;
+        }
+        // ---- Profiler overlay (F3) ----
+        if (wi::input::Press(wi::input::KEYBOARD_BUTTON_F3))
+        {
+            showProfiler = !showProfiler;
+            wi::profiler::SetEnabled(showProfiler);
+            if (showProfiler) {
+                profilerLogTimer_ = 0.0f;
+                profilerLogCount_ = 0;
+                // Write header
+                std::ofstream pf("profiler_log.txt", std::ios::trunc);
+                pf << "CrowdSim Profiler Log\n";
+                pf << "Interval: " << profilerLogInterval_ << "s\n";
+                pf << "=================================================\n\n";
+                pf.close();
+            }
         }
         // ---- Sidewalk debug layer (F8) ----
         if (wi::input::Press(wi::input::KEYBOARD_BUTTON_F8))
@@ -791,8 +1334,10 @@ public:
                         while (fs::exists("saves/save_" + std::to_string(num) + ".city")) num++;
                         std::string autoName = "save_" + std::to_string(num);
                         std::string path = "saves/" + autoName + ".city";
-                        if (city.SaveToFile(path.c_str()))
+                        if (city.SaveToFile(path.c_str())) {
+                            SaveBusRoutes("saves/" + autoName);
                             wi::backlog::post("[Save] Saved to " + path, wi::backlog::LogLevel::Default);
+                        }
                         RefreshSaveList();
                         savesMenuOpen = false;
                     }
@@ -810,8 +1355,10 @@ public:
                         {
                             // Overwrite this save
                             std::string path = "saves/" + saveFiles[si] + ".city";
-                            if (city.SaveToFile(path.c_str()))
+                            if (city.SaveToFile(path.c_str())) {
+                                SaveBusRoutes("saves/" + saveFiles[si]);
                                 wi::backlog::post("[Save] Overwrote " + path, wi::backlog::LogLevel::Default);
+                            }
                             savesMenuOpen = false;
                         }
                         else
@@ -839,15 +1386,36 @@ public:
         }
 
         // ---- Simulate cars + traffic lights + pedestrians + render ----
-        trafficLights.Update(dt * simSpeed);
-        trafficLights.UpdateVisuals();
+        {
+            ScopedCPUProfiling("TrafficLights");
+            trafficLights.Update(dt * simSpeed);
+            trafficLights.UpdateVisuals();
+        }
         auto carView = cars.GetCarView();
-        crowd.Update(dt * simSpeed, city, trafficLights, &carView);
+        {
+            ScopedCPUProfiling("CrowdSystem");
+            crowd.Update(dt * simSpeed, city, trafficLights, &carView);
+        }
         auto pedView = crowd.GetView();
-        cars.Update(dt * simSpeed, city, trafficLights, timeOfDay, dayDuration, &pedView);
+        {
+            ScopedCPUProfiling("CarSystem");
+            cars.Update(dt * simSpeed, city, trafficLights, timeOfDay, dayDuration, &pedView);
+        }
         townTreasury += cars.DrainTax();
-        cars.RenderCars(cam.Eye, city);
-        crowd.Render(cam.Eye);
+        {
+            ScopedCPUProfiling("CarSystem::Render");
+            cars.RenderCars(cam.Eye, city);
+        }
+        {
+            ScopedCPUProfiling("CrowdSystem::Render");
+            crowd.Render(cam.Eye);
+        }
+
+        // ---- Bus route updates (spawn/stop handling) ----
+        {
+            ScopedCPUProfiling("BusRoutes");
+            cars.UpdateBusRoutes(dt * simSpeed, city);
+        }
 
         // ---- Reproduction: houses grow population over time ----
         reproTimer_ += dt * simSpeed;
@@ -860,56 +1428,65 @@ public:
             {
                 if (city.GetCellType(gx, gz) != CellType::HOUSE) continue;
                 int pop = city.GetHousePop(gx, gz);
-                if (pop < 2) continue; // need at least 2 to reproduce
-                if (!city.HasFullServiceCoverage(gx, gz)) continue; // needs police, fire, hospital
-                // One new person born (cap at 50 per house)
+                if (pop < 2) continue;
+                if (!city.HasFullServiceCoverage(gx, gz)) continue;
                 if (pop >= 50) continue;
                 city.AddHousePop(gx, gz, 1);
                 city.UpdateHouseHeight(gx, gz);
-
-                // Spawn the new person with a job
-                TrySpawnOneWorker(gx, gz);
+                // Cars are spawned by the car-pop sync below, not here
             }
         }
 
-        // ---- Bus spawning: periodically add buses on roads ----
-        busTimer_ += dt * simSpeed;
-        if (busTimer_ >= BUS_INTERVAL)
+        // ---- Car-population sync: maintain 1 car per POP_PER_CAR people ----
+        carSyncTimer_ += dt * simSpeed;
+        if (carSyncTimer_ >= CAR_SYNC_INTERVAL)
         {
-            busTimer_ -= BUS_INTERVAL;
-            // Count current buses
-            int busCount = 0;
-            for (uint32_t bi = 0; bi < cars.GetCarCount(); ++bi)
-                if (cars.IsBus(bi)) ++busCount;
-            if (busCount < MAX_BUSES)
+            carSyncTimer_ -= CAR_SYNC_INTERVAL;
+            constexpr int GS = CityLayout::GRID_SIZE;
+
+            // Count total population and non-bus cars
+            int totalPop = 0;
+            uint32_t nonBusCars = 0;
+            for (int gz = 0; gz < GS; ++gz)
+            for (int gx = 0; gx < GS; ++gx)
+                if (city.GetCellType(gx, gz) == CellType::HOUSE)
+                    totalPop += city.GetHousePop(gx, gz);
+            for (uint32_t ci = 0; ci < cars.GetCarCount(); ++ci)
+                if (!cars.IsBus(ci)) ++nonBusCars;
+
+            int targetCars = totalPop / POP_PER_CAR;
+            int deficit = targetCars - (int)nonBusCars;
+
+            // Spawn up to 50 cars per sync tick to avoid stutter
+            int toSpawn = std::min(deficit, 50);
+            if (toSpawn > 0)
             {
-                constexpr int GS = CityLayout::GRID_SIZE;
-                // Collect road cells
-                std::vector<int> roadCells;
-                for (int c = 0; c < GS * GS; ++c)
-                    if (city.GetCellType(c % GS, c / GS) == CellType::ROAD)
-                        roadCells.push_back(c);
-                if (roadCells.size() >= 2)
+                // Build list of houses with pop > 0
+                struct HouseInfo { int gx, gz, pop; };
+                std::vector<HouseInfo> houses;
+                for (int gz = 0; gz < GS; ++gz)
+                for (int gx = 0; gx < GS; ++gx)
+                    if (city.GetCellType(gx, gz) == CellType::HOUSE && city.GetHousePop(gx, gz) > 0)
+                        houses.push_back({gx, gz, city.GetHousePop(gx, gz)});
+
+                if (!houses.empty())
                 {
-                    // Pick two distinct random road cells
-                    busRng_ ^= busRng_ << 13; busRng_ ^= busRng_ >> 17; busRng_ ^= busRng_ << 5;
-                    int srcIdx = (int)(busRng_ % (uint32_t)roadCells.size());
-                    busRng_ ^= busRng_ << 13; busRng_ ^= busRng_ >> 17; busRng_ ^= busRng_ << 5;
-                    int dstIdx = (int)(busRng_ % (uint32_t)roadCells.size());
-                    if (srcIdx != dstIdx)
+                    // Weighted random selection by population
+                    uint32_t rng = (uint32_t)(totalPop * 2654435761u + nonBusCars * 31u);
+                    for (int s = 0; s < toSpawn; ++s)
                     {
-                        int sx = roadCells[srcIdx] % GS, sz = roadCells[srcIdx] / GS;
-                        int dx = roadCells[dstIdx] % GS, dz = roadCells[dstIdx] / GS;
-                        auto path = city.FindPathRoad(sx, sz, dx, dz);
-                        if ((int)path.size() >= 2)
-                            cars.SpawnBus(path, busRng_);
+                        rng = rng * 1664525u + 1013904223u;
+                        int idx = (int)(rng % houses.size());
+                        TrySpawnOneWorker(houses[idx].gx, houses[idx].gz);
                     }
                 }
             }
         }
 
-        // ---- Agent / car picking (LMB click, not in build mode, not RMB look) ----
-        if (!buildModeEnabled &&
+        // (Random bus spawning removed — only route-based buses now)
+
+        // ---- Agent / car picking (LMB click, not in build mode, not RMB look, not creating bus line) ----
+        if (!buildModeEnabled && !lineCreationMode && !depotMenuOpen && !lineClickConsumed &&
             wi::input::Press(wi::input::MOUSE_BUTTON_LEFT) &&
             !wi::input::Down(wi::input::MOUSE_BUTTON_RIGHT))
         {
@@ -983,6 +1560,12 @@ public:
                         int gx3, gz3;
                         if (city.WorldToGrid(hx3, hz3, gx3, gz3)) {
                             auto ct3 = city.GetCellType(gx3, gz3);
+                            // Click on bus depot in normal mode -> open depot menu
+                            if (ct3 == CellType::BUS_DEPOT) {
+                                depotMenuOpen = true;
+                                depotMenuGX = gx3; depotMenuGZ = gz3;
+                                inspectGX = inspectGZ = -1;
+                            } else {
                             bool isIntersection = (ct3 == CellType::ROAD || ct3 == CellType::CROSSWALK)
                                                   && trafficLights.IsIntersection(gx3, gz3);
                             if (isIntersection || (ct3 != CellType::EMPTY && ct3 != CellType::ROAD && ct3 != CellType::CROSSWALK)) {
@@ -990,6 +1573,7 @@ public:
                                 inspectGZ = gz3;
                             } else {
                                 inspectGX = inspectGZ = -1;
+                            }
                             }
                         } else {
                             inspectGX = inspectGZ = -1;
@@ -1202,6 +1786,48 @@ public:
 
         if (dt > 1e-6f)
             displayFPS = displayFPS * 0.9f + (1.0f / dt) * 0.1f;
+
+        // ---- Profiler frame-time logging ----
+        if (showProfiler)
+        {
+            float frameMs = dt * 1000.0f;
+            profFrameTimes_[profFrameIdx_ % 120] = frameMs;
+            profFrameIdx_++;
+
+            profilerLogTimer_ += dt;
+            if (profilerLogTimer_ >= profilerLogInterval_)
+            {
+                profilerLogTimer_ -= profilerLogInterval_;
+                profilerLogCount_++;
+
+                // Compute stats over recent frames
+                int count = std::min(profFrameIdx_, 120);
+                float sumMs = 0, minMs = 9999, maxMs = 0;
+                for (int i = 0; i < count; i++) {
+                    float t = profFrameTimes_[i];
+                    sumMs += t;
+                    if (t < minMs) minMs = t;
+                    if (t > maxMs) maxMs = t;
+                }
+                float avgMs = (count > 0) ? sumMs / count : 0;
+                float avgFps = (avgMs > 0.001f) ? 1000.0f / avgMs : 0;
+
+                std::ofstream pf("profiler_log.txt", std::ios::app);
+                pf << "=== Snapshot #" << profilerLogCount_ << " ===\n";
+                pf << "FPS (avg/min/max): " << std::fixed << std::setprecision(1)
+                   << avgFps << " / " << (minMs > 0.001f ? 1000.0f/maxMs : 0)
+                   << " / " << (minMs > 0.001f ? 1000.0f/minMs : 0) << "\n";
+                pf << "Frame time (avg/min/max): " << std::setprecision(2)
+                   << avgMs << " / " << minMs << " / " << maxMs << " ms\n";
+                pf << "Cars: " << cars.GetCarCount()
+                   << "  Peds: " << crowd.GetPedCount()
+                   << "  Sim speed: " << simSpeed << "x\n";
+                pf << "\n--- Wicked Engine Profiler (CPU + GPU per-process) ---\n";
+                pf << cachedProfilerText_;
+                pf << "\n";
+                pf.close();
+            }
+        }
     }
 
     // -- Build helpers --
@@ -1221,13 +1847,15 @@ public:
                 int workers = 0;
                 int toSpawn = ((int)path.size() > CAR_HOP_THRESHOLD) ? 3 : 5;
                 uint32_t seed = (uint32_t)(hGX * 37 + hGZ * 19 + wx * 7 + wz * 3);
+                int pathLanes = city.GetRoadLanes(
+                    (int)std::floor((path[0].x + CityLayout::HALF_WORLD) / CityLayout::CELL_SIZE),
+                    (int)std::floor((path[0].y + CityLayout::HALF_WORLD) / CityLayout::CELL_SIZE));
                 for (int c = 0; c < toSpawn; ++c) {
-                    if (cars.SpawnCar(path, seed + (uint32_t)c) != UINT32_MAX)
+                    if (cars.SpawnCar(path, seed + (uint32_t)c, pathLanes) != UINT32_MAX)
                         ++workers;
                 }
                 if (workers == 0) continue;
                 city.AddWorkers(wx, wz, workers);
-                city.AddHousePop(hGX, hGZ, workers);
 
                 // Spawn pedestrians (2 per house-workplace pair)
                 for (int p = 0; p < 2; ++p)
@@ -1253,10 +1881,85 @@ public:
 
             {
                 uint32_t seed = (uint32_t)(hGX * 37 + hGZ * 19 + wx * 7 + wz * 3 + city.GetHousePop(hGX, hGZ));
-                if (cars.SpawnCar(path, seed) == UINT32_MAX) continue;
+                int pathLanes2 = city.GetRoadLanes(
+                    (int)std::floor((path[0].x + CityLayout::HALF_WORLD) / CityLayout::CELL_SIZE),
+                    (int)std::floor((path[0].y + CityLayout::HALF_WORLD) / CityLayout::CELL_SIZE));
+                if (cars.SpawnCar(path, seed, pathLanes2) == UINT32_MAX) continue;
             }
             city.AddWorkers(wx, wz, 1);
             return;
+        }
+    }
+
+    // Place a bus stop sign on the sidewalk of a road cell (no cell type change)
+    // side: 0=E, 1=W, 2=S, 3=N.  -1 = auto-detect first visible sidewalk.
+    void PlaceBusStopSign(int gx, int gz, int side = -1)
+    {
+        XMFLOAT2 c = city.GridCellCenter(gx, gz);
+        auto& s = wi::scene::GetScene();
+        constexpr float CELL_SIZE = CityLayout::CELL_SIZE;
+        constexpr float SIDEWALK_W = CityLayout::SIDEWALK_W;
+        constexpr float h = CELL_SIZE * 0.5f;
+
+        // Find a visible sidewalk side (not connected to another road)
+        auto isRoadLike = [&](int cx, int cz) {
+            auto t = city.GetCellType(cx, cz);
+            return t == CellType::ROAD || t == CellType::CROSSWALK;
+        };
+        const bool connected[4] = {
+            isRoadLike(gx+1, gz),  // E
+            isRoadLike(gx-1, gz),  // W
+            isRoadLike(gx, gz+1),  // S
+            isRoadLike(gx, gz-1),  // N
+        };
+
+        if (side < 0 || side > 3) {
+            // Auto-detect: pick first non-connected side
+            side = 0;
+            for (int d = 0; d < 4; ++d) { if (!connected[d]) { side = d; break; } }
+        }
+        // If the chosen side is connected (no sidewalk), fall back to first visible
+        if (connected[side]) {
+            for (int d = 0; d < 4; ++d) { if (!connected[d]) { side = d; break; } }
+        }
+
+        const float swCenter = h - SIDEWALK_W * 0.5f; // 9.0m from center
+        float signX = c.x, signZ = c.y;
+        switch (side) {
+            case 0: signX = c.x + swCenter; break; // E
+            case 1: signX = c.x - swCenter; break; // W
+            case 2: signZ = c.y + swCenter; break; // S
+            case 3: signZ = c.y - swCenter; break; // N
+        }
+        float poleH = 3.5f;
+        // Pole
+        {
+            auto e = s.Entity_CreateCube("busstop_pole");
+            auto* tr = s.transforms.GetComponent(e);
+            if (tr) {
+                tr->Scale(XMFLOAT3(0.08f, poleH * 0.5f, 0.08f));
+                tr->Translate(XMFLOAT3(signX, poleH * 0.5f, signZ));
+                tr->UpdateTransform();
+            }
+            auto* mat = s.materials.GetComponent(e);
+            if (mat) mat->SetBaseColor(XMFLOAT4(0.40f, 0.40f, 0.45f, 1.0f));
+            busStopSignEntities_.push_back(e);
+        }
+        // Sign board
+        {
+            auto e = s.Entity_CreateCube("busstop_sign");
+            auto* tr = s.transforms.GetComponent(e);
+            if (tr) {
+                tr->Scale(XMFLOAT3(0.40f, 0.30f, 0.05f));
+                tr->Translate(XMFLOAT3(signX, poleH, signZ));
+                tr->UpdateTransform();
+            }
+            auto* mat = s.materials.GetComponent(e);
+            if (mat) {
+                mat->SetBaseColor(XMFLOAT4(0.10f, 0.60f, 0.90f, 1.0f));
+                mat->SetEmissiveColor(XMFLOAT4(0.10f, 0.60f, 0.90f, 1.5f));
+            }
+            busStopSignEntities_.push_back(e);
         }
     }
 
@@ -1542,12 +2245,34 @@ public:
     {
         wi::RenderPath3D::Compose(cmd);
 
+        // Capture detailed profiler text here — GPU sub-ranges are only live during Compose
+        if (showProfiler)
+            cachedProfilerText_ = wi::profiler::GetProfilingText();
+
         const uint32_t threads  = wi::jobsystem::GetThreadCount();
+
+        // Compute city stats
+        int totalPop = 0, totalWorkers = 0, totalWorkCap = 0;
+        int houseCount = 0, workCount = 0;
+        for (int zz = 0; zz < CityLayout::GRID_SIZE; ++zz)
+        for (int xx = 0; xx < CityLayout::GRID_SIZE; ++xx) {
+            auto ct = city.GetCellType(xx, zz);
+            if (ct == CellType::HOUSE) {
+                totalPop += city.GetHousePop(xx, zz);
+                houseCount++;
+            } else if (ct == CellType::WORKPLACE) {
+                totalWorkers += city.GetWorkCount(xx, zz);
+                totalWorkCap += city.GetWorkCap(xx, zz);
+                workCount++;
+            }
+        }
 
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(1)
             << "FPS          : " << displayFPS << "\n"
             << "CPU Threads  : " << threads    << "\n"
+            << "Population   : " << totalPop << " (" << houseCount << " houses)\n"
+            << "Workers      : " << totalWorkers << " / " << totalWorkCap << " (" << workCount << " workplaces)\n"
             << "Car drivers  : " << cars.GetCarCount() << "\n"
             << "Pedestrians  : " << crowd.GetPedCount()
                << " (walk:" << crowd.GetWalkingCount() << " wait:" << crowd.GetWaitingCount() << ")\n"
@@ -1561,6 +2286,7 @@ public:
             << "[Shift]       Sprint\n"
             << "[Scroll]      Speed: " << static_cast<int>(moveSpeed) << " u/s\n"
             << "[B]           Build Mode: " << (buildModeEnabled ? "ON" : "OFF") << "\n"
+            << "[F3]          Profiler: " << (showProfiler ? "ON (logging)" : "OFF") << "\n"
             << "[F5]          Save  |  [F9] Load / Saves Menu\n"
             << "[F8]          Sidewalk Debug: " << (showSidewalkDebug ? "ON" : "OFF");
         if (showSidewalkDebug && swDebugClickActive)
@@ -1590,7 +2316,7 @@ public:
             const float btnStart = 145.0f*S;
             const float btnStep  = 55.0f*S;
             struct BtnDef { const char* label; XMFLOAT4 col; };
-            BtnDef btns[12] = {
+            BtnDef btns[14] = {
                 { "  Road",         {0.40f,0.40f,1.00f,1.0f} },
                 { "  House",        {1.00f,0.50f,0.10f,1.0f} },
                 { "  Workplace",    {0.20f,0.55f,1.00f,1.0f} },
@@ -1603,6 +2329,8 @@ public:
                 { "  Police",       {0.15f,0.20f,0.55f,1.0f} },
                 { "  Fire Station", {0.75f,0.15f,0.10f,1.0f} },
                 { "  Hospital",     {0.90f,0.90f,0.95f,1.0f} },
+                { "  Bus Depot",    {0.75f,0.60f,0.15f,1.0f} },
+                { "  Destroy",      {0.90f,0.15f,0.15f,1.0f} },
             };
 
             // Panel title
@@ -1613,7 +2341,7 @@ public:
             title.color = wi::Color(220, 220, 220, 230);
             wi::font::Draw("BUILD TOOLS", title, cmd);
 
-            for (int k = 0; k < 12; ++k)
+            for (int k = 0; k < 14; ++k)
             {
                 bool sel = (placeTool == k);
                 float by = btnStart + k * btnStep;
@@ -1655,7 +2383,7 @@ public:
             // Hover cell info below buttons
             wi::font::Params hfp;
             hfp.posX  = px;
-            hfp.posY  = btnStart + 12 * btnStep + 10.0f*S;
+            hfp.posY  = btnStart + 14 * btnStep + 10.0f*S;
             hfp.size  = (int)(18*S);
             hfp.color = wi::Color(180, 180, 180, 180);
             if (hoverValid)
@@ -1671,10 +2399,236 @@ public:
             {
                 wi::font::Draw("Hover over world", hfp, cmd);
             }
+
         }
         else
         {
             oss << "\n[1-6]         Sim speed: " << simSpeed << "x";
+        }
+
+        // ---- Depot menu overlay (right side, works in any mode) ----
+        {
+            const float S = uiScale();
+            if (depotMenuOpen && !lineCreationMode)
+            {
+                const float mW = 280.0f * S;
+                const float mX = (float)this->width - mW - 10.0f * S;
+                const float mY = 200.0f * S;
+
+                // Collect lines for this depot
+                std::vector<int> depotLineIndices;
+                for (int ri = 0; ri < (int)cars.busRoutes_.size(); ++ri) {
+                    auto& r = cars.busRoutes_[ri];
+                    if ((r.depotA_gx == depotMenuGX && r.depotA_gz == depotMenuGZ) ||
+                        (r.depotB_gx == depotMenuGX && r.depotB_gz == depotMenuGZ))
+                        depotLineIndices.push_back(ri);
+                }
+
+                float totalH = 80.0f*S + (float)depotLineIndices.size() * 35.0f*S + 50.0f*S;
+                // Background
+                wi::image::Params mbg;
+                mbg.pos = XMFLOAT3(mX, mY, 0.f);
+                mbg.siz = XMFLOAT2(mW, totalH);
+                mbg.color = XMFLOAT4(0.06f, 0.06f, 0.10f, 0.92f);
+                wi::image::Draw(nullptr, mbg, cmd);
+
+                // Title
+                wi::font::Params mt;
+                mt.posX = mX + 10.0f*S; mt.posY = mY + 8.0f*S;
+                mt.size = (int)(22*S);
+                mt.color = wi::Color(255, 220, 50, 255);
+                wi::font::Draw("BUS DEPOT", mt, cmd);
+
+                wi::font::Params ms;
+                ms.posX = mX + 10.0f*S; ms.posY = mY + 36.0f*S;
+                ms.size = (int)(16*S);
+                ms.color = wi::Color(180, 180, 180, 220);
+                std::ostringstream ds;
+                ds << "Cell (" << depotMenuGX << ", " << depotMenuGZ << ")";
+                wi::font::Draw(ds.str(), ms, cmd);
+
+                // Existing lines
+                float lineY = mY + 60.0f*S;
+                XMFLOAT4 dptr = wi::input::GetPointer();
+                for (int ri : depotLineIndices) {
+                    auto& r = cars.busRoutes_[ri];
+                    wi::font::Params lp;
+                    lp.posX = mX + 15.0f*S; lp.posY = lineY + 6.0f*S;
+                    lp.size = (int)(18*S);
+                    lp.color = wi::Color(200, 200, 100, 255);
+                    std::ostringstream ls;
+                    ls << "Line " << r.lineNumber << " - " << r.stops.size() << " stops";
+                    if (r.circular) ls << " (circ)";
+                    if (r.active) ls << " [ON]";
+                    wi::font::Draw(ls.str(), lp, cmd);
+
+                    // Delete button [X] at right end of line entry
+                    float delX = mX + mW - 40.0f*S;
+                    float delW = 30.0f*S, delH = 24.0f*S;
+                    float delY = lineY + 4.0f*S;
+                    wi::image::Params dbg;
+                    dbg.pos = XMFLOAT3(delX, delY, 0.f);
+                    dbg.siz = XMFLOAT2(delW, delH);
+                    dbg.color = XMFLOAT4(0.70f, 0.10f, 0.10f, 0.85f);
+                    wi::image::Draw(nullptr, dbg, cmd);
+                    wi::font::Params df;
+                    df.posX = delX + 6.0f*S; df.posY = delY + 2.0f*S;
+                    df.size = (int)(16*S);
+                    df.color = wi::Color(255, 255, 255, 255);
+                    wi::font::Draw("X", df, cmd);
+
+                    if (wi::input::Press(wi::input::MOUSE_BUTTON_LEFT)) {
+                        if (dptr.x >= delX && dptr.x <= delX + delW &&
+                            dptr.y >= delY && dptr.y <= delY + delH)
+                        {
+                            pendingRouteDelete = ri;
+                        }
+                    }
+
+                    lineY += 35.0f*S;
+                }
+
+                // "Add Line" button
+                float addBtnY = lineY + 10.0f*S;
+                wi::image::Params abg;
+                abg.pos = XMFLOAT3(mX + 10.0f*S, addBtnY, 0.f);
+                abg.siz = XMFLOAT2(mW - 20.0f*S, 36.0f*S);
+                abg.color = XMFLOAT4(0.15f, 0.50f, 0.20f, 0.90f);
+                wi::image::Draw(nullptr, abg, cmd);
+                wi::font::Params abf;
+                abf.posX = mX + 20.0f*S; abf.posY = addBtnY + 8.0f*S;
+                abf.size = (int)(20*S);
+                abf.color = wi::Color(255, 255, 255, 255);
+                // Determine next available line number
+                int nextNum = 1;
+                for (auto& r : cars.busRoutes_) {
+                    if (r.lineNumber >= nextNum) nextNum = r.lineNumber + 1;
+                }
+                std::ostringstream abl;
+                abl << "+ Add Line " << nextNum;
+                wi::font::Draw(abl.str(), abf, cmd);
+
+                // Handle "Add Line" button click
+                if (wi::input::Press(wi::input::MOUSE_BUTTON_LEFT)) {
+                    if (dptr.x >= mX + 10.0f*S && dptr.x <= mX + mW - 10.0f*S &&
+                        dptr.y >= addBtnY && dptr.y <= addBtnY + 36.0f*S)
+                    {
+                        lineCreationMode = true;
+                        lineCreationLeg = 0;
+                        newLineNumber = nextNum;
+                        lineCreationDepotGX = depotMenuGX;
+                        lineCreationDepotGZ = depotMenuGZ;
+                        lineStops.clear();
+                        lineStopsLeg1.clear();
+                        linePreviewPaths.clear();
+                        linePreviewPathsLeg1.clear();
+                        depotMenuOpen = false;
+                    }
+                }
+
+                // Close hint
+                wi::font::Params ch;
+                ch.posX = mX + 10.0f*S; ch.posY = addBtnY + 45.0f*S;
+                ch.size = (int)(14*S);
+                ch.color = wi::Color(140, 140, 140, 180);
+                wi::font::Draw("ESC to close", ch, cmd);
+            }
+
+            // ---- Line creation mode overlay ----
+            if (lineCreationMode)
+            {
+                wi::font::Params rp;
+                rp.posX = 10.0f * S;
+                rp.posY = (float)this->height - 220.0f * S;
+                rp.size = (int)(22 * S);
+                rp.color = wi::Color(255, 220, 50, 255);
+                std::ostringstream rs;
+                rs << "CREATING LINE " << newLineNumber;
+                if (lineCreationLeg == 0)
+                    rs << "  [Outbound]\n";
+                else
+                    rs << "  [Return]\n";
+                rs << "Depot: (" << lineCreationDepotGX << ", " << lineCreationDepotGZ << ")\n";
+                if (!lineStopsLeg1.empty()) {
+                    rs << "Outbound stops: " << lineStopsLeg1.size() << "\n";
+                }
+                rs << "Stops placed: " << lineStops.size() << "\n";
+                for (size_t si = 0; si < lineStops.size(); ++si)
+                    rs << "  " << (si+1) << ". (" << lineStops[si].first << "," << lineStops[si].second << ")\n";
+                rs << "\nClick ROAD to add stop\n";
+                if (lineCreationLeg == 0)
+                    rs << "Click DEPOT = finish outbound leg\n";
+                else
+                    rs << "Click DEPOT = finish route\n";
+                rs << "Click other DEPOT = point-to-point\n";
+                rs << "RMB/ESC to cancel";
+                wi::font::Draw(rs.str(), rp, cmd);
+
+                // Draw leg 1 preview paths (muted) during leg 2
+                for (auto& seg : linePreviewPathsLeg1) {
+                    for (size_t j = 0; j + 1 < seg.size(); ++j) {
+                        wi::renderer::RenderablePoint p0, p1;
+                        p0.position = XMFLOAT3(seg[j].x, 1.5f, seg[j].y);
+                        p0.color = XMFLOAT4(0.50f, 0.45f, 0.10f, 0.6f);
+                        p0.size = 0.12f;
+                        p1.position = XMFLOAT3(seg[j+1].x, 1.5f, seg[j+1].y);
+                        p1.color = XMFLOAT4(0.50f, 0.45f, 0.10f, 0.6f);
+                        p1.size = 0.12f;
+                        wi::renderer::DrawPoint(p0);
+                        wi::renderer::DrawPoint(p1);
+                    }
+                }
+                // Draw current leg preview paths
+                for (auto& seg : linePreviewPaths) {
+                    for (size_t j = 0; j + 1 < seg.size(); ++j) {
+                        wi::renderer::RenderablePoint p0, p1;
+                        p0.position = XMFLOAT3(seg[j].x, 1.5f, seg[j].y);
+                        p0.color = XMFLOAT4(0.95f, 0.80f, 0.10f, 1.0f);
+                        p0.size = 0.15f;
+                        p1.position = XMFLOAT3(seg[j+1].x, 1.5f, seg[j+1].y);
+                        p1.color = XMFLOAT4(0.95f, 0.80f, 0.10f, 1.0f);
+                        p1.size = 0.15f;
+                        wi::renderer::DrawPoint(p0);
+                        wi::renderer::DrawPoint(p1);
+                    }
+                }
+                // Also draw dots at stop locations (leg 1 muted + current leg)
+                for (auto& [sgx, sgz] : lineStopsLeg1) {
+                    XMFLOAT2 cc = city.GridCellCenter(sgx, sgz);
+                    wi::renderer::RenderablePoint sp;
+                    sp.position = XMFLOAT3(cc.x, 3.0f, cc.y);
+                    sp.color = XMFLOAT4(0.10f, 0.35f, 0.55f, 0.6f);
+                    sp.size = 0.4f;
+                    wi::renderer::DrawPoint(sp);
+                }
+                for (auto& [sgx, sgz] : lineStops) {
+                    XMFLOAT2 cc = city.GridCellCenter(sgx, sgz);
+                    wi::renderer::RenderablePoint sp;
+                    sp.position = XMFLOAT3(cc.x, 3.0f, cc.y);
+                    sp.color = XMFLOAT4(0.10f, 0.60f, 0.95f, 1.0f);
+                    sp.size = 0.5f;
+                    wi::renderer::DrawPoint(sp);
+                }
+            }
+
+            // Active bus lines info bar
+            if (!cars.busRoutes_.empty())
+            {
+                wi::font::Params bp;
+                bp.posX = 10.0f * S;
+                bp.posY = (float)this->height - 50.0f * S;
+                bp.size = (int)(16 * S);
+                bp.color = wi::Color(200, 200, 100, 200);
+                std::ostringstream bs;
+                bs << "Bus Lines: ";
+                for (size_t ri = 0; ri < cars.busRoutes_.size(); ++ri) {
+                    auto& r = cars.busRoutes_[ri];
+                    if (ri > 0) bs << " | ";
+                    bs << "#" << r.lineNumber << " (" << r.stops.size() << " stops)";
+                    if (r.circular) bs << " circ";
+                }
+                wi::font::Draw(bs.str(), bp, cmd);
+            }
         }
 
         // ---- Shadow cascade slider panel (bottom-left, always visible) ----
@@ -1748,14 +2702,29 @@ public:
             uint8_t wpCount = cars.GetWpCount(ci);
 
             std::ostringstream sel;
-            sel << std::fixed << std::setprecision(1)
-                << "\n\n┌────── CAR " << ci << " ──────┐\n"
-                << "| State:    " << CarSystem::StateStr(st) << "\n"
-                << "| Dir:      " << (cars.GetCarDir(ci) == 0 ? "To work" : "To home") << "\n"
+            sel << std::fixed << std::setprecision(1);
+            if (cars.IsBus(ci)) {
+                int8_t bri = cars.GetBusRouteIdx(ci);
+                sel << "\n\n┌────── BUS " << ci << " ──────┐\n"
+                    << "| Passengers: " << (int)cars.GetBusPassengers(ci) << " / 40\n"
+                    << "| Route:     ";
+                if (bri >= 0 && bri < (int)cars.busRoutes_.size())
+                    sel << "Line " << cars.busRoutes_[bri].lineNumber;
+                else
+                    sel << "None";
+                sel << "\n"
+                    << "| Direction: " << (cars.GetBusDirection(ci) == 0 ? "Outbound" : "Return") << "\n"
+                    << "| Next Stop: " << (int)cars.GetBusNextStop(ci) << "\n"
+                    << "| At Stop:   " << (cars.IsBusAtStop(ci) ? "YES" : "no") << "\n";
+            } else {
+                sel << "\n\n┌────── CAR " << ci << " ──────┐\n"
+                    << "| Dir:      " << (cars.GetCarDir(ci) == 0 ? "To work" : "To home") << "\n"
+                    << "| Savings:  $" << std::setprecision(0) << cars.GetMoney(ci) << "\n";
+            }
+            sel << "| State:    " << CarSystem::StateStr(st) << "\n"
                 << "| Speed:    " << spd << " m/s (" << std::setprecision(0) << (spd * 3.6f) << " km/h)\n"
                 << "| Waypoint: " << (int)wpCurr << "/" << (int)wpCount << "\n"
-                << "| Lane:     " << std::setprecision(1) << cars.GetLaneOff(ci) << "\n"
-                << "| Savings:  $" << std::setprecision(0) << cars.GetMoney(ci) << "\n";
+                << "| Lane:     " << std::setprecision(1) << cars.GetLaneOff(ci) << "\n";
 
             // Debug: show traffic light status for next intersection
             if (st == CarSystem::State::DRIVING && wpCurr < wpCount)

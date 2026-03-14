@@ -10,6 +10,24 @@ struct PedestrianView;
 struct CarView;
 
 // ============================================================
+//  BusRoute — defines a route between two depots with stops
+// ============================================================
+struct BusRoute {
+    int lineNumber = 0;                  // bus line number (user-assigned)
+    int depotA_gx = 0, depotA_gz = 0;   // origin depot
+    int depotB_gx = 0, depotB_gz = 0;   // destination depot (same as A for circular)
+    bool circular = false;               // true = loop back to same depot
+    struct Stop { int gx = 0, gz = 0; char name[32] = {}; };
+    std::vector<Stop> stops;             // ordered stops A→B (outbound)
+    std::vector<Stop> stopsBA;           // ordered stops B→A (return, circular only)
+    std::vector<XMFLOAT2> fullPathAB;   // precomputed waypoints A→B
+    std::vector<XMFLOAT2> fullPathBA;   // precomputed waypoints B→A
+    std::vector<int> stopWpIdxAB;       // waypoint index for each stop (A→B path)
+    std::vector<int> stopWpIdxBA;       // waypoint index for each stop (B→A path, reversed order)
+    bool active = false;
+};
+
+// ============================================================
 //  CarSystem  –  city traffic simulation
 //
 //  Roads are 20 m wide (CELL_SIZE).  Right-hand drive.
@@ -22,9 +40,9 @@ struct CarView;
 class CarSystem
 {
 public:
-    static constexpr uint32_t MAX_CARS     = 2'000;
+    static constexpr uint32_t MAX_CARS     = 10'000;
     static constexpr uint8_t  MAX_WP       = 64;
-    static constexpr uint32_t MAX_VISIBLE  = 1'500;
+    static constexpr uint32_t MAX_VISIBLE  = 5'000;
 
     // Physics
     static constexpr float MAX_SPEED   = 14.0f;   // m/s ≈ 50 km/h
@@ -33,7 +51,7 @@ public:
 
     // Geometry – variable lanes (2, 4 or 6 per cell)
     static constexpr float PARK_PAUSE  =  2.0f;   // s idle at destination
-    static constexpr float CAR_HW      =  0.50f;  // half-width  (~1.0 m)
+    static constexpr float CAR_HW      =  0.45f;  // half-width  (~0.9 m)
     static constexpr float CAR_HH      =  0.35f;  // half-height (~0.7 m)
     static constexpr float CAR_HL      =  1.00f;  // half-length (~2.0 m)
     static constexpr float BUS_HL      =  3.00f;  // half-length (~6.0 m)
@@ -63,13 +81,14 @@ public:
     static constexpr float TAX_RATE    =  0.10f;
 
     // Schedule
-    static constexpr float JOYRIDE_CHANCE = 0.03f;  // 3% chance per parked-at-home cycle
+    static constexpr float JOYRIDE_CHANCE = 0.15f;  // 15% chance per parked-at-home cycle
+    static constexpr float WANDER_HOME_CHANCE = 0.30f; // 30% chance wanderer goes home after stop
 
     enum class State : uint8_t { PARKED, DRIVING, ENTERING_PARKING, EXITING_PARKING };
 
     void     Initialize();
     // Returns car slot, or UINT32_MAX if at capacity / bad path
-    uint32_t SpawnCar(const std::vector<XMFLOAT2>& roadPath, uint32_t colorSeed);
+    uint32_t SpawnCar(const std::vector<XMFLOAT2>& roadPath, uint32_t colorSeed, int spawnLanes = 6);
     // Spawn a bus on a random loop through the city
     uint32_t SpawnBus(const std::vector<XMFLOAT2>& roadPath, uint32_t seed);
     void     Update(float dt, CityLayout& city, const TrafficLightSystem& lights,
@@ -88,6 +107,17 @@ public:
 
     bool IsBus(uint32_t i) const { return i < isBus_.size() && isBus_[i]; }
     float GetHalfLen(uint32_t i) const { return i < halfLen_.size() ? halfLen_[i] : CAR_HL; }
+
+    // Bus route system
+    std::vector<BusRoute> busRoutes_;
+    uint32_t SpawnRouteBus(int routeIdx, CityLayout& city, int direction = 0);
+    void     UpdateBusRoutes(float dt, CityLayout& city);
+    int8_t   GetBusRouteIdx(uint32_t i) const { return i < busRouteIdx_.size() ? busRouteIdx_[i] : -1; }
+    int8_t   GetBusDirection(uint32_t i) const { return i < busDirection_.size() ? busDirection_[i] : 0; }
+    uint8_t  GetBusPassengers(uint32_t i) const { return i < busPassengers_.size() ? busPassengers_[i] : 0; }
+    bool     IsBusAtStop(uint32_t i) const { return i < busStopTimer_.size() && busStopTimer_[i] > 0.f; }
+    int8_t   GetBusNextStop(uint32_t i) const { return i < busNextStop_.size() ? busNextStop_[i] : -1; }
+    void     SetBusRouteIdx(uint32_t i, int8_t val) { if (i < busRouteIdx_.size()) busRouteIdx_[i] = val; }
 
     // For click-on-car inspection
     State    GetState(uint32_t i)   const { return i < state_.size() ? state_[i] : State::PARKED; }
@@ -147,6 +177,13 @@ private:
     std::vector<float>   halfLen_;         // per-vehicle half-length
     std::vector<bool>    isBus_;           // true for buses
 
+    // Per-bus route data (-1 = legacy random bus)
+    std::vector<int8_t>  busRouteIdx_;     // which route this bus follows
+    std::vector<int8_t>  busDirection_;    // 0 = A→B, 1 = B→A
+    std::vector<int8_t>  busNextStop_;     // next stop index to visit
+    std::vector<float>   busStopTimer_;    // countdown timer at stops (seconds)
+    std::vector<uint8_t> busPassengers_;   // current passenger count
+
     // Economy
     std::vector<float>   wage_;           // $/game-sec when returning from work
     std::vector<float>   money_;
@@ -157,6 +194,7 @@ private:
     std::vector<uint8_t>  wpCount_;
     std::vector<uint8_t>  wpCurr_;
     std::vector<uint8_t>  carDir_;   // 0 = to work, 1 = to home
+    std::vector<bool>     wandering_; // true = car is wandering (random destination)
     std::vector<float>    laneOff_;  // current lane offset from centreline
     std::vector<float>    laneTarget_; // target lane for smooth transitions
     std::vector<int8_t>   laneIdx_;    // lane index (0=inner, N-1=outer)

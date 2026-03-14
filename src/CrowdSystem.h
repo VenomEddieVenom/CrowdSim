@@ -53,7 +53,7 @@ public:
     static constexpr float SIDEWALK_INNER   = CityLayout::CELL_SIZE * 0.5f - SIDEWALK_W; // 8.0 m
     static constexpr float SIDEWALK_MID     = SIDEWALK_INNER + SIDEWALK_W * 0.5f;        // 9.0 m
 
-    enum class State : uint8_t { IDLE = 0, WALKING = 1, WAITING_CROSS = 2 };
+    enum class State : uint8_t { IDLE = 0, WALKING = 1, WAITING_CROSS = 2, ON_BUS = 3 };
 
     void     Initialize();
     uint32_t SpawnPed(int homeGX, int homeGZ, int workGX, int workGZ,
@@ -79,6 +79,11 @@ private:
     std::vector<float>    heading_;
     std::vector<State>    state_;
     std::vector<uint8_t>  dir_;           // 0=to work, 1=to home
+
+    // Bus riding data (valid when state == ON_BUS)
+    std::vector<uint32_t> ridingBusIdx_;  // which bus this ped is on (UINT32_MAX = none)
+    std::vector<int>      exitStopGX_;    // grid cell where ped wants to exit
+    std::vector<int>      exitStopGZ_;
 
     // Waypoints per ped
     std::vector<std::vector<XMFLOAT2>> wpBuf_;

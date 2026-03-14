@@ -27,6 +27,9 @@ void CrowdSystem::Initialize()
     heading_.resize(MAX_PEDS, 0.f);
     state_.resize(MAX_PEDS, State::IDLE);
     dir_.resize(MAX_PEDS, 0);
+    ridingBusIdx_.resize(MAX_PEDS, UINT32_MAX);
+    exitStopGX_.resize(MAX_PEDS, -1);
+    exitStopGZ_.resize(MAX_PEDS, -1);
     wpBuf_.resize(MAX_PEDS);
     wpCurr_.resize(MAX_PEDS, 0);
     cellHead_.assign(GS * GS, UINT32_MAX);
@@ -275,7 +278,7 @@ void CrowdSystem::Update(float dt, const CityLayout& city,
     RebuildSpatialHash();
 
     for (uint32_t i = 0; i < activeCount_; i++) {
-        if (state_[i] == State::IDLE) continue;
+        if (state_[i] == State::IDLE || state_[i] == State::ON_BUS) continue;
 
         auto& wps = wpBuf_[i];
         uint16_t& wn = wpCurr_[i];
@@ -435,7 +438,7 @@ void CrowdSystem::Render(const XMFLOAT3& cameraPos)
 
     uint32_t count = 0;
     for (uint32_t i = 0; i < activeCount_ && count < MAX_VISIBLE; ++i) {
-        if (state_[i] == State::IDLE) continue;
+        if (state_[i] == State::IDLE || state_[i] == State::ON_BUS) continue;
         float dx = posX_[i] - camX, dz = posZ_[i] - camZ;
         float d2 = dx * dx + dz * dz;
         if (d2 >= farSq) continue;
