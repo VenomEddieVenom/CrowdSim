@@ -872,20 +872,27 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
         };
 
         // ---- Turn lane preparation (uses lane index) ----
+        // Left turn → leftmost lane (0), right turn → rightmost lane (N-1),
+        // straight → any lane (pick least busy)
         int8_t requiredIdx = laneIdx_[i];
         bool turnPrepNeeded = false;
+        float distToTurnWp = 1e6f;
 
         // Current turn: left → inner (0), right → outer (N-1)
         if (isTurn)
         {
             requiredIdx = (turnCross > 0.0f) ? 0 : (int8_t)(cellLaneCount - 1);
             turnPrepNeeded = true;
+            float tdx = target_raw.x - posX_[i], tdz = target_raw.y - posZ_[i];
+            distToTurnWp = std::sqrt(tdx * tdx + tdz * tdz);
         }
 
-        // Look ahead for upcoming turns (4 segments for early lane change)
+        // Look ahead for upcoming turns (8 segments for early lane change)
         if (!turnPrepNeeded)
         {
-            for (uint8_t look = 1; look <= 4 && (wn + look) < wc; ++look)
+            float tdx0 = target_raw.x - posX_[i], tdz0 = target_raw.y - posZ_[i];
+            float accumDist = std::sqrt(tdx0 * tdx0 + tdz0 * tdz0);
+            for (uint8_t look = 1; look <= 8 && (wn + look) < wc; ++look)
             {
                 uint8_t futIdx = wn + look;
                 if (futIdx + 1 >= wc) break;
@@ -897,8 +904,12 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
                 {
                     requiredIdx = (fCross > 0.0f) ? 0 : (int8_t)(cellLaneCount - 1);
                     turnPrepNeeded = true;
+                    distToTurnWp = accumDist;
                     break;
                 }
+                float sdx = wp[futIdx].x - wp[futIdx - 1].x;
+                float sdz = wp[futIdx].y - wp[futIdx - 1].y;
+                accumDist += std::sqrt(sdx * sdx + sdz * sdz);
             }
         }
 
@@ -909,6 +920,9 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
             laneIdx_[i] = requiredIdx;
             laneTarget_[i] = cellLaneOffs[laneIdx_[i]];
         }
+
+        // Wrong lane for upcoming turn: car must slow down to change before intersection
+        bool wrongLaneForTurn = turnPrepNeeded && (laneIdx_[i] != requiredIdx);
 
         // Balance lane distribution: no turn ahead → prefer less crowded lane
         if (!turnPrepNeeded && canChangeLane && cellLaneCount > 1)
@@ -1337,6 +1351,16 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
             float distToEntry = std::max(0.0f, segLen - segFwd - HALF_CS);
             float approachFactor = std::clamp(distToEntry / 25.0f, 0.0f, 1.0f);
             desiredMax = MAX_SPEED * (0.30f + 0.70f * approachFactor);
+        }
+
+        // Wrong lane for turn: slow down to allow lane change before intersection
+        if (wrongLaneForTurn && !inArc)
+        {
+            float urgency = 1.0f - std::clamp(distToTurnWp / 60.0f, 0.0f, 1.0f);
+            float laneChangeMax = MAX_SPEED * (1.0f - urgency * 0.85f);
+            if (distToTurnWp < 25.0f)
+                laneChangeMax = std::min(laneChangeMax, 2.0f);
+            desiredMax = std::min(desiredMax, laneChangeMax);
         }
 
         if (v > desiredMax)
