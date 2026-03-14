@@ -830,7 +830,14 @@ struct CarSys {
 
                 bool inIntersection = onGrid && lights.IsIntersection(myGX, myGZ);
                 bool laneSettled = std::abs(laneOff[i] - laneTarget[i]) < 0.1f;
-                bool canChangeLane = !isTurn && !inIntersection && onGrid && laneSettled;
+
+                // Forward projection (needed early for turn approach check)
+                float segFwd = (posX[i]-prev_raw.x)*segDir.x + (posZ[i]-prev_raw.y)*segDir.y;
+
+                // Allow lane changes on straight approach portion of turn segments
+                float arcEntryDist = isTurn ? std::max(0.0f, segLen - HALF_CS) : 1e6f;
+                bool onTurnApproach = isTurn && segFwd < arcEntryDist - 5.0f;
+                bool canChangeLane = (!isTurn || onTurnApproach) && !inIntersection && onGrid && laneSettled;
 
                 // Helper: check if a target lane is clear of nearby same-direction cars
                 auto isLaneClear = [&](float tgtLane) -> bool {
@@ -933,7 +940,6 @@ struct CarSys {
                 }
 
                 // Steering target
-                float segFwd = (posX[i]-prev_raw.x)*segDir.x + (posZ[i]-prev_raw.y)*segDir.y;
                 Vec2 steerTarget;
                 bool inArc = false;
 
@@ -1138,13 +1144,25 @@ struct CarSys {
                     desiredMax = MAX_SPEED * (0.30f + 0.70f*approachFactor);
                 }
 
-                // Wrong lane for turn: slow down to allow lane change before intersection
+                // Wrong lane for turn: slow down and stop ONLY if correct lane is available
                 if (wrongLaneForTurn && !inArc) {
                     float urgency = 1.0f - std::clamp(distToTurnWp / 60.0f, 0.0f, 1.0f);
                     float laneChangeMax = MAX_SPEED * (1.0f - urgency * 0.85f);
                     if (distToTurnWp < 25.0f)
                         laneChangeMax = std::min(laneChangeMax, 2.0f);
                     desiredMax = std::min(desiredMax, laneChangeMax);
+
+                    // Near the arc: stop and force lane change IF target lane has room.
+                    // If lane is blocked, don't stop — just proceed at reduced speed.
+                    if (isTurn) {
+                        float distToArc = arcEntryDist - segFwd;
+                        if (distToArc < 15.0f && isLaneClear(cellLaneOffs[requiredIdx])) {
+                            float stopDist = std::max(0.0f, distToArc - halfLen[i] - 2.0f);
+                            if (stopDist < bestGap) { bestGap = stopDist; bestSpd = 0; }
+                            laneIdx[i] = requiredIdx;
+                            laneTarget[i] = cellLaneOffs[requiredIdx];
+                        }
+                    }
                 }
                 if (v > desiredMax) idmAccel = std::min(idmAccel, -IDM_B*1.5f);
 

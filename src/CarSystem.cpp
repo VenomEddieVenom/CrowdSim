@@ -844,7 +844,15 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
         // No lane changes inside intersection cells
         bool inIntersection = onGrid && lights.IsIntersection(myGX, myGZ);
         bool laneSettled = std::abs(laneOff_[i] - laneTarget_[i]) < 0.1f;
-        bool canChangeLane = !isTurn && !inIntersection && onGrid && laneSettled;
+
+        // Forward projection along segment (needed early for turn approach check)
+        float segFwd = (posX_[i] - prev_raw.x) * segDir.x + (posZ_[i] - prev_raw.y) * segDir.y;
+
+        // Allow lane changes on the straight approach portion of a turn segment
+        // (before the arc entry point), so cars can get into the correct lane
+        float arcEntryDist = isTurn ? std::max(0.0f, segLen - HALF_CS) : 1e6f;
+        bool onTurnApproach = isTurn && segFwd < arcEntryDist - 5.0f;
+        bool canChangeLane = (!isTurn || onTurnApproach) && !inIntersection && onGrid && laneSettled;
 
         // Helper: check if a target lane is clear of nearby same-direction cars
         auto isLaneClear = [&](float targetLane) -> bool {
@@ -966,9 +974,6 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
                 laneTarget_[i] = cellLaneOffs[laneIdx_[i]];
             }
         }
-
-        // ---- Forward projection along segment ----
-        float segFwd = (posX_[i] - prev_raw.x) * segDir.x + (posZ_[i] - prev_raw.y) * segDir.y;
 
         // ---- Compute target point for steering ----
         //   Two-phase turn model:
@@ -1353,7 +1358,7 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
             desiredMax = MAX_SPEED * (0.30f + 0.70f * approachFactor);
         }
 
-        // Wrong lane for turn: slow down to allow lane change before intersection
+        // Wrong lane for turn: slow down and stop ONLY if the correct lane is available
         if (wrongLaneForTurn && !inArc)
         {
             float urgency = 1.0f - std::clamp(distToTurnWp / 60.0f, 0.0f, 1.0f);
@@ -1361,6 +1366,20 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
             if (distToTurnWp < 25.0f)
                 laneChangeMax = std::min(laneChangeMax, 2.0f);
             desiredMax = std::min(desiredMax, laneChangeMax);
+
+            // Near the arc: stop and force lane change IF the target lane has room.
+            // If the lane is blocked, don't stop — just proceed at reduced speed.
+            if (isTurn)
+            {
+                float distToArc = arcEntryDist - segFwd;
+                if (distToArc < 15.0f && isLaneClear(cellLaneOffs[requiredIdx]))
+                {
+                    float stopDist = std::max(0.0f, distToArc - halfLen_[i] - 2.0f);
+                    if (stopDist < bestGap) { bestGap = stopDist; bestSpd = 0.0f; }
+                    laneIdx_[i] = requiredIdx;
+                    laneTarget_[i] = cellLaneOffs[requiredIdx];
+                }
+            }
         }
 
         if (v > desiredMax)
