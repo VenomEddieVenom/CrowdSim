@@ -562,8 +562,8 @@ public:
 
         // ---- Sky (initial values, updated by day cycle each frame) ----
         auto& scene = wi::scene::GetScene();
-        scene.weather.fogStart   = 600.0f;
-        scene.weather.fogDensity = 0.002f;
+        scene.weather.fogStart   = 3000.0f;
+        scene.weather.fogDensity = 0.0002f;
 
         // ---- Sun (directional light with shadow cascades) ----
         sunEntity = scene.Entity_CreateLight(

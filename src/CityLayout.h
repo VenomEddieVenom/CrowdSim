@@ -8,6 +8,7 @@
 #include <functional>
 #include <fstream>
 #include <utility>
+#include <unordered_map>
 
 // ============================================================
 //  CityLayout  –  user-editable grid city
@@ -197,9 +198,139 @@ public:
                 scene.objects.Remove(e);
             wi::backlog::post("[CityLayout] dom.wiscene merged – GPU instancing enabled",
                               wi::backlog::LogLevel::Default);
+            // --- Mesh complexity report ---
+            {
+                std::string report = "[CityLayout] dom.wiscene sub-objects: " +
+                    std::to_string(domSubObjects_.size()) + "\n";
+                // Deduplicate meshIDs
+                std::unordered_map<wi::ecs::Entity, int> seen;
+                uint64_t totalTris = 0;
+                for (auto& sub : domSubObjects_) {
+                    if (seen.count(sub.meshID)) continue;
+                    seen[sub.meshID] = 1;
+                    auto* mesh = scene.meshes.GetComponent(sub.meshID);
+                    if (mesh) {
+                        uint64_t tris = mesh->indices.size() / 3;
+                        totalTris += tris;
+                        report += "  meshID=" + std::to_string(sub.meshID)
+                               + " tris=" + std::to_string(tris) + "\n";
+                    }
+                }
+                report += "[CityLayout] dom.wiscene TOTAL unique tris: " +
+                    std::to_string(totalTris);
+                wi::backlog::post(report);
+            }
+            // --- Auto-scale: compute AABB and fit to CELL_SIZE * 0.80 ---
+            {
+                XMVECTOR aabbMin = XMVectorSet( FLT_MAX,  FLT_MAX,  FLT_MAX, 0);
+                XMVECTOR aabbMax = XMVectorSet(-FLT_MAX, -FLT_MAX, -FLT_MAX, 0);
+                for (auto& sub : domSubObjects_) {
+                    auto* mesh = scene.meshes.GetComponent(sub.meshID);
+                    if (!mesh) continue;
+                    XMMATRIX mat = XMLoadFloat4x4(&sub.localMatrix);
+                    for (auto& v : mesh->vertex_positions) {
+                        XMVECTOR p = XMVector3Transform(XMLoadFloat3(&v), mat);
+                        aabbMin = XMVectorMin(aabbMin, p);
+                        aabbMax = XMVectorMax(aabbMax, p);
+                    }
+                }
+                XMFLOAT3 mn, mx;
+                XMStoreFloat3(&mn, aabbMin);
+                XMStoreFloat3(&mx, aabbMax);
+                float spanX = mx.x - mn.x;
+                float spanZ = mx.z - mn.z;
+                float maxSpan = std::max(spanX, spanZ);
+                domScale_ = (maxSpan > 0.001f) ? (CELL_SIZE * 0.80f) / maxSpan : 1.0f;
+                wi::backlog::post("[CityLayout] dom.wiscene auto-scale: " + std::to_string(domScale_)
+                    + " (span=" + std::to_string(maxSpan) + ")");
+            }
         } else {
             wi::backlog::post("[CityLayout] dom.wiscene not found, falling back to procedural houses",
                               wi::backlog::LogLevel::Warning);
+        }
+
+        // ---- Create shared mesh prototypes for GPU instancing ----
+        // Each type gets one Entity_CreateCube; its ObjectComponent is removed so it
+        // never renders at the origin, but its MeshComponent and MaterialComponent stay.
+        // All instance entities set obj.meshID = <proto entity> → single draw call per type.
+        {
+            auto mkMesh = [&](const char* n, wi::ecs::Entity& out,
+                              std::function<void(wi::scene::MaterialComponent*)> f)
+            {
+                out = scene.Entity_CreateCube(n);
+                scene.objects.Remove(out);
+                if (auto* m = scene.materials.GetComponent(out)) f(m);
+            };
+            mkMesh("road_proto",      meshRoad_,        [&](auto* m){ ApplyRoadTexture(m); });
+            mkMesh("crosswalk_proto", meshCrosswalk_,   [&](auto* m){ ApplyRoadTexture(m); });
+            mkMesh("sidewalk_proto",  meshSidewalk_,    [](auto* m){ m->SetBaseColor({0.74f,0.72f,0.65f,1.f}); });
+            mkMesh("corner_proto",    meshCorner_,      [](auto* m){ m->SetBaseColor({0.74f,0.72f,0.65f,1.f}); });
+            mkMesh("zebra_proto",     meshZebra_,       [](auto* m){ m->SetBaseColor({0.95f,0.95f,0.90f,1.f}); });
+            mkMesh("lnline_proto",    meshLaneLine_,    [](auto* m){ m->SetBaseColor({1.f,1.f,1.f,1.f}); });
+            mkMesh("lndash_proto",    meshLaneDash_,    [](auto* m){ m->SetBaseColor({1.f,1.f,1.f,1.f}); });
+            mkMesh("house_proto",     meshHouse_,       [](auto* m){ m->SetBaseColor({1.f,1.f,1.f,1.f}); });
+            mkMesh("housroof_proto",  meshHouseRoof_,   [](auto* m){ m->SetBaseColor({0.30f,0.14f,0.09f,1.f}); });
+            mkMesh("work_proto",      meshWorkplace_,   [](auto* m){ m->SetBaseColor({1.f,1.f,1.f,1.f}); });
+            mkMesh("workcrown_proto", meshWorkCrown_,   [](auto* m){ m->SetBaseColor({0.62f,0.82f,0.97f,1.f}); });
+            mkMesh("pkslb_proto",     meshParkSlab_,    [](auto* m){ m->SetBaseColor({0.56f,0.55f,0.52f,1.f}); });
+            mkMesh("pkcol_proto",     meshParkCol_,     [](auto* m){ m->SetBaseColor({0.52f,0.51f,0.48f,1.f}); });
+            mkMesh("pkroof_proto",    meshParkRoof_,    [](auto* m){ m->SetBaseColor({0.38f,0.36f,0.33f,1.f}); });
+            mkMesh("pkramp_proto",    meshParkRamp_,    [](auto* m){ m->SetBaseColor({0.50f,0.49f,0.46f,1.f}); });
+            mkMesh("pksign_proto",    meshParkSign_,    [](auto* m){
+                m->SetBaseColor({0.10f,0.28f,0.82f,1.f});
+                m->SetEmissiveColor({0.10f,0.28f,0.82f,3.f});
+            });
+            mkMesh("lkbed_proto",     meshLakeBed_,     [](auto* m){ m->SetBaseColor({0.02f,0.05f,0.04f,1.f}); });
+            mkMesh("lkwater_proto",   meshLakeWater_,   [](auto* m){
+                m->shaderType = wi::scene::MaterialComponent::SHADERTYPE_PBR;
+                m->SetBaseColor({0.04f,0.15f,0.30f,1.f});
+                m->SetEmissiveColor({0.01f,0.06f,0.15f,0.5f});
+                m->SetRoughness(0.08f);
+                m->SetReflectance(0.8f);
+                m->SetMetalness(0.0f);
+            });
+            mkMesh("lkshore_proto",   meshLakeShore_,   [](auto* m){ m->SetBaseColor({0.12f,0.22f,0.10f,1.f}); });
+            mkMesh("pwrmain_proto",   meshPowerMain_,   [](auto* m){ m->SetBaseColor({0.30f,0.28f,0.26f,1.f}); });
+            mkMesh("pwrstk_proto",    meshPowerStack_,  [](auto* m){ m->SetBaseColor({0.45f,0.42f,0.40f,1.f}); });
+            mkMesh("pwrstrp_proto",   meshPowerStripe_, [](auto* m){
+                m->SetBaseColor({0.85f,0.75f,0.10f,1.f});
+                m->SetEmissiveColor({0.85f,0.75f,0.10f,1.5f});
+            });
+            mkMesh("wpbase_proto",    meshWpumpBase_,   [](auto* m){ m->SetBaseColor({0.35f,0.50f,0.65f,1.f}); });
+            mkMesh("wppipe_proto",    meshWpumpPipe_,   [](auto* m){ m->SetBaseColor({0.20f,0.35f,0.55f,1.f}); });
+            mkMesh("wpind_proto",     meshWpumpInd_,    [](auto* m){
+                m->SetBaseColor({0.10f,0.40f,0.90f,1.f});
+                m->SetEmissiveColor({0.10f,0.40f,0.90f,2.f});
+            });
+            mkMesh("polmain_proto",   meshPoliceMain_,  [](auto* m){ m->SetBaseColor({0.15f,0.20f,0.45f,1.f}); });
+            mkMesh("polroof_proto",   meshPoliceRoof_,  [](auto* m){ m->SetBaseColor({0.85f,0.85f,0.90f,1.f}); });
+            mkMesh("pollit_proto",    meshPoliceLight_, [](auto* m){
+                m->SetBaseColor({0.10f,0.30f,0.95f,1.f});
+                m->SetEmissiveColor({0.10f,0.30f,0.95f,3.f});
+            });
+            mkMesh("firemain_proto",  meshFireMain_,    [](auto* m){ m->SetBaseColor({0.65f,0.12f,0.10f,1.f}); });
+            mkMesh("firedoor_proto",  meshFireDoor_,    [](auto* m){ m->SetBaseColor({0.80f,0.25f,0.20f,1.f}); });
+            mkMesh("firetwr_proto",   meshFireTower_,   [](auto* m){ m->SetBaseColor({0.55f,0.10f,0.08f,1.f}); });
+            mkMesh("firelit_proto",   meshFireLight_,   [](auto* m){
+                m->SetBaseColor({0.95f,0.15f,0.10f,1.f});
+                m->SetEmissiveColor({0.95f,0.15f,0.10f,3.f});
+            });
+            mkMesh("hospmain_proto",  meshHospMain_,    [](auto* m){ m->SetBaseColor({0.90f,0.90f,0.92f,1.f}); });
+            mkMesh("hospcrsH_proto",  meshHospCrossH_,  [](auto* m){
+                m->SetBaseColor({0.90f,0.10f,0.10f,1.f});
+                m->SetEmissiveColor({0.90f,0.10f,0.10f,1.5f});
+            });
+            mkMesh("hospcrsV_proto",  meshHospCrossV_,  [](auto* m){
+                m->SetBaseColor({0.90f,0.10f,0.10f,1.f});
+                m->SetEmissiveColor({0.90f,0.10f,0.10f,1.5f});
+            });
+            mkMesh("hosprf_proto",    meshHospRoof_,    [](auto* m){ m->SetBaseColor({0.75f,0.78f,0.80f,1.f}); });
+            mkMesh("busmain_proto",   meshBusMain_,     [](auto* m){ m->SetBaseColor({0.75f,0.60f,0.15f,1.f}); });
+            mkMesh("busroof_proto",   meshBusRoof_,     [](auto* m){ m->SetBaseColor({0.55f,0.45f,0.10f,1.f}); });
+            mkMesh("busicon_proto",   meshBusIcon_,     [](auto* m){
+                m->SetBaseColor({0.95f,0.80f,0.10f,1.f});
+                m->SetEmissiveColor({0.95f,0.80f,0.05f,2.f});
+            });
         }
     }
 
@@ -731,15 +862,13 @@ private:
 
         // Asphalt base (full cell)
         {
-            auto e  = s.Entity_CreateCube("road");
+            auto e = SpawnInst(meshRoad_, s);
             auto* tr = s.transforms.GetComponent(e);
             if (tr) {
                 tr->Scale(XMFLOAT3(h, 0.10f, h));
                 tr->Translate(XMFLOAT3(c.x, 0.10f, c.y));
                 tr->UpdateTransform();
             }
-            auto* mat = s.materials.GetComponent(e);
-            if (mat) ApplyRoadTexture(mat);
             cellEntities[idx].push_back(e);
         }
 
@@ -764,7 +893,7 @@ private:
 
         for (int d = 0; d < 4; ++d)
         {
-            auto se = s.Entity_CreateCube("sidewalk");
+            auto se = SpawnInst(meshSidewalk_, s);
             auto* st = s.transforms.GetComponent(se);
             if (st) {
                 const float visY = connected[d] ? -100.0f : 0.14f;
@@ -772,8 +901,6 @@ private:
                 st->Translate(XMFLOAT3(c.x + ox[d], visY, c.y + oz[d]));
                 st->UpdateTransform();
             }
-            auto* mat = s.materials.GetComponent(se);
-            if (mat) mat->SetBaseColor(XMFLOAT4(0.74f, 0.72f, 0.65f, 1.0f));
             cellEntities[idx].push_back(se);
             roadSidewalks[idx][d] = se;
         }
@@ -792,7 +919,7 @@ private:
             const float coz[4] = { -(h-swh), -(h-swh),  h - swh,  h - swh };
             for (int d = 0; d < 4; ++d)
             {
-                auto ce = s.Entity_CreateCube("sidewalk_corner");
+                auto ce = SpawnInst(meshCorner_, s);
                 auto* ct = s.transforms.GetComponent(ce);
                 if (ct) {
                     const float visY = cornerVis[d] ? 0.14f : -100.0f;
@@ -800,8 +927,6 @@ private:
                     ct->Translate(XMFLOAT3(c.x + cox[d], visY, c.y + coz[d]));
                     ct->UpdateTransform();
                 }
-                auto* mat = s.materials.GetComponent(ce);
-                if (mat) mat->SetBaseColor(XMFLOAT4(0.74f, 0.72f, 0.65f, 1.0f));
                 cellEntities[idx].push_back(ce);
                 roadCorners[idx][d] = ce;
             }
@@ -890,7 +1015,7 @@ public:
                              float r, float g, float b)
         {
             if (halfLen < 0.05f) return;
-            auto e = s.Entity_CreateCube("lane_line");
+            auto e = SpawnInst(meshLaneLine_, s, XMFLOAT4(r, g, b, 1.f));
             auto* tr = s.transforms.GetComponent(e);
             if (tr) {
                 if (axisNS) {
@@ -902,8 +1027,6 @@ public:
                 }
                 tr->UpdateTransform();
             }
-            auto* mat = s.materials.GetComponent(e);
-            if (mat) mat->SetBaseColor(XMFLOAT4(r, g, b, 1.f));
             laneMarkEntities_.push_back(e);
         };
 
@@ -921,7 +1044,7 @@ public:
                 if (dEnd > dStart + 0.1f) {
                     float dHL = (dEnd - dStart) * 0.5f;
                     float dMid = (dStart + dEnd) * 0.5f;
-                    auto e = s.Entity_CreateCube("lane_dash");
+                    auto e = SpawnInst(meshLaneDash_, s, XMFLOAT4(r, g, b, 1.f));
                     auto* tr = s.transforms.GetComponent(e);
                     if (tr) {
                         if (axisNS) {
@@ -933,8 +1056,6 @@ public:
                         }
                         tr->UpdateTransform();
                     }
-                    auto* mat = s.materials.GetComponent(e);
-                    if (mat) mat->SetBaseColor(XMFLOAT4(r, g, b, 1.f));
                     laneMarkEntities_.push_back(e);
                 }
                 pos += DASH_PERIOD;
@@ -1123,15 +1244,13 @@ private:
 
         // Asphalt base (full cell, same as road)
         {
-            auto e  = s.Entity_CreateCube("crosswalk");
+            auto e = SpawnInst(meshCrosswalk_, s);
             auto* tr = s.transforms.GetComponent(e);
             if (tr) {
                 tr->Scale(XMFLOAT3(h, 0.10f, h));
                 tr->Translate(XMFLOAT3(c.x, 0.10f, c.y));
                 tr->UpdateTransform();
             }
-            auto* mat = s.materials.GetComponent(e);
-            if (mat) ApplyRoadTexture(mat);
             cellEntities[idx].push_back(e);
         }
 
@@ -1163,7 +1282,7 @@ private:
 
             for (int stripe = 0; stripe < NUM_STRIPES; ++stripe)
             {
-                auto e = s.Entity_CreateCube("zebra_stripe");
+                auto e = SpawnInst(meshZebra_, s);
                 auto* tr = s.transforms.GetComponent(e);
                 if (tr) {
                     float along = -bandHalf + stripeGap * ((float)stripe + 0.5f);
@@ -1179,8 +1298,6 @@ private:
                     }
                     tr->UpdateTransform();
                 }
-                auto* mat = s.materials.GetComponent(e);
-                if (mat) mat->SetBaseColor(XMFLOAT4(0.95f, 0.95f, 0.90f, 1.0f));
                 cellEntities[idx].push_back(e);
             }
         }
@@ -1195,7 +1312,7 @@ private:
 
             for (int d = 0; d < 4; ++d)
             {
-                auto se = s.Entity_CreateCube("sidewalk");
+                auto se = SpawnInst(meshSidewalk_, s);
                 auto* st = s.transforms.GetComponent(se);
                 if (st) {
                     const float visY = connected[d] ? -100.0f : 0.14f;
@@ -1203,8 +1320,6 @@ private:
                     st->Translate(XMFLOAT3(c.x + ox[d], visY, c.y + oz[d]));
                     st->UpdateTransform();
                 }
-                auto* mat = s.materials.GetComponent(se);
-                if (mat) mat->SetBaseColor(XMFLOAT4(0.74f, 0.72f, 0.65f, 1.0f));
                 cellEntities[idx].push_back(se);
                 roadSidewalks[idx][d] = se;
             }
@@ -1220,7 +1335,7 @@ private:
             const float coz[4] = { -(h-swh), -(h-swh),  h - swh,  h - swh };
             for (int d = 0; d < 4; ++d)
             {
-                auto ce = s.Entity_CreateCube("sidewalk_corner");
+                auto ce = SpawnInst(meshCorner_, s);
                 auto* ct = s.transforms.GetComponent(ce);
                 if (ct) {
                     const float visY = cornerVis[d] ? 0.14f : -100.0f;
@@ -1228,8 +1343,6 @@ private:
                     ct->Translate(XMFLOAT3(c.x + cox[d], visY, c.y + coz[d]));
                     ct->UpdateTransform();
                 }
-                auto* mat = s.materials.GetComponent(ce);
-                if (mat) mat->SetBaseColor(XMFLOAT4(0.74f, 0.72f, 0.65f, 1.0f));
                 cellEntities[idx].push_back(ce);
                 roadCorners[idx][d] = ce;
             }
@@ -1419,6 +1532,7 @@ public:
         XMFLOAT4   color = {1.f, 1.f, 1.f, 1.f};
     };
     std::vector<DomSubObject> domSubObjects_;  // one entry per mesh object in dom.wiscene
+    float domScale_ = 1.0f;  // auto-computed in Initialize() to fit tile
 
 private:
     void BuildHouse(int idx, int gx, int gz, XMFLOAT2 c, wi::scene::Scene& s)
@@ -1431,7 +1545,9 @@ private:
         {
             // Create one entity per sub-object, all sharing the same mesh entity → GPU instanced
             float rot = static_cast<float>((gx * 7 + gz * 13) % 4) * XM_PIDIV2;
-            XMMATRIX houseMat = XMMatrixRotationY(rot) * XMMatrixTranslation(c.x, 0.0f, c.y);
+            XMMATRIX houseMat = XMMatrixScaling(domScale_, domScale_, domScale_)
+                              * XMMatrixRotationY(rot)
+                              * XMMatrixTranslation(c.x, 0.0f, c.y);
             for (auto& sub : domSubObjects_) {
                 wi::ecs::Entity e = wi::ecs::CreateEntity();
                 s.layers.Create(e);
@@ -1442,6 +1558,7 @@ private:
                 auto& obj = s.objects.Create(e);
                 obj.meshID = sub.meshID;  // shared mesh → instanced by renderer
                 obj.color  = sub.color;
+                obj.SetCastShadow(false);  // static city geometry – no shadow CPU cost
                 cellEntities[idx].push_back(e);
             }
         }
@@ -1450,28 +1567,24 @@ private:
             // Fallback: procedural cube house
             float bw = CELL_SIZE * 0.38f;
 
-            auto e = s.Entity_CreateCube("house");
+            float hi = static_cast<float>((gx * 13 + gz * 7) % 8) / 7.0f;
+            auto e = SpawnInst(meshHouse_, s,
+                XMFLOAT4(0.82f + hi * 0.10f, 0.35f + hi * 0.10f, 0.16f, 1.0f));
             auto* tr = s.transforms.GetComponent(e);
             if (tr) {
                 tr->Scale(XMFLOAT3(bw, bh, bw));
                 tr->Translate(XMFLOAT3(c.x, bh, c.y));
                 tr->UpdateTransform();
             }
-            float hi = static_cast<float>((gx * 13 + gz * 7) % 8) / 7.0f;
-            auto* mat = s.materials.GetComponent(e);
-            if (mat) mat->SetBaseColor(
-                XMFLOAT4(0.82f + hi * 0.10f, 0.35f + hi * 0.10f, 0.16f, 1.0f));
             cellEntities[idx].push_back(e);
 
-            auto r = s.Entity_CreateCube("house_roof");
+            auto r = SpawnInst(meshHouseRoof_, s);
             auto* rt = s.transforms.GetComponent(r);
             if (rt) {
                 rt->Scale(XMFLOAT3(bw * 1.06f, bh * 0.10f, bw * 1.06f));
                 rt->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.10f, c.y));
                 rt->UpdateTransform();
             }
-            auto* rmat = s.materials.GetComponent(r);
-            if (rmat) rmat->SetBaseColor(XMFLOAT4(0.30f, 0.14f, 0.09f, 1.0f));
             cellEntities[idx].push_back(r);
         }
     }
@@ -1485,29 +1598,25 @@ private:
         workplaceWorkers_[idx] = 0;
 
         // Tower body (cool blue-gray)
-        auto e = s.Entity_CreateCube("workplace");
+        float ti = static_cast<float>((gx * 7 + gz * 13) % 6) / 5.0f;
+        auto e = SpawnInst(meshWorkplace_, s,
+            XMFLOAT4(0.22f + ti * 0.08f, 0.38f + ti * 0.10f, 0.72f + ti * 0.12f, 1.0f));
         auto* tr = s.transforms.GetComponent(e);
         if (tr) {
             tr->Scale(XMFLOAT3(bw, bh, bw));
             tr->Translate(XMFLOAT3(c.x, bh, c.y));
             tr->UpdateTransform();
         }
-        float ti = static_cast<float>((gx * 7 + gz * 13) % 6) / 5.0f;
-        auto* mat = s.materials.GetComponent(e);
-        if (mat) mat->SetBaseColor(
-            XMFLOAT4(0.22f + ti * 0.08f, 0.38f + ti * 0.10f, 0.72f + ti * 0.12f, 1.0f));
         cellEntities[idx].push_back(e);
 
         // Glass crown
-        auto g = s.Entity_CreateCube("workplace_crown");
+        auto g = SpawnInst(meshWorkCrown_, s);
         auto* gt = s.transforms.GetComponent(g);
         if (gt) {
             gt->Scale(XMFLOAT3(bw * 1.03f, bh * 0.09f, bw * 1.03f));
             gt->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.09f, c.y));
             gt->UpdateTransform();
         }
-        auto* gmat = s.materials.GetComponent(g);
-        if (gmat) gmat->SetBaseColor(XMFLOAT4(0.62f, 0.82f, 0.97f, 1.0f));
         cellEntities[idx].push_back(g);
     }
 
@@ -1536,12 +1645,11 @@ private:
 
             // Floor slab
             {
-                auto e = s.Entity_CreateCube("park_slab");
+                auto e = SpawnInst(meshParkSlab_, s);
                 auto* tr = s.transforms.GetComponent(e);
                 tr->Scale(XMFLOAT3(bw, slabThk, bw));
                 tr->Translate(XMFLOAT3(c.x, slabY + slabThk, c.y));
                 tr->UpdateTransform();
-                s.materials.GetComponent(e)->SetBaseColor(XMFLOAT4(0.56f, 0.55f, 0.52f, 1.0f));
                 cellEntities[idx].push_back(e);
             }
 
@@ -1550,25 +1658,23 @@ private:
             const float cz4[4] = { bw - colThk,   bw - colThk, -(bw - colThk), -(bw - colThk) };
             for (int col = 0; col < 4; ++col)
             {
-                auto e = s.Entity_CreateCube("park_col");
+                auto e = SpawnInst(meshParkCol_, s);
                 auto* tr = s.transforms.GetComponent(e);
                 float colH = (fh - slabThk * 2.f) * 0.5f;
                 tr->Scale(XMFLOAT3(colThk, colH, colThk));
                 tr->Translate(XMFLOAT3(c.x + cx4[col], slabY + slabThk * 2.f + colH, c.y + cz4[col]));
                 tr->UpdateTransform();
-                s.materials.GetComponent(e)->SetBaseColor(XMFLOAT4(0.52f, 0.51f, 0.48f, 1.0f));
                 cellEntities[idx].push_back(e);
             }
         }
 
         // ---- Roof slab ----
         {
-            auto e = s.Entity_CreateCube("park_roof");
+            auto e = SpawnInst(meshParkRoof_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(bw, slabThk, bw));
             tr->Translate(XMFLOAT3(c.x, totalH + slabThk, c.y));
             tr->UpdateTransform();
-            s.materials.GetComponent(e)->SetBaseColor(XMFLOAT4(0.38f, 0.36f, 0.33f, 1.0f));
             cellEntities[idx].push_back(e);
         }
 
@@ -1582,26 +1688,22 @@ private:
             float rampW   = bw * 0.20f;  // half-width
             float pitch = std::atan2(topY - botY, rampLen * 2.f);
 
-            auto e = s.Entity_CreateCube("park_ramp");
+            auto e = SpawnInst(meshParkRamp_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(rampW, slabThk, rampLen));
             tr->RotateRollPitchYaw(XMFLOAT3(pitch, 0.f, 0.f));
             tr->Translate(XMFLOAT3(c.x + bw - rampW - colThk, midY, c.y));
             tr->UpdateTransform();
-            s.materials.GetComponent(e)->SetBaseColor(XMFLOAT4(0.50f, 0.49f, 0.46f, 1.0f));
             cellEntities[idx].push_back(e);
         }
 
         // ---- Blue "P" sign on front face ----
         {
-            auto p = s.Entity_CreateCube("parking_sign");
+            auto p = SpawnInst(meshParkSign_, s);
             auto* pt = s.transforms.GetComponent(p);
             pt->Scale(XMFLOAT3(bw * 0.25f, fh * 0.35f, 0.14f));
             pt->Translate(XMFLOAT3(c.x, fh * 0.5f + fh * 0.35f, c.y - bw - 0.15f));
             pt->UpdateTransform();
-            auto* pm = s.materials.GetComponent(p);
-            pm->SetBaseColor(XMFLOAT4(0.10f, 0.28f, 0.82f, 1.0f));
-            pm->SetEmissiveColor(XMFLOAT4(0.10f, 0.28f, 0.82f, 3.0f));
             cellEntities[idx].push_back(p);
         }
     }
@@ -1611,29 +1713,20 @@ private:
         float hw = CELL_SIZE * 0.50f;
         // Dark lake bed recessed below ground
         {
-            auto e = s.Entity_CreateCube("lake_bed");
+            auto e = SpawnInst(meshLakeBed_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(hw, 0.8f, hw));
             tr->Translate(XMFLOAT3(c.x, -1.6f, c.y));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.02f, 0.05f, 0.04f, 1.0f));
             cellEntities[idx].push_back(e);
         }
         // Water surface – opaque flat plane just above ground
         {
-            auto e = s.Entity_CreateCube("lake_water");
+            auto e = SpawnInst(meshLakeWater_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(hw, 0.02f, hw));
             tr->Translate(XMFLOAT3(c.x, 0.08f, c.y));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->shaderType = wi::scene::MaterialComponent::SHADERTYPE_PBR;
-            mat->SetBaseColor(XMFLOAT4(0.04f, 0.15f, 0.30f, 1.0f));
-            mat->SetEmissiveColor(XMFLOAT4(0.01f, 0.06f, 0.15f, 0.5f));
-            mat->SetRoughness(0.08f);
-            mat->SetReflectance(0.8f);
-            mat->SetMetalness(0.0f);
             cellEntities[idx].push_back(e);
         }
         // Shore edges where no adjacent lake
@@ -1645,13 +1738,11 @@ private:
         const float eSZ[] = { hw, hw, 0.5f, 0.5f };
         for (int d = 0; d < 4; ++d) {
             if (IsLake(gx + ddx[d], gz + ddz[d])) continue;
-            auto e = s.Entity_CreateCube("lake_shore");
+            auto e = SpawnInst(meshLakeShore_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(eSX[d], 0.35f, eSZ[d]));
             tr->Translate(XMFLOAT3(c.x + eOX[d], -0.45f, c.y + eOZ[d]));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.12f, 0.22f, 0.10f, 1.0f));
             cellEntities[idx].push_back(e);
         }
     }
@@ -1662,38 +1753,31 @@ private:
         float bh = CELL_SIZE * 0.45f;
         // Main factory building (dark gray)
         {
-            auto e = s.Entity_CreateCube("power_main");
+            auto e = SpawnInst(meshPowerMain_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(bw, bh, bw));
             tr->Translate(XMFLOAT3(c.x, bh, c.y));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.30f, 0.28f, 0.26f, 1.0f));
             cellEntities[idx].push_back(e);
         }
         // Smokestack
         {
             float sr = bw * 0.18f;
             float sh = bh * 1.8f;
-            auto e = s.Entity_CreateCube("power_stack");
+            auto e = SpawnInst(meshPowerStack_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(sr, sh, sr));
             tr->Translate(XMFLOAT3(c.x + bw * 0.5f, sh, c.y + bw * 0.4f));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.45f, 0.42f, 0.40f, 1.0f));
             cellEntities[idx].push_back(e);
         }
         // Yellow warning stripe at base
         {
-            auto e = s.Entity_CreateCube("power_stripe");
+            auto e = SpawnInst(meshPowerStripe_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(bw * 1.02f, bh * 0.08f, bw * 1.02f));
             tr->Translate(XMFLOAT3(c.x, bh * 0.08f, c.y));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.85f, 0.75f, 0.10f, 1.0f));
-            mat->SetEmissiveColor(XMFLOAT4(0.85f, 0.75f, 0.10f, 1.5f));
             cellEntities[idx].push_back(e);
         }
     }
@@ -1704,38 +1788,31 @@ private:
         float bh = CELL_SIZE * 0.30f;
         // Pump station base (light blue-gray)
         {
-            auto e = s.Entity_CreateCube("wpump_base");
+            auto e = SpawnInst(meshWpumpBase_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(bw, bh, bw));
             tr->Translate(XMFLOAT3(c.x, bh, c.y));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.35f, 0.50f, 0.65f, 1.0f));
             cellEntities[idx].push_back(e);
         }
         // Pipe going down (cylinder-ish cube)
         {
             float pr = bw * 0.15f;
             float ph = bh * 0.6f;
-            auto e = s.Entity_CreateCube("wpump_pipe");
+            auto e = SpawnInst(meshWpumpPipe_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(pr, ph, pr));
             tr->Translate(XMFLOAT3(c.x - bw * 0.4f, ph, c.y));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.20f, 0.35f, 0.55f, 1.0f));
             cellEntities[idx].push_back(e);
         }
         // Blue indicator on top
         {
-            auto e = s.Entity_CreateCube("wpump_indicator");
+            auto e = SpawnInst(meshWpumpInd_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(bw * 0.3f, bh * 0.12f, bw * 0.3f));
             tr->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.12f, c.y));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.10f, 0.40f, 0.90f, 1.0f));
-            mat->SetEmissiveColor(XMFLOAT4(0.10f, 0.40f, 0.90f, 2.0f));
             cellEntities[idx].push_back(e);
         }
     }
@@ -1746,36 +1823,29 @@ private:
         float bh = CELL_SIZE * 0.38f;
         // Main building (dark blue)
         {
-            auto e = s.Entity_CreateCube("police_main");
+            auto e = SpawnInst(meshPoliceMain_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(bw, bh, bw));
             tr->Translate(XMFLOAT3(c.x, bh, c.y));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.15f, 0.20f, 0.45f, 1.0f));
             cellEntities[idx].push_back(e);
         }
         // Roof stripe (white)
         {
-            auto e = s.Entity_CreateCube("police_roof");
+            auto e = SpawnInst(meshPoliceRoof_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(bw * 1.04f, bh * 0.08f, bw * 1.04f));
             tr->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.08f, c.y));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.85f, 0.85f, 0.90f, 1.0f));
             cellEntities[idx].push_back(e);
         }
         // Blue light on top
         {
-            auto e = s.Entity_CreateCube("police_light");
+            auto e = SpawnInst(meshPoliceLight_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(bw * 0.12f, bh * 0.10f, bw * 0.12f));
             tr->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.26f, c.y));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.10f, 0.30f, 0.95f, 1.0f));
-            mat->SetEmissiveColor(XMFLOAT4(0.10f, 0.30f, 0.95f, 3.0f));
             cellEntities[idx].push_back(e);
         }
     }
@@ -1786,49 +1856,40 @@ private:
         float bh = CELL_SIZE * 0.35f;
         // Main building (dark red)
         {
-            auto e = s.Entity_CreateCube("fire_main");
+            auto e = SpawnInst(meshFireMain_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(bw, bh, bw));
             tr->Translate(XMFLOAT3(c.x, bh, c.y));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.65f, 0.12f, 0.10f, 1.0f));
             cellEntities[idx].push_back(e);
         }
         // Garage door (lighter red stripe at base)
         {
-            auto e = s.Entity_CreateCube("fire_door");
+            auto e = SpawnInst(meshFireDoor_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(bw * 0.6f, bh * 0.55f, 0.15f));
             tr->Translate(XMFLOAT3(c.x, bh * 0.55f, c.y - bw - 0.16f));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.80f, 0.25f, 0.20f, 1.0f));
             cellEntities[idx].push_back(e);
         }
         // Tower (hose tower)
         {
             float tw = bw * 0.20f;
             float th = bh * 1.8f;
-            auto e = s.Entity_CreateCube("fire_tower");
+            auto e = SpawnInst(meshFireTower_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(tw, th, tw));
             tr->Translate(XMFLOAT3(c.x + bw * 0.55f, th, c.y + bw * 0.45f));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.55f, 0.10f, 0.08f, 1.0f));
             cellEntities[idx].push_back(e);
         }
         // Red light on top
         {
-            auto e = s.Entity_CreateCube("fire_light");
+            auto e = SpawnInst(meshFireLight_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(bw * 0.12f, bh * 0.10f, bw * 0.12f));
             tr->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.18f, c.y));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.95f, 0.15f, 0.10f, 1.0f));
-            mat->SetEmissiveColor(XMFLOAT4(0.95f, 0.15f, 0.10f, 3.0f));
             cellEntities[idx].push_back(e);
         }
     }
@@ -1839,48 +1900,38 @@ private:
         float bh = CELL_SIZE * 0.45f;
         // Main building (white)
         {
-            auto e = s.Entity_CreateCube("hospital_main");
+            auto e = SpawnInst(meshHospMain_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(bw, bh, bw));
             tr->Translate(XMFLOAT3(c.x, bh, c.y));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.90f, 0.90f, 0.92f, 1.0f));
             cellEntities[idx].push_back(e);
         }
         // Red cross – horizontal bar
         {
-            auto e = s.Entity_CreateCube("hospital_crossH");
+            auto e = SpawnInst(meshHospCrossH_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(bw * 0.40f, bh * 0.12f, 0.16f));
             tr->Translate(XMFLOAT3(c.x, bh * 1.35f, c.y - bw - 0.17f));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.90f, 0.10f, 0.10f, 1.0f));
-            mat->SetEmissiveColor(XMFLOAT4(0.90f, 0.10f, 0.10f, 1.5f));
             cellEntities[idx].push_back(e);
         }
         // Red cross – vertical bar
         {
-            auto e = s.Entity_CreateCube("hospital_crossV");
+            auto e = SpawnInst(meshHospCrossV_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(bw * 0.12f, bh * 0.35f, 0.16f));
             tr->Translate(XMFLOAT3(c.x, bh * 1.35f, c.y - bw - 0.17f));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.90f, 0.10f, 0.10f, 1.0f));
-            mat->SetEmissiveColor(XMFLOAT4(0.90f, 0.10f, 0.10f, 1.5f));
             cellEntities[idx].push_back(e);
         }
         // Roof cap
         {
-            auto e = s.Entity_CreateCube("hospital_roof");
+            auto e = SpawnInst(meshHospRoof_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(bw * 1.05f, bh * 0.06f, bw * 1.05f));
             tr->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.06f, c.y));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.75f, 0.78f, 0.80f, 1.0f));
             cellEntities[idx].push_back(e);
         }
     }
@@ -1891,38 +1942,86 @@ private:
         float bh = CELL_SIZE * 0.30f;
         // Main building (dark yellow / industrial)
         {
-            auto e = s.Entity_CreateCube("busdepot_main");
+            auto e = SpawnInst(meshBusMain_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(bw, bh, bw));
             tr->Translate(XMFLOAT3(c.x, bh, c.y));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.75f, 0.60f, 0.15f, 1.0f));
             cellEntities[idx].push_back(e);
         }
         // Flat roof overhang
         {
-            auto e = s.Entity_CreateCube("busdepot_roof");
+            auto e = SpawnInst(meshBusRoof_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(bw * 1.10f, bh * 0.06f, bw * 1.10f));
             tr->Translate(XMFLOAT3(c.x, bh * 2.0f + bh * 0.06f, c.y));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.55f, 0.45f, 0.10f, 1.0f));
             cellEntities[idx].push_back(e);
         }
         // Bus icon on front (yellow stripe)
         {
-            auto e = s.Entity_CreateCube("busdepot_icon");
+            auto e = SpawnInst(meshBusIcon_, s);
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(bw * 0.50f, bh * 0.25f, 0.15f));
             tr->Translate(XMFLOAT3(c.x, bh * 1.2f, c.y - bw - 0.16f));
             tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.95f, 0.80f, 0.10f, 1.0f));
-            mat->SetEmissiveColor(XMFLOAT4(0.95f, 0.80f, 0.05f, 2.0f));
             cellEntities[idx].push_back(e);
         }
     }
 
+    // ── Shared mesh prototypes for GPU instancing ──────────────────────
+    wi::ecs::Entity meshRoad_        = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshCrosswalk_   = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshSidewalk_    = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshCorner_      = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshZebra_       = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshLaneLine_    = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshLaneDash_    = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshHouse_       = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshHouseRoof_   = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshWorkplace_   = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshWorkCrown_   = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshParkSlab_    = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshParkCol_     = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshParkRoof_    = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshParkRamp_    = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshParkSign_    = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshLakeBed_     = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshLakeWater_   = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshLakeShore_   = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshPowerMain_   = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshPowerStack_  = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshPowerStripe_ = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshWpumpBase_   = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshWpumpPipe_   = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshWpumpInd_    = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshPoliceMain_  = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshPoliceRoof_  = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshPoliceLight_ = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshFireMain_    = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshFireDoor_    = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshFireTower_   = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshFireLight_   = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshHospMain_    = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshHospCrossH_  = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshHospCrossV_  = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshHospRoof_    = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshBusMain_     = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshBusRoof_     = wi::ecs::INVALID_ENTITY;
+    wi::ecs::Entity meshBusIcon_     = wi::ecs::INVALID_ENTITY;
+
+    // Create an instance entity referencing a shared mesh prototype.
+    wi::ecs::Entity SpawnInst(wi::ecs::Entity sharedMesh, wi::scene::Scene& s,
+                              XMFLOAT4 color = XMFLOAT4(1.f, 1.f, 1.f, 1.f))
+    {
+        wi::ecs::Entity e = wi::ecs::CreateEntity();
+        s.layers.Create(e);
+        s.transforms.Create(e);
+        auto& obj = s.objects.Create(e);
+        obj.meshID = sharedMesh;
+        obj.color  = color;
+        // City geometry is static – no shadows keeps shadow CPU near 0ms
+        obj.SetCastShadow(false);
+        return e;
+    }
 };
