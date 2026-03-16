@@ -29,11 +29,11 @@ road_lines = [0, 5, 10, 15, 20, 25, 30, 35, 39]
 for z in road_lines:
     for x in range(GRID):
         grid[z][x] = ROAD
-        lanes[z][x] = 4
+        lanes[z][x] = 6
 for x in road_lines:
     for z in range(GRID):
         grid[z][x] = ROAD
-        lanes[z][x] = 4
+        lanes[z][x] = 6
 
 # Arterials (6 lanes) – center cross + inner ring
 for a in [15, 20, 25]:

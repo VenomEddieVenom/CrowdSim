@@ -70,6 +70,12 @@ public:
     uint32_t GetWalkingCount() const;
     uint32_t GetWaitingCount() const;
 
+    // Reset all peds (for save loading)
+    void ResetAll() { activeCount_ = 0; }
+
+    // Shadow casting toggle — applies to all visible ped instances
+    void SetShadowCasting(bool value);
+
 private:
     uint32_t activeCount_ = 0;
 

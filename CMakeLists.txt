@@ -132,6 +132,17 @@ if(_WE_TYPE STREQUAL "SHARED_LIBRARY")
     )
 endif()
 
+# Copy textures to output directory
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/textures")
+    add_custom_command(TARGET CrowdSim POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_CURRENT_SOURCE_DIR}/textures"
+            "$<TARGET_FILE_DIR:CrowdSim>/textures"
+        COMMENT "Copying textures..."
+        VERBATIM
+    )
+endif()
+
 # Copy custom models (e.g. drzewo.wiscene placed in build/models/ by the user)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/build/models/drzewo.wiscene")
     add_custom_command(TARGET CrowdSim POST_BUILD

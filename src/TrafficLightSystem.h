@@ -5,17 +5,19 @@
 #include <cmath>
 
 // ============================================================
-//  TrafficLightSystem  –  Collision-free 4×(green+yellow) phases
+//  TrafficLightSystem  –  Collision-free 4×(green+yellow) + ped phase
 //
 //  Phase 0 (N_GREEN):  N all turns,  W right-only          8 s
-//  Phase 1 (N_YELLOW): yellow for above                    2 s
+//  Phase 1 (N_YELLOW): yellow for above                    3.5 s
 //  Phase 2 (E_GREEN):  E all turns,  N right-only          8 s
-//  Phase 3 (E_YELLOW): yellow for above                    2 s
+//  Phase 3 (E_YELLOW): yellow for above                    3.5 s
 //  Phase 4 (S_GREEN):  S all turns,  E right-only          8 s
-//  Phase 5 (S_YELLOW): yellow for above                    2 s
+//  Phase 5 (S_YELLOW): yellow for above                    3.5 s
 //  Phase 6 (W_GREEN):  W all turns,  S right-only          8 s
-//  Phase 7 (W_YELLOW): yellow for above                    2 s
-//  Total cycle: 40 s
+//  Phase 7 (W_YELLOW): yellow for above                    3.5 s
+//  Phase 8 (PED_WALK): all vehicles RED, peds GREEN        20 s
+//  Phase 9 (PED_CLEAR): ALL red (cars+peds) clearance      5 s
+//  Total cycle: 71 s
 // ============================================================
 class TrafficLightSystem
 {
@@ -24,10 +26,12 @@ public:
     static constexpr float CS = CityLayout::CELL_SIZE;
 
     // Phase durations (seconds)
-    static constexpr float GREEN_DUR   = 8.0f;
-    static constexpr float YELLOW_DUR  = 2.0f;
-    static constexpr float CYCLE_DUR   = (GREEN_DUR + YELLOW_DUR) * 4.0f; // 40 s
-    static constexpr int   NUM_PHASES  = 8;
+    static constexpr float GREEN_DUR     = 8.0f;
+    static constexpr float YELLOW_DUR    = 3.5f;   // 2s yellow + 1.5s all-red clearance
+    static constexpr float PED_DUR       = 20.0f;  // pedestrian crossing phase (enough for slow peds to cross 20m cell)
+    static constexpr float PED_CLEAR_DUR = 5.0f;   // all-red clearance after ped walk
+    static constexpr float CYCLE_DUR     = (GREEN_DUR + YELLOW_DUR) * 4.0f + PED_DUR + PED_CLEAR_DUR; // 71 s
+    static constexpr int   NUM_PHASES    = 10;
 
     enum class Phase : uint8_t {
         N_GREEN  = 0,   // N dominant + W right-turn
@@ -37,7 +41,9 @@ public:
         S_GREEN  = 4,   // S dominant + E right-turn
         S_YELLOW = 5,
         W_GREEN  = 6,   // W dominant + S right-turn
-        W_YELLOW = 7
+        W_YELLOW = 7,
+        PED_WALK  = 8,  // all vehicles RED, pedestrians GREEN
+        PED_CLEAR = 9   // all RED (cars+peds) — clearance for peds still crossing
     };
 
     // Approach direction as seen by the car
@@ -80,28 +86,23 @@ public:
         int key = gz * GS + gx;
         if (!isIntersection_[key]) return LightColor::GREEN;
 
-        ApproachDir ad = GetApproachDir(dx, dz);
         Phase ph = phase_[key];
 
-        // Dominant direction per green phase: N,E,S,W
-        // Companion right-turn: W,N,E,S (turns into dominant's road)
-        // Green phases are 0,2,4,6; yellow phases are 1,3,5,7.
+        // PED_WALK / PED_CLEAR: all vehicles RED
+        if (ph == Phase::PED_WALK || ph == Phase::PED_CLEAR) return LightColor::RED;
+
         int phIdx = static_cast<int>(ph);
         bool isYellow = (phIdx & 1) != 0;
         int greenIdx = isYellow ? (phIdx - 1) : phIdx;
 
-        // Map greenIdx → dominant approach dir
-        // 0→N, 2→E, 4→S, 6→W
         ApproachDir dominant   = static_cast<ApproachDir>(greenIdx / 2);
-        // Companion = prev CW direction: N→W, E→N, S→E, W→S
         ApproachDir companion  = static_cast<ApproachDir>((static_cast<int>(dominant) + 3) % 4);
 
+        ApproachDir ad = GetApproachDir(dx, dz);
         if (ad == dominant) {
-            // Dominant direction: all turns allowed
             return isYellow ? LightColor::YELLOW : LightColor::GREEN;
         }
         if (ad == companion && intent == TurnIntent::RIGHT) {
-            // Companion: right turn only
             return isYellow ? LightColor::YELLOW : LightColor::GREEN;
         }
         return LightColor::RED;
@@ -133,6 +134,8 @@ public:
         case Phase::S_YELLOW: return "S Yellow";
         case Phase::W_GREEN:  return "W Green (+S right)";
         case Phase::W_YELLOW: return "W Yellow";
+        case Phase::PED_WALK:  return "Pedestrian Walk";
+        case Phase::PED_CLEAR: return "Ped Clearance (All Red)";
         }
         return "?";
     }
@@ -146,26 +149,15 @@ public:
         return "?";
     }
 
-    bool CanPedestrianCross(int gx, int gz, Axis crossAxis) const
+    bool CanPedestrianCross(int gx, int gz, Axis /*crossAxis*/) const
     {
         if (gx < 0 || gx >= GS || gz < 0 || gz >= GS) return true;
         int key = gz * GS + gx;
         if (!isIntersection_[key]) return true;
 
-        Phase ph = phase_[key];
-        int phIdx = static_cast<int>(ph);
-        int greenIdx = (phIdx & 1) ? (phIdx - 1) : phIdx;
-        ApproachDir dominant = static_cast<ApproachDir>(greenIdx / 2);
-
-        // Pedestrians crossing NS can walk when no NS traffic is dominant
-        // Pedestrians crossing EW can walk when no EW traffic is dominant
-        if (crossAxis == Axis::NS) {
-            // Safe when dominant is E or W (no NS traffic)
-            return (dominant == ApproachDir::E || dominant == ApproachDir::W);
-        } else {
-            // Safe when dominant is N or S (no EW traffic)
-            return (dominant == ApproachDir::N || dominant == ApproachDir::S);
-        }
+        // Pedestrians may ONLY start crossing during the dedicated PED_WALK phase.
+        // During PED_CLEAR all lights are red (grace period), but no new crossings.
+        return phase_[key] == Phase::PED_WALK;
     }
 
 private:
@@ -183,6 +175,7 @@ private:
         wi::ecs::Entity arrowLeft     = wi::ecs::INVALID_ENTITY;
         wi::ecs::Entity arrowStraight = wi::ecs::INVALID_ENTITY;
         wi::ecs::Entity arrowRight    = wi::ecs::INVALID_ENTITY;
+        wi::ecs::Entity pedSignal     = wi::ecs::INVALID_ENTITY;   // walk / don't-walk
         bool hasLeft = false, hasStraight = false, hasRight = false;
     };
     std::vector<std::vector<PoleVisuals>> poleVisuals_;
@@ -196,6 +189,8 @@ private:
     }
     static float PhaseDuration(Phase p)
     {
+        if (p == Phase::PED_WALK)  return PED_DUR;
+        if (p == Phase::PED_CLEAR) return PED_CLEAR_DUR;
         int phIdx = static_cast<int>(p);
         return (phIdx & 1) ? YELLOW_DUR : GREEN_DUR;
     }

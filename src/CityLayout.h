@@ -12,7 +12,7 @@
 // ============================================================
 //  CityLayout  –  user-editable grid city
 //
-//  40×40 cells, 20 m each (world: ±400 m).
+//  100×100 cells, 20 m each (world: ±1000 m).
 //  Cell types: EMPTY, ROAD, HOUSE, WORKPLACE.
 //  FindPath() does BFS on ROAD cells and returns world-space
 //  waypoints for CrowdSystem::SpawnAgents().
@@ -20,9 +20,9 @@
 class CityLayout
 {
 public:
-    static constexpr int   GRID_SIZE  = 40;
+    static constexpr int   GRID_SIZE  = 100;
     static constexpr float CELL_SIZE  = 20.0f;
-    static constexpr float HALF_WORLD = GRID_SIZE * CELL_SIZE * 0.5f;   // 400 m
+    static constexpr float HALF_WORLD = GRID_SIZE * CELL_SIZE * 0.5f;   // 1000 m
     static constexpr float SIDEWALK_W = 2.0f;
     static constexpr float GRID_CELL  = 2.0f;  // legacy API compat
 
@@ -32,7 +32,7 @@ public:
     static constexpr int   SW_DIM      = GRID_SIZE * SW_SUB;          // 400
     bool sidewalkLayer[SW_DIM * SW_DIM] = {};
 
-    enum class CellType : uint8_t { EMPTY = 0, ROAD, HOUSE, WORKPLACE, CROSSWALK, PARKING, LAKE, POWER_PLANT, WATER_PUMP, POLICE, FIRE_STATION, HOSPITAL, BUS_DEPOT, BUS_STOP };
+    enum class CellType : uint8_t { EMPTY = 0, ROAD, HOUSE, WORKPLACE, CROSSWALK, PARKING, LAKE, POWER_PLANT, WATER_PUMP, POLICE, FIRE_STATION, HOSPITAL, BUS_DEPOT };
 
     // Flat arrays indexed [gz * GRID_SIZE + gx]
     CellType                     cellType   [GRID_SIZE * GRID_SIZE] = {};
@@ -51,10 +51,16 @@ public:
     std::vector<wi::ecs::Entity> laneMarkEntities_;
     bool laneMarksDirty_ = false;
 
+    // Cached road PBR textures (loaded once in Initialize)
+    wi::Resource roadTexDiffuse_;
+    wi::Resource roadTexNormal_;
+    wi::Resource roadTexRoughness_;
+    bool roadTexturesLoaded_ = false;
+
     int  GetRoadLanes(int gx, int gz) const {
         if (gx < 0 || gx >= GRID_SIZE || gz < 0 || gz >= GRID_SIZE) return 6;
         int v = roadLanes_[gz * GRID_SIZE + gx];
-        return (v == 2 || v == 4) ? v : 6;
+        return (v == 2) ? 2 : 6;
     }
     void SetRoadLanes(int gx, int gz, int lanes) {
         if (gx >= 0 && gx < GRID_SIZE && gz >= 0 && gz < GRID_SIZE)
@@ -62,7 +68,7 @@ public:
     }
     void CycleRoadLanes(int gx, int gz) {
         int cur = GetRoadLanes(gx, gz);
-        int next = (cur == 2) ? 4 : (cur == 4) ? 6 : 2;
+        int next = (cur == 2) ? 6 : 2;
         SetRoadLanes(gx, gz, next);
         // Propagate to adjacent crosswalk cells so cars stay consistent
         const int ddx[] = {1,-1,0,0};
@@ -100,6 +106,13 @@ public:
         return t == CellType::ROAD || t == CellType::CROSSWALK;
     }
 
+    // A building cell must have at least one adjacent road/crosswalk cell
+    bool HasRoadAccess(int gx, int gz) const
+    {
+        return IsRoadLike(gx-1, gz) || IsRoadLike(gx+1, gz)
+            || IsRoadLike(gx, gz-1) || IsRoadLike(gx, gz+1);
+    }
+
     bool IsLake(int gx, int gz) const
     {
         if (!InBounds(gx, gz)) return false;
@@ -125,11 +138,25 @@ public:
         auto& scene = wi::scene::GetScene();
         auto  ground = scene.Entity_CreateCube("ground");
         auto* tr  = scene.transforms.GetComponent(ground);
-        tr->Scale(XMFLOAT3(HALF_WORLD, 0.05f, HALF_WORLD));
+        // Make grass plane very large (5000m radius) for visual infinity
+        tr->Scale(XMFLOAT3(5000.0f, 0.05f, 5000.0f));
         tr->Translate(XMFLOAT3(0.0f, -0.05f, 0.0f));
         tr->UpdateTransform();
         scene.materials.GetComponent(ground)->SetBaseColor(
             XMFLOAT4(0.18f, 0.38f, 0.12f, 1.0f)); // green grass (desaturated)
+
+        // Load road PBR textures
+        roadTexDiffuse_   = wi::resourcemanager::Load("textures/asphalt_02_diff_1k.jpg");
+        roadTexNormal_    = wi::resourcemanager::Load("textures/asphalt_02_nor_gl_1k.png",
+                                wi::resourcemanager::Flags::IMPORT_NORMALMAP);
+        roadTexRoughness_ = wi::resourcemanager::Load("textures/asphalt_02_rough_1k.jpg");
+        roadTexturesLoaded_ = roadTexDiffuse_.IsValid() && roadTexNormal_.IsValid()
+                           && roadTexRoughness_.IsValid();
+        wi::backlog::post("[CityLayout] Road textures loaded: " +
+            std::string(roadTexturesLoaded_ ? "YES" : "NO") +
+            " (diff=" + std::to_string(roadTexDiffuse_.IsValid()) +
+            " norm=" + std::to_string(roadTexNormal_.IsValid()) +
+            " rough=" + std::to_string(roadTexRoughness_.IsValid()) + ")");
 
         // Load dom.wiscene ONCE into a prefab scene, then merge its meshes/materials
         // into the main scene. All houses share the same mesh entity IDs → GPU instancing.
@@ -348,7 +375,6 @@ public:
         case CellType::FIRE_STATION: BuildFireStation(idx, gx, gz, c, s); break;
         case CellType::HOSPITAL:     BuildHospital(idx, gx, gz, c, s);  break;
         case CellType::BUS_DEPOT:    BuildBusDepot(idx, gx, gz, c, s);  break;
-        case CellType::BUS_STOP:     BuildBusStop(idx, gx, gz, c, s);   break;
         default: break;
         }
         // Rebuild neighboring roads so they update their sidewalk open-sides
@@ -377,12 +403,12 @@ public:
     // ----------------------------------------------------------
     //  Save / Load  –  binary file: 4-byte magic + cell type grid
     // ----------------------------------------------------------
-    bool SaveToFile(const char* path) const
+    bool SaveToFile(const char* path, float timeOfDay = 0.3f, float treasury = 0.0f, float taxRate = 0.1f) const
     {
         std::ofstream f(path, std::ios::binary);
         if (!f) return false;
         uint32_t magic = 0x43495459; // "CITY"
-        uint32_t ver   = 2;
+        uint32_t ver   = 3;
         uint32_t gs    = GRID_SIZE;
         f.write(reinterpret_cast<const char*>(&magic), 4);
         f.write(reinterpret_cast<const char*>(&ver), 4);
@@ -390,6 +416,10 @@ public:
         f.write(reinterpret_cast<const char*>(cellType), GRID_SIZE * GRID_SIZE);
         f.write(reinterpret_cast<const char*>(housePopulation_), GRID_SIZE * GRID_SIZE * sizeof(int));
         f.write(reinterpret_cast<const char*>(roadLanes_), GRID_SIZE * GRID_SIZE * sizeof(int));
+        // v3: extra simulation state
+        f.write(reinterpret_cast<const char*>(&timeOfDay), sizeof(float));
+        f.write(reinterpret_cast<const char*>(&treasury), sizeof(float));
+        f.write(reinterpret_cast<const char*>(&taxRate), sizeof(float));
         return f.good();
     }
 
@@ -399,6 +429,9 @@ public:
         CellType cells[GRID_SIZE * GRID_SIZE] = {};
         int      housePop[GRID_SIZE * GRID_SIZE] = {};
         int      roadLanes[GRID_SIZE * GRID_SIZE] = {};
+        float    timeOfDay = 0.3f;
+        float    treasury  = 0.0f;
+        float    taxRate   = 0.1f;
         bool     valid = false;
     };
 
@@ -411,12 +444,20 @@ public:
         f.read(reinterpret_cast<char*>(&magic), 4);
         f.read(reinterpret_cast<char*>(&ver), 4);
         f.read(reinterpret_cast<char*>(&gs), 4);
-        if (magic != 0x43495459 || (ver != 1 && ver != 2)) return sd;
+        if (magic != 0x43495459 || (ver != 1 && ver != 2 && ver != 3)) return sd;
         if (gs != (uint32_t)GRID_SIZE) return sd;
         f.read(reinterpret_cast<char*>(sd.cells),    gs * gs);
+        // Convert removed BUS_STOP (old value 13) to ROAD for backward-compat
+        for (uint32_t i = 0; i < gs * gs; ++i)
+            if (static_cast<uint8_t>(sd.cells[i]) == 13) sd.cells[i] = CellType::ROAD;
         f.read(reinterpret_cast<char*>(sd.housePop), gs * gs * sizeof(int));
         if (ver >= 2)
             f.read(reinterpret_cast<char*>(sd.roadLanes), gs * gs * sizeof(int));
+        if (ver >= 3) {
+            f.read(reinterpret_cast<char*>(&sd.timeOfDay), sizeof(float));
+            f.read(reinterpret_cast<char*>(&sd.treasury), sizeof(float));
+            f.read(reinterpret_cast<char*>(&sd.taxRate), sizeof(float));
+        }
         if (!f.good()) return sd;
         sd.valid = true;
         return sd;
@@ -663,6 +704,26 @@ public:
     }
 
 private:
+    // Apply PBR asphalt textures to a road/crosswalk material
+    void ApplyRoadTexture(wi::scene::MaterialComponent* mat)
+    {
+        using MC = wi::scene::MaterialComponent;
+        mat->SetBaseColor(XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f));
+        if (roadTexturesLoaded_) {
+            mat->textures[MC::BASECOLORMAP].resource = roadTexDiffuse_;
+            mat->textures[MC::NORMALMAP].resource    = roadTexNormal_;
+            mat->textures[MC::SURFACEMAP].resource   = roadTexRoughness_;
+            mat->SetRoughness(1.0f);
+            mat->SetMetalness(0.0f);
+            mat->SetNormalMapStrength(1.0f);
+            // Tile the texture across the cell (cell = 20m, texture should repeat ~2x)
+            mat->texMulAdd = XMFLOAT4(2.0f, 2.0f, 0.0f, 0.0f);
+            mat->SetDirty();
+        } else {
+            mat->SetBaseColor(XMFLOAT4(0.10f, 0.10f, 0.12f, 1.0f));
+        }
+    }
+
     void BuildRoad(int idx, int gx, int gz, XMFLOAT2 c, wi::scene::Scene& s)
     {
         const float h   = CELL_SIZE * 0.5f;
@@ -678,7 +739,7 @@ private:
                 tr->UpdateTransform();
             }
             auto* mat = s.materials.GetComponent(e);
-            if (mat) mat->SetBaseColor(XMFLOAT4(0.10f, 0.10f, 0.12f, 1.0f));
+            if (mat) ApplyRoadTexture(mat);
             cellEntities[idx].push_back(e);
         }
 
@@ -962,8 +1023,6 @@ public:
                         if (lanes >= 6) {
                             divs[nDiv++] = 2.67f; divs[nDiv++] = -2.67f;
                             divs[nDiv++] = 5.33f; divs[nDiv++] = -5.33f;
-                        } else if (lanes >= 4) {
-                            divs[nDiv++] = 4.0f;  divs[nDiv++] = -4.0f;
                         }
                         XMFLOAT2 cc = GridCellCenter(gx, rz);
                         for (int d = 0; d < nDiv; ++d) {
@@ -1018,8 +1077,6 @@ public:
                         if (lanes >= 6) {
                             divs[nDiv++] = 2.67f; divs[nDiv++] = -2.67f;
                             divs[nDiv++] = 5.33f; divs[nDiv++] = -5.33f;
-                        } else if (lanes >= 4) {
-                            divs[nDiv++] = 4.0f;  divs[nDiv++] = -4.0f;
                         }
                         XMFLOAT2 cc = GridCellCenter(rx, gz);
                         for (int d = 0; d < nDiv; ++d) {
@@ -1074,7 +1131,7 @@ private:
                 tr->UpdateTransform();
             }
             auto* mat = s.materials.GetComponent(e);
-            if (mat) mat->SetBaseColor(XMFLOAT4(0.10f, 0.10f, 0.12f, 1.0f));
+            if (mat) ApplyRoadTexture(mat);
             cellEntities[idx].push_back(e);
         }
 
@@ -1215,14 +1272,13 @@ public:
     // Service coverage radius (in grid cells, Manhattan distance)
     static constexpr int SERVICE_RADIUS = 10;
 
-    // Check whether a house cell is covered by all three services
+    // Check whether a house cell is covered by all three services (square/Chebyshev range)
     bool HasFullServiceCoverage(int hx, int hz) const
     {
         bool police = false, fire = false, hospital = false;
         int r = SERVICE_RADIUS;
         for (int dz = -r; dz <= r && !(police && fire && hospital); ++dz)
         for (int dx = -r; dx <= r && !(police && fire && hospital); ++dx) {
-            if (std::abs(dx) + std::abs(dz) > r) continue;
             int nx = hx + dx, nz = hz + dz;
             if (!InBounds(nx, nz)) continue;
             auto ct = cellType[nz * GRID_SIZE + nx];
@@ -1231,6 +1287,19 @@ public:
             if (ct == CellType::HOSPITAL)     hospital = true;
         }
         return police && fire && hospital;
+    }
+
+    // Check whether a house cell is covered by a specific service type (square/Chebyshev range)
+    bool HasSpecificServiceCoverage(int hx, int hz, CellType serviceType) const
+    {
+        int r = SERVICE_RADIUS;
+        for (int dz = -r; dz <= r; ++dz)
+        for (int dx = -r; dx <= r; ++dx) {
+            int nx = hx + dx, nz = hz + dz;
+            if (!InBounds(nx, nz)) continue;
+            if (cellType[nz * GRID_SIZE + nx] == serviceType) return true;
+        }
+        return false;
     }
 
     // Utility system tracking
@@ -1551,21 +1620,20 @@ private:
             mat->SetBaseColor(XMFLOAT4(0.02f, 0.05f, 0.04f, 1.0f));
             cellEntities[idx].push_back(e);
         }
-        // Water surface – translucent PBR (no planar reflections, cheap)
+        // Water surface – opaque flat plane just above ground
         {
             auto e = s.Entity_CreateCube("lake_water");
             auto* tr = s.transforms.GetComponent(e);
             tr->Scale(XMFLOAT3(hw, 0.02f, hw));
-            tr->Translate(XMFLOAT3(c.x, -0.02f, c.y));
+            tr->Translate(XMFLOAT3(c.x, 0.08f, c.y));
             tr->UpdateTransform();
             auto* mat = s.materials.GetComponent(e);
             mat->shaderType = wi::scene::MaterialComponent::SHADERTYPE_PBR;
-            mat->SetBaseColor(XMFLOAT4(0.01f, 0.08f, 0.18f, 0.70f));
-            mat->SetEmissiveColor(XMFLOAT4(0.005f, 0.04f, 0.12f, 0.35f));
-            mat->SetRoughness(0.15f);
-            mat->SetReflectance(0.6f);
-            mat->SetMetalness(0.3f);
-            mat->userBlendMode = wi::enums::BLENDMODE_ALPHA;
+            mat->SetBaseColor(XMFLOAT4(0.04f, 0.15f, 0.30f, 1.0f));
+            mat->SetEmissiveColor(XMFLOAT4(0.01f, 0.06f, 0.15f, 0.5f));
+            mat->SetRoughness(0.08f);
+            mat->SetReflectance(0.8f);
+            mat->SetMetalness(0.0f);
             cellEntities[idx].push_back(e);
         }
         // Shore edges where no adjacent lake
@@ -1857,34 +1925,4 @@ private:
         }
     }
 
-    void BuildBusStop(int idx, int gx, int gz, XMFLOAT2 c, wi::scene::Scene& s)
-    {
-        // Bus stop is placed on road cells — build a small shelter sign
-        // First build the road surface underneath
-        BuildRoad(idx, gx, gz, c, s);
-        // Add a small pole + sign at the sidewalk edge
-        float poleH = 3.5f;
-        {
-            auto e = s.Entity_CreateCube("busstop_pole");
-            auto* tr = s.transforms.GetComponent(e);
-            tr->Scale(XMFLOAT3(0.08f, poleH * 0.5f, 0.08f));
-            tr->Translate(XMFLOAT3(c.x + 8.5f, poleH * 0.5f, c.y));
-            tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.40f, 0.40f, 0.45f, 1.0f));
-            cellEntities[idx].push_back(e);
-        }
-        // Sign board
-        {
-            auto e = s.Entity_CreateCube("busstop_sign");
-            auto* tr = s.transforms.GetComponent(e);
-            tr->Scale(XMFLOAT3(0.40f, 0.30f, 0.05f));
-            tr->Translate(XMFLOAT3(c.x + 8.5f, poleH, c.y));
-            tr->UpdateTransform();
-            auto* mat = s.materials.GetComponent(e);
-            mat->SetBaseColor(XMFLOAT4(0.10f, 0.60f, 0.90f, 1.0f));
-            mat->SetEmissiveColor(XMFLOAT4(0.10f, 0.60f, 0.90f, 1.5f));
-            cellEntities[idx].push_back(e);
-        }
-    }
 };

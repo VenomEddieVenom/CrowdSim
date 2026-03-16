@@ -1,24 +1,26 @@
 {
     "version": "2.0.0",
+    "options": {
+        "shell": {
+            "executable": "cmd.exe",
+            "args": ["/d", "/c"]
+        },
+        "env": {
+            "VSCMD_START_DIR": "${workspaceFolder}"
+        }
+    },
     "tasks": [
         {
             "label": "Kill CrowdSim",
             "type": "shell",
-            "command": "Stop-Process -Name CrowdSim -Force -ErrorAction SilentlyContinue; exit 0",
+            "command": "powershell -Command \"Stop-Process -Name CrowdSim -Force -ErrorAction SilentlyContinue; exit 0\"",
             "presentation": { "reveal": "silent", "panel": "shared" },
             "problemMatcher": []
         },
         {
             "label": "CMake: Configure (Release)",
             "type": "shell",
-            "command": "cmake",
-            "args": [
-                "-B", "${workspaceFolder}/build",
-                "-S", "${workspaceFolder}",
-                "-DCMAKE_BUILD_TYPE=Release",
-                "-G", "Visual Studio 17 2022",
-                "-A", "x64"
-            ],
+            "command": "\"C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvarsall.bat\" amd64 >nul 2>&1 && cmake -B ${workspaceFolder}/build -S ${workspaceFolder} -DCMAKE_BUILD_TYPE=Release -G Ninja -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl",
             "group": "build",
             "presentation": {
                 "reveal": "always",
@@ -30,14 +32,7 @@
         {
             "label": "CMake: Configure (Debug)",
             "type": "shell",
-            "command": "cmake",
-            "args": [
-                "-B", "${workspaceFolder}/build",
-                "-S", "${workspaceFolder}",
-                "-DCMAKE_BUILD_TYPE=Debug",
-                "-G", "Visual Studio 17 2022",
-                "-A", "x64"
-            ],
+            "command": "\"C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvarsall.bat\" amd64 >nul 2>&1 && cmake -B ${workspaceFolder}/build -S ${workspaceFolder} -DCMAKE_BUILD_TYPE=Debug -G Ninja -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl",
             "group": "build",
             "presentation": {
                 "reveal": "always",
@@ -49,12 +44,7 @@
         {
             "label": "CMake: Build Release",
             "type": "shell",
-            "command": "cmake",
-            "args": [
-                "--build", "${workspaceFolder}/build",
-                "--config", "Release",
-                "--parallel"
-            ],
+            "command": "\"C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvarsall.bat\" amd64 >nul 2>&1 && cmake --build ${workspaceFolder}/build --parallel",
             "group": "build",
             "presentation": {
                 "reveal": "always",
@@ -66,12 +56,7 @@
         {
             "label": "CMake: Build Debug",
             "type": "shell",
-            "command": "cmake",
-            "args": [
-                "--build", "${workspaceFolder}/build",
-                "--config", "Debug",
-                "--parallel"
-            ],
+            "command": "\"C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvarsall.bat\" amd64 >nul 2>&1 && cmake --build ${workspaceFolder}/build --parallel",
             "group": "build",
             "presentation": {
                 "reveal": "always",
@@ -83,12 +68,7 @@
         {
             "label": "Build and Run",
             "type": "shell",
-            "command": "cmake",
-            "args": [
-                "--build", "${workspaceFolder}/build",
-                "--config", "Release",
-                "--parallel"
-            ],
+            "command": "\"C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvarsall.bat\" amd64 >nul 2>&1 && cmake --build ${workspaceFolder}/build --parallel",
             "group": {
                 "kind": "build",
                 "isDefault": true
@@ -101,12 +81,10 @@
             "problemMatcher": ["$msCompile"],
             "dependsOn": ["CMake: Configure (Release)", "Kill CrowdSim"]
         },
+        {
+            "label": "Run CrowdSim",
             "type": "shell",
-            "command": "Start-Process",
-            "args": [
-                "-FilePath", "${workspaceFolder}/build/Release/CrowdSim.exe",
-                "-WorkingDirectory", "${workspaceFolder}/build/Release"
-            ],
+            "command": "start \"\" /D \"${workspaceFolder}\\build\" \"${workspaceFolder}\\build\\CrowdSim.exe\"",
             "group": "test",
             "presentation": {
                 "reveal": "silent",
@@ -117,12 +95,7 @@
         {
             "label": "Clean Build",
             "type": "shell",
-            "command": "cmake",
-            "args": [
-                "--build", "${workspaceFolder}/build",
-                "--config", "Release",
-                "--target", "clean"
-            ],
+            "command": "\"C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvarsall.bat\" amd64 >nul 2>&1 && cmake --build ${workspaceFolder}/build --target clean",
             "group": "build",
             "presentation": {
                 "reveal": "always",

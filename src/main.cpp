@@ -96,6 +96,11 @@ static LONG WINAPI UnhandledExFilter(EXCEPTION_POINTERS* ep) {
 class CrowdRenderPath : public wi::RenderPath3D
 {
 public:
+    // Game state
+    enum class GameState { MAIN_MENU, PLAYING };
+    mutable GameState gameState_ = GameState::MAIN_MENU;
+    mutable bool pauseMenuOpen_ = false;
+
     CityLayout  city;
     CarSystem   cars;
     CrowdSystem crowd;
@@ -108,6 +113,10 @@ public:
     wi::scene::TransformComponent camera_transform;
     float moveSpeed = 50.0f;  // units/second (scroll wheel adjusts)
     float simSpeed  = 1.0f;   // simulation time scale
+
+    // Time-budget simulation decoupling
+    float simTimeBank_      = 0.0f;  // accumulated sim-seconds to process
+    float effectiveSimSpeed_ = 1.0f; // actual achieved sim speed (for HUD)
 
     // Day/night cycle
     wi::ecs::Entity sunEntity = wi::ecs::INVALID_ENTITY;
@@ -135,14 +144,15 @@ public:
     // Bus system (only route-based, no random)
     uint32_t busRng_ = 12345;
 
-    // Agent / car / building selection
+    // Agent / car / ped / building selection
     int32_t selectedAgent = -1;  // agent index, or -1 for none
     int32_t selectedCar   = -1;  // car index, or -1 for none
+    int32_t selectedPed   = -1;  // ped index, or -1 for none
     int32_t inspectGX = -1, inspectGZ = -1;  // inspected building cell, or -1 for none
 
     // Shadow cascade sliders
-    float cascadeDist1_     = 30.0f;    // near cascade distance (m)
-    float cascadeDist2_     = 200.0f;   // far cascade distance (m)
+    mutable float cascadeDist1_     = 30.0f;    // near cascade distance (m)
+    mutable float cascadeDist2_     = 200.0f;   // far cascade distance (m)
     bool  draggingCascade1_ = false;
     bool  draggingCascade2_ = false;
 
@@ -169,6 +179,7 @@ public:
     mutable std::vector<std::pair<int,int>> lineStopsLeg1;  // leg 1 stops (saved when starting leg 2)
     mutable std::vector<std::vector<XMFLOAT2>> linePreviewPathsLeg1; // leg 1 preview paths
     mutable int      pendingRouteDelete = -1;        // route index queued for deletion
+    mutable std::vector<std::pair<int,int>> pendingBusCountChanges_; // (routeIdx, delta)
     std::vector<wi::ecs::Entity> busStopSignEntities_; // sign entities placed on sidewalks
     int      hoverGX = 0, hoverGZ = 0;
     bool     hoverValid = false;
@@ -180,7 +191,7 @@ public:
     std::vector<std::pair<int,int>> roadPreviewPath; // cells of the preview path
 
     // Saves menu
-    bool     savesMenuOpen = false;
+    mutable bool     savesMenuOpen = false;
     bool     showSidewalkDebug = false;  // F8 toggle: visualise sidewalk layer
     bool     showProfiler = false;        // F3 toggle: profiler overlay + logging
     float    profilerLogTimer_ = 0.0f;    // seconds until next log dump
@@ -189,24 +200,74 @@ public:
     wi::Timer profFrameTimer_;            // per-frame CPU timer
     float    profFrameTimes_[120] = {};   // rolling frame time buffer (ms)
     int      profFrameIdx_ = 0;
-    mutable std::string cachedProfilerText_;  // captured in Compose where GPU ranges are live
+
     float    hoverWorldX = 0.f, hoverWorldZ = 0.f;  // world-space hit position
     bool     swDebugClickActive = false;
     float    swDebugClickX = 0.f, swDebugClickZ = 0.f;
     int      swDebugClickSX = 0, swDebugClickSZ = 0;
     bool     swDebugClickOnSW = false;
-    std::vector<std::string> saveFiles;     // filenames in saves/
-    int      savesMenuScroll = 0;
-    bool     savesMenuSaveMode = false;     // true = saving, false = loading
-    std::string pendingSaveName;            // for new save typing
-    bool     typingSaveName = false;
+    mutable std::vector<std::string> saveFiles;     // filenames in saves/
+    mutable int      savesMenuScroll = 0;
+    mutable bool     savesMenuSaveMode = false;     // true = saving, false = loading
+
+    // Settings menu
+    mutable bool settingsMenuOpen = false;
+    mutable int  settingsTab = 0;           // 0=Keybinds, 1=Graphics
+    // Pending graphics settings (apply on button press)
+    mutable float pendingCascade1_ = 30.0f;
+    mutable float pendingCascade2_ = 200.0f;
+    mutable bool draggingSettingsCasc1_ = false;
+    mutable bool draggingSettingsCasc2_ = false;
+    // Anti-aliasing state
+    mutable bool fxaaEnabled_ = true;          // active FXAA state
+    mutable bool taaEnabled_  = true;          // active TAA state
+    mutable bool pendingFxaa_ = true;          // pending (settings menu)
+    mutable bool pendingTaa_  = true;           // pending (settings menu)
+    mutable bool aaApplyPending_ = false;       // deferred to Update()
+    // Shadow settings state (live + pending for settings menu)
+    mutable bool shadowsEnabled_        = true;
+    mutable bool carShadows_            = true;
+    mutable bool pedShadows_            = true;
+    mutable int  shadowRes_             = 2;   // index: 0=256,1=512,2=1024,3=2048
+    mutable int  cascadeCount_          = 2;   // 1 or 2
+    mutable bool sssEnabled_            = true;  // screen space shadows
+    mutable int  aoMode_                = 2;   // 0=Off,1=SSAO,2=MSAO
+    mutable bool pendingShadowsEnabled_ = true;
+    mutable bool pendingCarShadows_     = true;
+    mutable bool pendingPedShadows_     = true;
+    mutable int  pendingShadowRes_      = 2;
+    mutable int  pendingCascadeCount_   = 2;
+    mutable bool pendingSSS_            = true;
+    mutable int  pendingAO_             = 2;
+    mutable bool shadowApplyPending_    = false;
+    // Keybind display names (read-only for now, but shown in menu)
+    struct KeybindEntry { const char* action; const char* key; };
+
+    // President / Economy menu
+    mutable bool presidentMenuOpen = false;
+    mutable int  presidentTab_ = 0;                // 0=Overview, 1=Budget
+    mutable float taxRate_ = 0.10f;                // adjustable tax rate
+    float maintenanceCost_ = 0.0f;         // computed per frame
+    float incomePerSec_ = 0.0f;            // computed income rate
+    // Economy history for graphs (recorded every ~2 game-seconds)
+    static constexpr int ECON_HISTORY_SIZE = 120;
+    float econTimer_ = 0.0f;
+    float treasuryHistory_[ECON_HISTORY_SIZE] = {};
+    float incomeHistory_[ECON_HISTORY_SIZE] = {};
+    float expenseHistory_[ECON_HISTORY_SIZE] = {};
+    float popHistory_[ECON_HISTORY_SIZE] = {};
+    int   econHistoryIdx_ = 0;
+    int   econHistoryCount_ = 0;
+    mutable std::string pendingSaveName;            // for new save typing
+    mutable bool     typingSaveName = false;
+
 
     // UI scale factor: all pixel sizes are authored for 1080p reference.
     // Scale proportionally to actual screen height so everything looks right
     // at any resolution / DPI.
     float uiScale() const { return (float)height / 1080.0f; }
 
-    void RefreshSaveList() {
+    void RefreshSaveList() const {
         saveFiles.clear();
         namespace fs = std::filesystem;
         fs::create_directories("saves");
@@ -221,7 +282,7 @@ public:
         std::string rpath = basePath + ".routes";
         std::ofstream f(rpath, std::ios::binary);
         if (!f) return;
-        uint32_t magic = 0x42555332; // "BUS2" format marker
+        uint32_t magic = 0x42555333; // "BUS3" format marker (v3: +maxBuses)
         f.write(reinterpret_cast<const char*>(&magic), 4);
         uint32_t count = (uint32_t)cars.busRoutes_.size();
         f.write(reinterpret_cast<const char*>(&count), 4);
@@ -250,6 +311,9 @@ public:
                 f.write(reinterpret_cast<const char*>(&s.gz), 4);
                 f.write(s.name, 32);
             }
+            // v3: write maxBuses
+            int32_t mb = r.maxBuses;
+            f.write(reinterpret_cast<const char*>(&mb), 4);
         }
     }
 
@@ -258,10 +322,11 @@ public:
         std::ifstream f(rpath, std::ios::binary);
         if (!f) return;
         cars.busRoutes_.clear();
-        // Detect format: old = first u32 is count (<=1000), new = 0x42555332 magic
+        // Detect format: old = first u32 is count (<=1000), v2 = 0x42555332, v3 = 0x42555333
         uint32_t first = 0;
         f.read(reinterpret_cast<char*>(&first), 4);
-        bool newFormat = (first == 0x42555332);
+        bool newFormat = (first == 0x42555332 || first == 0x42555333);
+        bool v3Format  = (first == 0x42555333);
         uint32_t count = 0;
         if (newFormat) {
             f.read(reinterpret_cast<char*>(&count), 4);
@@ -306,6 +371,12 @@ public:
                         r.stopsBA.push_back(s);
                     }
                 }
+            }
+            // v3: read maxBuses
+            if (v3Format) {
+                int32_t mb = 5;
+                f.read(reinterpret_cast<char*>(&mb), 4);
+                r.maxBuses = std::clamp(mb, 1, 20);
             }
             // Rebuild fullPathAB by pathfinding
             {
@@ -373,6 +444,10 @@ public:
             wi::backlog::post("[Load] Failed to load: " + path, wi::backlog::LogLevel::Warning);
             return;
         }
+        // Restore simulation state from save
+        timeOfDay     = sd.timeOfDay;
+        townTreasury  = sd.treasury;
+        taxRate_      = sd.taxRate;
         trafficLights.RebuildIntersections(city);
         // Remove old bus stop sign entities
         {
@@ -380,15 +455,14 @@ public:
             for (auto e : busStopSignEntities_) sc.Entity_Remove(e);
             busStopSignEntities_.clear();
         }
+        cars.ResetAll();
+        crowd.ResetAll();
         for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
         for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2)
             city.ClearCell(gx2, gz2);
         std::fill(std::begin(houseHasSpawned), std::end(houseHasSpawned), false);
         // Three passes: roads first (including crosswalks as temporary ROAD),
         // buildings second, then upgrade crosswalks.
-        // Pass 0 places both ROAD and CROSSWALK cells as ROAD so every road-like
-        // cell exists before pass 2 converts crosswalks.  This ensures
-        // BuildCrosswalk's countRN correctly detects all intersection arms.
         for (int pass = 0; pass < 3; ++pass)
         for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
         for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2) {
@@ -397,7 +471,6 @@ public:
             if (pass == 0 && ct != CellType::ROAD && ct != CellType::CROSSWALK) continue;
             if (pass == 1 && (ct == CellType::ROAD || ct == CellType::CROSSWALK)) continue;
             if (pass == 2 && ct != CellType::CROSSWALK) continue;
-            // Pass 0: place crosswalks as ROAD temporarily
             city.PlaceCell(gx2, gz2, (pass == 0 && ct == CellType::CROSSWALK) ? CellType::ROAD : ct);
         }
         trafficLights.RebuildIntersections(city);
@@ -407,14 +480,14 @@ public:
         for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
         for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2) {
             int lanes = sd.roadLanes[gz2 * CityLayout::GRID_SIZE + gx2];
-            if (lanes == 2 || lanes == 4 || lanes == 6)
+            if (lanes == 4) lanes = 6;
+            if (lanes == 2 || lanes == 6)
                 city.SetRoadLanes(gx2, gz2, lanes);
         }
         for (int gz2 = 0; gz2 < CityLayout::GRID_SIZE; ++gz2)
         for (int gx2 = 0; gx2 < CityLayout::GRID_SIZE; ++gx2) {
             int idx2 = gz2 * CityLayout::GRID_SIZE + gx2;
             if (sd.cells[idx2] == CellType::HOUSE) {
-                // Restore saved population first
                 city.SetHousePop(gx2, gz2, sd.housePop[idx2]);
                 city.UpdateHouseHeight(gx2, gz2);
             }
@@ -429,7 +502,6 @@ public:
                     totalPop += city.GetHousePop(gx2, gz2);
             int targetCars = totalPop / POP_PER_CAR;
 
-            // Collect houses with population
             struct HI { int gx, gz, pop; };
             std::vector<HI> houses;
             for (int gz2 = 0; gz2 < GS; ++gz2)
@@ -437,29 +509,22 @@ public:
                 if (city.GetCellType(gx2, gz2) == CellType::HOUSE && city.GetHousePop(gx2, gz2) > 0)
                     houses.push_back({gx2, gz2, city.GetHousePop(gx2, gz2)});
 
-            // Spawn cars distributed across houses proportionally
-            if (!houses.empty())
-            {
+            if (!houses.empty()) {
                 uint32_t rng = 42u;
-                for (int c = 0; c < targetCars; ++c)
-                {
+                for (int c = 0; c < targetCars; ++c) {
                     rng = rng * 1664525u + 1013904223u;
                     int idx2 = (int)(rng % houses.size());
                     TrySpawnOneWorker(houses[idx2].gx, houses[idx2].gz);
                 }
-                // Also spawn pedestrians — ~1 ped per 5 people
                 int targetPeds = totalPop / 5;
-                // Collect workplaces for random assignment
                 struct WI { int gx, gz; };
                 std::vector<WI> workplaces;
                 for (int wz = 0; wz < GS; ++wz)
                 for (int wx = 0; wx < GS; ++wx)
                     if (city.GetCellType(wx, wz) == CellType::WORKPLACE)
                         workplaces.push_back({wx, wz});
-                if (!workplaces.empty())
-                {
-                    for (int p = 0; p < targetPeds; ++p)
-                    {
+                if (!workplaces.empty()) {
+                    for (int p = 0; p < targetPeds; ++p) {
                         rng = rng * 1664525u + 1013904223u;
                         int hi = (int)(rng % houses.size());
                         rng = rng * 1664525u + 1013904223u;
@@ -471,7 +536,6 @@ public:
             }
         }
         wi::backlog::post("[Load] Loaded: " + path, wi::backlog::LogLevel::Default);
-        // Load bus routes if they exist
         LoadBusRoutes("saves/" + name);
         savesMenuOpen = false;
     }
@@ -532,6 +596,10 @@ public:
         setShadowsEnabled(true);
         setScreenSpaceShadowSampleCount(4);  // 16 was excessive
 
+        // Anti-aliasing: enable FXAA + TAA by default
+        setFXAAEnabled(fxaaEnabled_);
+        wi::renderer::SetTemporalAAEnabled(taaEnabled_);
+
         wi::renderer::SetToDrawGridHelper(false);
     }
 
@@ -562,7 +630,46 @@ public:
             cars.busRoutes_.erase(cars.busRoutes_.begin() + ri);
             pendingRouteDelete = -1;
         }
+        // Process deferred bus count changes (queued from Compose UI)
+        for (auto& [bri2, delta] : pendingBusCountChanges_) {
+            if (bri2 >= 0 && bri2 < (int)cars.busRoutes_.size()) {
+                cars.busRoutes_[bri2].maxBuses = std::clamp(cars.busRoutes_[bri2].maxBuses + delta, 1, 20);
+            }
+        }
+        pendingBusCountChanges_.clear();
+        // Apply deferred AA settings (queued from Compose)
+        if (aaApplyPending_) {
+            setFXAAEnabled(fxaaEnabled_);
+            wi::renderer::SetTemporalAAEnabled(taaEnabled_);
+            aaApplyPending_ = false;
+        }
+        // Apply deferred shadow settings (queued from Compose)
+        if (shadowApplyPending_) {
+            setShadowsEnabled(shadowsEnabled_);
+            cars.SetShadowCasting(carShadows_);
+            crowd.SetShadowCasting(pedShadows_);
+            static const int kShadowResTab[] = { 256, 512, 1024, 2048 };
+            wi::renderer::SetShadowProps2D(kShadowResTab[shadowRes_]);
+            wi::renderer::SetScreenSpaceShadowsEnabled(sssEnabled_);
+            setAO((AO)aoMode_);
+            // Update sun cascade distances
+            auto& scene = wi::scene::GetScene();
+            auto* sunLight = scene.lights.GetComponent(sunEntity);
+            if (sunLight) {
+                if (cascadeCount_ == 1)
+                    sunLight->cascade_distances = { cascadeDist2_ };
+                else
+                    sunLight->cascade_distances = { cascadeDist1_, cascadeDist2_ };
+            }
+            shadowApplyPending_ = false;
+        }
         if (city.laneMarksDirty_) city.RebuildAllLaneMarkings();
+
+        // Main menu — only update renderer, no simulation
+        if (gameState_ == GameState::MAIN_MENU) {
+            wi::RenderPath3D::Update(dt);
+            return;
+        }
 
         wi::RenderPath3D::Update(dt);
 
@@ -619,10 +726,10 @@ public:
         cam.UpdateCamera();
 
         // ---- Day/night cycle ----
+        // timeOfDay is advanced after simulation budget loop below.
+        // Visual update (sun, sky) uses current timeOfDay.
         {
             auto& scene = wi::scene::GetScene();
-            timeOfDay += (dt * simSpeed) / dayDuration;
-            timeOfDay = fmodf(timeOfDay, 1.0f);
 
             // sunAngle: 0 at noon (timeOfDay=0.5), PI at midnight
             float sunAngle = (timeOfDay - 0.5f) * XM_2PI;
@@ -1185,6 +1292,10 @@ public:
                     else if (placeTool == 12) ct = CellType::BUS_DEPOT;
                     else
                         ct = static_cast<CellType>(placeTool + 1);
+                    // Buildings need adjacent road access (lakes/empty are exempt)
+                    if (ct != CellType::EMPTY && ct != CellType::LAKE
+                        && !city.HasRoadAccess(hoverGX, hoverGZ))
+                        ct = CellType::EMPTY;
                     if (ct != CellType::EMPTY) {
                     bool placed = city.PlaceCell(hoverGX, hoverGZ, ct);
                     if (placed)
@@ -1209,8 +1320,9 @@ public:
             }
             else if (hoverValid && lmbDown && placeTool >= 1 && placeTool <= 2)
             {
-                // Allow dragging for house/workplace placement — only on EMPTY cells
+                // Allow dragging for house/workplace placement — only on EMPTY cells with road access
                 if (city.GetCellType(hoverGX, hoverGZ) != CellType::EMPTY) { /* skip */ }
+                else if (!city.HasRoadAccess(hoverGX, hoverGZ)) { /* no adjacent road */ }
                 else {
                 CellType ct = static_cast<CellType>(placeTool + 1);
                 bool placed = city.PlaceCell(hoverGX, hoverGZ, ct);
@@ -1273,6 +1385,38 @@ public:
             RefreshSaveList();
             savesMenuOpen = true;
         }
+        // ---- Settings menu (F4) ----
+        if (wi::input::Press(wi::input::KEYBOARD_BUTTON_F4))
+        {
+            settingsMenuOpen = !settingsMenuOpen;
+            if (settingsMenuOpen) {
+                pendingCascade1_ = cascadeDist1_;
+                pendingCascade2_ = cascadeDist2_;
+                pendingFxaa_ = fxaaEnabled_;
+                pendingTaa_  = taaEnabled_;
+                // seed shadow pending values
+                pendingShadowsEnabled_ = shadowsEnabled_;
+                pendingCarShadows_     = carShadows_;
+                pendingPedShadows_     = pedShadows_;
+                pendingShadowRes_      = shadowRes_;
+                pendingCascadeCount_   = cascadeCount_;
+                pendingSSS_            = sssEnabled_;
+                pendingAO_             = aoMode_;
+            }
+        }
+        // ---- President / Economy menu (P key, not in build mode) ----
+        if (!buildModeEnabled && wi::input::Press((wi::input::BUTTON)'P'))
+        {
+            presidentMenuOpen = !presidentMenuOpen;
+        }
+        if (wi::input::Press(wi::input::KEYBOARD_BUTTON_ESCAPE) && settingsMenuOpen)
+        {
+            settingsMenuOpen = false;
+        }
+        if (wi::input::Press(wi::input::KEYBOARD_BUTTON_ESCAPE) && presidentMenuOpen)
+        {
+            presidentMenuOpen = false;
+        }
         // ---- Profiler overlay (F3) ----
         if (wi::input::Press(wi::input::KEYBOARD_BUTTON_F3))
         {
@@ -1307,6 +1451,13 @@ public:
             savesMenuOpen = false;
             typingSaveName = false;
         }
+        // Pause menu toggle (ESC when no other menu is open)
+        if (wi::input::Press(wi::input::KEYBOARD_BUTTON_ESCAPE) &&
+            !savesMenuOpen && !settingsMenuOpen && !presidentMenuOpen &&
+            !depotMenuOpen && !lineCreationMode)
+        {
+            pauseMenuOpen_ = !pauseMenuOpen_;
+        }
 
         // Handle saves menu interaction
         if (savesMenuOpen)
@@ -1334,7 +1485,7 @@ public:
                         while (fs::exists("saves/save_" + std::to_string(num) + ".city")) num++;
                         std::string autoName = "save_" + std::to_string(num);
                         std::string path = "saves/" + autoName + ".city";
-                        if (city.SaveToFile(path.c_str())) {
+                        if (city.SaveToFile(path.c_str(), timeOfDay, townTreasury, taxRate_)) {
                             SaveBusRoutes("saves/" + autoName);
                             wi::backlog::post("[Save] Saved to " + path, wi::backlog::LogLevel::Default);
                         }
@@ -1355,7 +1506,7 @@ public:
                         {
                             // Overwrite this save
                             std::string path = "saves/" + saveFiles[si] + ".city";
-                            if (city.SaveToFile(path.c_str())) {
+                            if (city.SaveToFile(path.c_str(), timeOfDay, townTreasury, taxRate_)) {
                                 SaveBusRoutes("saves/" + saveFiles[si]);
                                 wi::backlog::post("[Save] Overwrote " + path, wi::backlog::LogLevel::Default);
                             }
@@ -1371,7 +1522,60 @@ public:
             }
         }
 
-        // ---- Update traffic density on city grid for traffic-aware pathfinding ----
+        // ================================================================
+        //  Time-budgeted simulation loop
+        //  Accumulates sim time, processes in fixed steps up to a
+        //  wall-clock budget so the camera/GPU stays responsive.
+        // ================================================================
+        constexpr float SIM_STEP    = 0.05f;   // 50 ms fixed sim step
+        constexpr float SIM_BUDGET  = 12.0f;   // max wall-clock ms per frame
+        constexpr float MAX_BANK    = 10.0f;   // cap accumulated sim-seconds
+
+        simTimeBank_ += dt * simSpeed;
+        simTimeBank_  = std::min(simTimeBank_, MAX_BANK);
+
+        wi::Timer simClock;
+        float simTimeConsumed = 0.0f;
+        cars.taxRateOverride = taxRate_;
+
+        // Process whole steps while within wall-clock budget
+        while (simTimeBank_ >= SIM_STEP)
+        {
+            if (simClock.elapsed() > SIM_BUDGET && simTimeConsumed > 0.0f) break;
+            simTimeBank_ -= SIM_STEP;
+            simTimeConsumed += SIM_STEP;
+
+            trafficLights.Update(SIM_STEP);
+            auto cv = cars.GetCarView();
+            crowd.Update(SIM_STEP, city, trafficLights, &cv);
+            auto pv = crowd.GetView();
+            cars.Update(SIM_STEP, city, trafficLights, timeOfDay, dayDuration, &pv);
+            cars.UpdateBusRoutes(SIM_STEP, city);
+        }
+        // Process any remaining partial step if budget allows
+        if (simTimeBank_ > 0.001f &&
+            (simClock.elapsed() <= SIM_BUDGET || simTimeConsumed == 0.0f))
+        {
+            float partial = simTimeBank_;
+            simTimeBank_ = 0.0f;
+            simTimeConsumed += partial;
+
+            trafficLights.Update(partial);
+            auto cv = cars.GetCarView();
+            crowd.Update(partial, city, trafficLights, &cv);
+            auto pv = crowd.GetView();
+            cars.Update(partial, city, trafficLights, timeOfDay, dayDuration, &pv);
+            cars.UpdateBusRoutes(partial, city);
+        }
+
+        // Advance day clock by actual simulation time consumed
+        timeOfDay += simTimeConsumed / dayDuration;
+        timeOfDay = fmodf(timeOfDay, 1.0f);
+
+        // Track effective speed for HUD
+        effectiveSimSpeed_ = simTimeConsumed / std::max(dt, 0.0001f);
+
+        // ---- Update traffic density on city grid ----
         {
             constexpr int GS = CityLayout::GRID_SIZE;
             for (int z = 0; z < GS; ++z)
@@ -1385,23 +1589,42 @@ public:
             }
         }
 
-        // ---- Simulate cars + traffic lights + pedestrians + render ----
+        // ---- Tax income ----
+        float taxIncome = cars.DrainTax();
+        townTreasury += taxIncome;
+        incomePerSec_ = taxIncome / std::max(dt, 0.0001f);
+
+        // ---- Maintenance costs ----
         {
-            ScopedCPUProfiling("TrafficLights");
-            trafficLights.Update(dt * simSpeed);
-            trafficLights.UpdateVisuals();
+            constexpr int GS = CityLayout::GRID_SIZE;
+            float roadCost = 0.0f, serviceCost = 0.0f;
+            int roadCount = 0, serviceCount = 0;
+            for (int z = 0; z < GS; ++z)
+            for (int x = 0; x < GS; ++x) {
+                auto ct2 = city.GetCellType(x, z);
+                switch (ct2) {
+                case CellType::ROAD: case CellType::CROSSWALK:
+                    roadCount++; roadCost += 0.01f; break;
+                case CellType::POLICE: case CellType::FIRE_STATION:
+                case CellType::HOSPITAL: case CellType::BUS_DEPOT:
+                    serviceCount++; serviceCost += 0.05f; break;
+                case CellType::POWER_PLANT: serviceCost += 0.08f; serviceCount++; break;
+                case CellType::WATER_PUMP: serviceCost += 0.06f; serviceCount++; break;
+                default: break;
+                }
+            }
+            float busCost = 0.0f;
+            for (uint32_t ci2 = 0; ci2 < cars.GetCarCount(); ++ci2)
+                if (cars.IsBus(ci2)) busCost += 0.02f;
+
+            maintenanceCost_ = (roadCost + serviceCost + busCost) * effectiveSimSpeed_;
+            townTreasury -= maintenanceCost_ * dt;
         }
-        auto carView = cars.GetCarView();
-        {
-            ScopedCPUProfiling("CrowdSystem");
-            crowd.Update(dt * simSpeed, city, trafficLights, &carView);
-        }
-        auto pedView = crowd.GetView();
-        {
-            ScopedCPUProfiling("CarSystem");
-            cars.Update(dt * simSpeed, city, trafficLights, timeOfDay, dayDuration, &pedView);
-        }
-        townTreasury += cars.DrainTax();
+
+        // ---- Traffic light visuals (once per frame) ----
+        trafficLights.UpdateVisuals();
+
+        // ---- Render cars + pedestrians (once per frame) ----
         {
             ScopedCPUProfiling("CarSystem::Render");
             cars.RenderCars(cam.Eye, city);
@@ -1411,14 +1634,31 @@ public:
             crowd.Render(cam.Eye);
         }
 
-        // ---- Bus route updates (spawn/stop handling) ----
+        // ---- Economy history recording ----
+        econTimer_ += simTimeConsumed;
+        if (econTimer_ >= 2.0f)
         {
-            ScopedCPUProfiling("BusRoutes");
-            cars.UpdateBusRoutes(dt * simSpeed, city);
+            econTimer_ -= 2.0f;
+            int idx2 = econHistoryIdx_ % ECON_HISTORY_SIZE;
+            treasuryHistory_[idx2] = townTreasury;
+            float curIncome = 0.0f;
+            for (uint32_t ci2 = 0; ci2 < cars.GetCarCount(); ++ci2)
+                if (!cars.IsBus(ci2) && cars.GetState(ci2) == CarSystem::State::DRIVING)
+                    curIncome += 1.0f * taxRate_;
+            incomeHistory_[idx2] = curIncome;
+            expenseHistory_[idx2] = maintenanceCost_;
+            float totalPop2 = 0;
+            for (int z2 = 0; z2 < CityLayout::GRID_SIZE; ++z2)
+            for (int x2 = 0; x2 < CityLayout::GRID_SIZE; ++x2)
+                if (city.GetCellType(x2, z2) == CellType::HOUSE)
+                    totalPop2 += (float)city.GetHousePop(x2, z2);
+            popHistory_[idx2] = totalPop2;
+            econHistoryIdx_++;
+            if (econHistoryCount_ < ECON_HISTORY_SIZE) econHistoryCount_++;
         }
 
         // ---- Reproduction: houses grow population over time ----
-        reproTimer_ += dt * simSpeed;
+        reproTimer_ += simTimeConsumed;
         if (reproTimer_ >= REPRO_INTERVAL)
         {
             reproTimer_ -= REPRO_INTERVAL;
@@ -1433,18 +1673,16 @@ public:
                 if (pop >= 50) continue;
                 city.AddHousePop(gx, gz, 1);
                 city.UpdateHouseHeight(gx, gz);
-                // Cars are spawned by the car-pop sync below, not here
             }
         }
 
         // ---- Car-population sync: maintain 1 car per POP_PER_CAR people ----
-        carSyncTimer_ += dt * simSpeed;
+        carSyncTimer_ += simTimeConsumed;
         if (carSyncTimer_ >= CAR_SYNC_INTERVAL)
         {
             carSyncTimer_ -= CAR_SYNC_INTERVAL;
             constexpr int GS = CityLayout::GRID_SIZE;
 
-            // Count total population and non-bus cars
             int totalPop = 0;
             uint32_t nonBusCars = 0;
             for (int gz = 0; gz < GS; ++gz)
@@ -1457,11 +1695,9 @@ public:
             int targetCars = totalPop / POP_PER_CAR;
             int deficit = targetCars - (int)nonBusCars;
 
-            // Spawn up to 50 cars per sync tick to avoid stutter
             int toSpawn = std::min(deficit, 50);
             if (toSpawn > 0)
             {
-                // Build list of houses with pop > 0
                 struct HouseInfo { int gx, gz, pop; };
                 std::vector<HouseInfo> houses;
                 for (int gz = 0; gz < GS; ++gz)
@@ -1471,7 +1707,6 @@ public:
 
                 if (!houses.empty())
                 {
-                    // Weighted random selection by population
                     uint32_t rng = (uint32_t)(totalPop * 2654435761u + nonBusCars * 31u);
                     for (int s = 0; s < toSpawn; ++s)
                     {
@@ -1487,6 +1722,7 @@ public:
 
         // ---- Agent / car picking (LMB click, not in build mode, not RMB look, not creating bus line) ----
         if (!buildModeEnabled && !lineCreationMode && !depotMenuOpen && !lineClickConsumed &&
+            !settingsMenuOpen && !presidentMenuOpen &&
             wi::input::Press(wi::input::MOUSE_BUTTON_LEFT) &&
             !wi::input::Down(wi::input::MOUSE_BUTTON_RIGHT))
         {
@@ -1533,10 +1769,40 @@ public:
             float bestAgentDist = 5.0f;
             int32_t bestAgentIdx = -1;
 
-            // Prefer cars (bigger), then agents, then buildings
-            if (bestCarIdx >= 0 && bestCarDist <= bestAgentDist)
+            // Check pedestrians
+            float bestPedDist = 3.0f;
+            int32_t bestPedIdx = -1;
+            {
+                auto pedView = crowd.GetView();
+                for (uint32_t pi = 0; pi < pedView.count; ++pi)
+                {
+                    if (pedView.state[pi] == 0) continue; // idle
+                    XMVECTOR pedPos = XMVectorSet(pedView.posX[pi], 0.9f, pedView.posZ[pi], 1.0f);
+                    XMVECTOR toPed = pedPos - rayOrigin;
+                    float t = XMVectorGetX(XMVector3Dot(toPed, rayDir));
+                    if (t < 0.0f) continue;
+                    XMVECTOR closest = rayOrigin + rayDir * t;
+                    float dist = XMVectorGetX(XMVector3Length(closest - pedPos));
+                    if (dist < bestPedDist)
+                    {
+                        bestPedDist = dist;
+                        bestPedIdx = static_cast<int32_t>(pi);
+                    }
+                }
+            }
+
+            // Prefer cars (bigger), then peds, then buildings
+            if (bestCarIdx >= 0 && bestCarDist <= bestPedDist)
             {
                 selectedCar = bestCarIdx;
+                selectedAgent = -1;
+                selectedPed = -1;
+                inspectGX = inspectGZ = -1;
+            }
+            else if (bestPedIdx >= 0)
+            {
+                selectedPed = bestPedIdx;
+                selectedCar = -1;
                 selectedAgent = -1;
                 inspectGX = inspectGZ = -1;
             }
@@ -1544,12 +1810,14 @@ public:
             {
                 selectedAgent = bestAgentIdx;
                 selectedCar = -1;
+                selectedPed = -1;
                 inspectGX = inspectGZ = -1;
             }
             else
             {
                 selectedCar = -1;
                 selectedAgent = -1;
+                selectedPed = -1;
                 // Try ground-plane hit for building inspection
                 float rDirY3 = XMVectorGetY(rayDir);
                 if (fabsf(rDirY3) > 0.001f) {
@@ -1725,6 +1993,115 @@ public:
             }
         }
 
+        // ---- Draw pedestrian selection visuals ----
+        if (selectedPed >= 0 && static_cast<uint32_t>(selectedPed) < crowd.GetPedCount())
+        {
+            auto pv = crowd.GetView();
+            uint32_t pi = static_cast<uint32_t>(selectedPed);
+            if (pi < pv.count) {
+                float px = pv.posX[pi], pz = pv.posZ[pi];
+                // Highlight ring around ped
+                wi::renderer::RenderablePoint pp;
+                pp.position = XMFLOAT3(px, 1.0f, pz);
+                pp.size = 8.0f;
+                pp.color = XMFLOAT4(0.2f, 0.8f, 1.0f, 1.0f);
+                wi::renderer::DrawPoint(pp);
+            }
+        }
+
+        // ---- Draw service building coverage and tint ALL houses ----
+        if (inspectGX >= 0 && inspectGZ >= 0)
+        {
+            auto ict2 = city.GetCellType(inspectGX, inspectGZ);
+            if (ict2 == CellType::POLICE || ict2 == CellType::FIRE_STATION || ict2 == CellType::HOSPITAL)
+            {
+                // Color per service type
+                XMFLOAT4 svcCol;
+                if (ict2 == CellType::POLICE)            svcCol = {0.3f, 0.5f, 1.0f, 0.7f};
+                else if (ict2 == CellType::FIRE_STATION) svcCol = {1.0f, 0.3f, 0.2f, 0.7f};
+                else                                     svcCol = {0.2f, 1.0f, 0.4f, 0.7f};
+
+                constexpr int R = CityLayout::SERVICE_RADIUS;
+                constexpr float CS = CityLayout::CELL_SIZE;
+                constexpr int GS = CityLayout::GRID_SIZE;
+                const float drawY = 0.4f;
+
+                // Draw filled translucent square showing the radius area
+                XMFLOAT2 center = city.GridCellCenter(inspectGX, inspectGZ);
+                float dR = (R + 0.5f) * CS;
+                // Draw thick border lines (multiple parallel lines for visibility)
+                for (float off = -0.3f; off <= 0.3f; off += 0.15f) {
+                    XMFLOAT3 tl = {center.x - dR + off, drawY + 0.15f, center.y + dR - off};
+                    XMFLOAT3 tr2 = {center.x + dR - off, drawY + 0.15f, center.y + dR - off};
+                    XMFLOAT3 br = {center.x + dR - off, drawY + 0.15f, center.y - dR + off};
+                    XMFLOAT3 bl = {center.x - dR + off, drawY + 0.15f, center.y - dR + off};
+                    wi::renderer::RenderableLine dl;
+                    dl.color_start = dl.color_end = svcCol;
+                    dl.start = tl;  dl.end = tr2; wi::renderer::DrawLine(dl);
+                    dl.start = tr2; dl.end = br;  wi::renderer::DrawLine(dl);
+                    dl.start = br;  dl.end = bl;  wi::renderer::DrawLine(dl);
+                    dl.start = bl;  dl.end = tl;  wi::renderer::DrawLine(dl);
+                }
+
+                // Tint ALL houses in the city
+                auto& scene2 = wi::scene::GetScene();
+                for (int hz = 0; hz < GS; ++hz)
+                for (int hx = 0; hx < GS; ++hx)
+                {
+                    if (city.GetCellType(hx, hz) != CellType::HOUSE) continue;
+                    bool hasSvc = city.HasSpecificServiceCoverage(hx, hz, ict2);
+                    XMFLOAT4 tint = hasSvc
+                        ? XMFLOAT4(0.4f, 1.0f, 0.5f, 1.0f)  // green tint
+                        : XMFLOAT4(1.0f, 0.3f, 0.3f, 1.0f); // red tint
+
+                    int idx2 = hz * GS + hx;
+                    for (auto e : city.cellEntities[idx2]) {
+                        auto* obj = scene2.objects.GetComponent(e);
+                        if (obj) obj->color = tint;
+                    }
+                }
+            }
+            else
+            {
+                // Not a service building — restore house colors
+                auto& scene2 = wi::scene::GetScene();
+                constexpr int GS = CityLayout::GRID_SIZE;
+                for (int hz = 0; hz < GS; ++hz)
+                for (int hx = 0; hx < GS; ++hx)
+                {
+                    if (city.GetCellType(hx, hz) != CellType::HOUSE) continue;
+                    int idx2 = hz * GS + hx;
+                    for (auto e : city.cellEntities[idx2]) {
+                        auto* obj = scene2.objects.GetComponent(e);
+                        if (obj) obj->color = XMFLOAT4(1, 1, 1, 1);
+                    }
+                }
+            }
+        }
+        else
+        {
+            // No inspection active — ensure all houses have default color
+            // (only reset once when inspectGX transitions to -1)
+            static bool wasInspecting = false;
+            bool isInspecting = (inspectGX >= 0);
+            if (wasInspecting && !isInspecting)
+            {
+                auto& scene2 = wi::scene::GetScene();
+                constexpr int GS = CityLayout::GRID_SIZE;
+                for (int hz = 0; hz < GS; ++hz)
+                for (int hx = 0; hx < GS; ++hx)
+                {
+                    if (city.GetCellType(hx, hz) != CellType::HOUSE) continue;
+                    int idx2 = hz * GS + hx;
+                    for (auto e : city.cellEntities[idx2]) {
+                        auto* obj = scene2.objects.GetComponent(e);
+                        if (obj) obj->color = XMFLOAT4(1, 1, 1, 1);
+                    }
+                }
+            }
+            wasInspecting = isInspecting;
+        }
+
         // ---- Sidewalk debug: click to inspect sub-cell ----
         if (showSidewalkDebug && !buildModeEnabled &&
             wi::input::Press(wi::input::MOUSE_BUTTON_LEFT) &&
@@ -1821,9 +2198,10 @@ public:
                    << avgMs << " / " << minMs << " / " << maxMs << " ms\n";
                 pf << "Cars: " << cars.GetCarCount()
                    << "  Peds: " << crowd.GetPedCount()
-                   << "  Sim speed: " << simSpeed << "x\n";
-                pf << "\n--- Wicked Engine Profiler (CPU + GPU per-process) ---\n";
-                pf << cachedProfilerText_;
+                   << "  Sim speed: " << simSpeed << "x"
+                   << " (actual: " << effectiveSimSpeed_ << "x)\n";
+                pf << "\n--- Wicked Engine Profiler ---\n";
+                pf << wi::profiler::GetDataString();
                 pf << "\n";
                 pf.close();
             }
@@ -1831,6 +2209,51 @@ public:
     }
 
     // -- Build helpers --
+
+    // Fix path so the car starts on the building's side of the road.
+    // In right-hand-traffic (lane offset = RIGHT of travel), the correct
+    // initial direction depends on which side the building is:
+    //   Building WEST  → travel north  (right = west  toward building)
+    //   Building EAST  → travel south  (right = east  toward building)
+    //   Building NORTH → travel east   (right = north toward building)
+    //   Building SOUTH → travel west   (right = south toward building)
+    void FixSpawnSide(std::vector<XMFLOAT2>& path, int houseGX, int houseGZ)
+    {
+        if (path.size() < 2) return;
+        constexpr float HW = CityLayout::HALF_WORLD;
+        constexpr float CS = CityLayout::CELL_SIZE;
+        int roadGX = (int)std::floor((path[0].x + HW) / CS);
+        int roadGZ = (int)std::floor((path[0].y + HW) / CS);
+        int hdx = houseGX - roadGX;
+        int hdz = houseGZ - roadGZ;
+        if (hdx == 0 && hdz == 0) return;
+
+        float correctDX, correctDZ;
+        int nGX, nGZ;
+        if (std::abs(hdx) >= std::abs(hdz)) {
+            if (hdx < 0) { correctDX = 0; correctDZ = -1; nGX = roadGX; nGZ = roadGZ - 1; }
+            else         { correctDX = 0; correctDZ =  1; nGX = roadGX; nGZ = roadGZ + 1; }
+        } else {
+            if (hdz < 0) { correctDX = 1; correctDZ = 0; nGX = roadGX + 1; nGZ = roadGZ; }
+            else         { correctDX =-1; correctDZ = 0; nGX = roadGX - 1; nGZ = roadGZ; }
+        }
+
+        float dx = path[1].x - path[0].x;
+        float dz = path[1].y - path[0].y;
+        if (dx * correctDX + dz * correctDZ > 0.01f) return; // already OK
+
+        auto ct = city.GetCellType(nGX, nGZ);
+        if (ct != CityLayout::CellType::ROAD && ct != CityLayout::CellType::CROSSWALK) return;
+
+        int dstGX = (int)std::floor((path.back().x + HW) / CS);
+        int dstGZ = (int)std::floor((path.back().y + HW) / CS);
+        auto newPath = city.FindPathRoad(nGX, nGZ, dstGX, dstGZ);
+        if (newPath.size() >= 2) {
+            newPath.insert(newPath.begin(), path[0]);
+            path = std::move(newPath);
+        }
+    }
+
     // Returns true if people were spawned/assigned for this house
     bool TrySpawnFromHouse(int hGX, int hGZ)
     {
@@ -1843,6 +2266,7 @@ public:
 
                 auto path = city.FindPath(hGX, hGZ, wx, wz);
                 if ((int)path.size() < 2) continue;
+                FixSpawnSide(path, hGX, hGZ);
 
                 int workers = 0;
                 int toSpawn = ((int)path.size() > CAR_HOP_THRESHOLD) ? 3 : 5;
@@ -1878,6 +2302,7 @@ public:
 
             auto path = city.FindPath(hGX, hGZ, wx, wz);
             if ((int)path.size() < 2) continue;
+            FixSpawnSide(path, hGX, hGZ);
 
             {
                 uint32_t seed = (uint32_t)(hGX * 37 + hGZ * 19 + wx * 7 + wz * 3 + city.GetHousePop(hGX, hGZ));
@@ -2245,9 +2670,97 @@ public:
     {
         wi::RenderPath3D::Compose(cmd);
 
+        // ---- Main Menu Screen ----
+        if (gameState_ == GameState::MAIN_MENU)
+        {
+            const float S = uiScale();
+            XMFLOAT4 mptr = wi::input::GetPointer();
+
+            // Full screen dark overlay
+            wi::image::Params dim;
+            dim.pos = XMFLOAT3(0, 0, 0);
+            dim.siz = XMFLOAT2((float)this->width, (float)this->height);
+            dim.color = XMFLOAT4(0.02f, 0.04f, 0.08f, 0.92f);
+            wi::image::Draw(nullptr, dim, cmd);
+
+            // Title
+            {
+                wi::font::Params tp;
+                tp.posX = (float)this->width * 0.5f - 160.0f*S;
+                tp.posY = (float)this->height * 0.30f;
+                tp.size = (int)(48*S);
+                tp.color = wi::Color(255, 220, 100, 255);
+                wi::font::Draw("CrowdSim", tp, cmd);
+            }
+            // Subtitle
+            {
+                wi::font::Params sp;
+                sp.posX = (float)this->width * 0.5f - 100.0f*S;
+                sp.posY = (float)this->height * 0.30f + 56.0f*S;
+                sp.size = (int)(20*S);
+                sp.color = wi::Color(180, 180, 200, 180);
+                wi::font::Draw("City Builder & Traffic Simulator", sp, cmd);
+            }
+
+            // Menu buttons
+            float btnW = 260.0f*S, btnH = 48.0f*S;
+            float btnX = (float)this->width * 0.5f - btnW * 0.5f;
+            float btnStartY = (float)this->height * 0.50f;
+            float btnGap = 14.0f*S;
+
+            auto drawMenuButton = [&](float bx, float by, float bw, float bh, const char* label,
+                                       XMFLOAT4 normalCol, XMFLOAT4 hoverCol) -> bool {
+                bool hov = (mptr.x >= bx && mptr.x <= bx + bw &&
+                            mptr.y >= by && mptr.y <= by + bh);
+                wi::image::Params bg;
+                bg.pos = XMFLOAT3(bx, by, 0);
+                bg.siz = XMFLOAT2(bw, bh);
+                bg.color = hov ? hoverCol : normalCol;
+                wi::image::Draw(nullptr, bg, cmd);
+                // Button text centered
+                wi::font::Params fp;
+                fp.posX = bx + bw * 0.5f - 50.0f*S; fp.posY = by + 12.0f*S;
+                fp.size = (int)(22*S);
+                fp.color = wi::Color(255, 255, 255, 255);
+                wi::font::Draw(label, fp, cmd);
+                return hov && wi::input::Press(wi::input::MOUSE_BUTTON_LEFT);
+            };
+
+            // New City button
+            if (drawMenuButton(btnX, btnStartY, btnW, btnH, "New City",
+                               XMFLOAT4(0.10f, 0.14f, 0.24f, 0.95f),
+                               XMFLOAT4(0.18f, 0.22f, 0.36f, 1.0f)))
+            {
+                gameState_ = GameState::PLAYING;
+            }
+
+            // Load Save button
+            if (drawMenuButton(btnX, btnStartY + btnH + btnGap, btnW, btnH, "Load Save",
+                               XMFLOAT4(0.10f, 0.14f, 0.24f, 0.95f),
+                               XMFLOAT4(0.18f, 0.22f, 0.36f, 1.0f)))
+            {
+                savesMenuSaveMode = false;
+                typingSaveName = false;
+                RefreshSaveList();
+                savesMenuOpen = true;
+                gameState_ = GameState::PLAYING;
+            }
+
+            // Version / credit
+            {
+                wi::font::Params vp;
+                vp.posX = (float)this->width * 0.5f - 60.0f*S;
+                vp.posY = (float)this->height * 0.85f;
+                vp.size = (int)(14*S);
+                vp.color = wi::Color(120, 120, 140, 140);
+                wi::font::Draw("Powered by WickedEngine", vp, cmd);
+            }
+            return;
+        }
+
         // Capture detailed profiler text here — GPU sub-ranges are only live during Compose
-        if (showProfiler)
-            cachedProfilerText_ = wi::profiler::GetProfilingText();
+        // Note: wi::profiler::DrawData() renders profiling info on screen;
+        // no text API available for file logging.
 
         const uint32_t threads  = wi::jobsystem::GetThreadCount();
 
@@ -2307,7 +2820,8 @@ public:
             }
             else
                 oss << "\n[LMB drag]    Place selected tile";
-            oss << "\n[1-7]         Sim speed: " << simSpeed << "x";
+            oss << "\n[1-7]         Sim speed: " << simSpeed << "x"
+                << " (actual: " << std::setprecision(0) << effectiveSimSpeed_ << "x)";
 
             // ---- Build panel (right side) ----
             const float S = uiScale();
@@ -2403,7 +2917,8 @@ public:
         }
         else
         {
-            oss << "\n[1-6]         Sim speed: " << simSpeed << "x";
+            oss << "\n[1-6]         Sim speed: " << simSpeed << "x"
+                << " (actual: " << std::setprecision(0) << effectiveSimSpeed_ << "x)";
         }
 
         // ---- Depot menu overlay (right side, works in any mode) ----
@@ -2424,7 +2939,7 @@ public:
                         depotLineIndices.push_back(ri);
                 }
 
-                float totalH = 80.0f*S + (float)depotLineIndices.size() * 35.0f*S + 50.0f*S;
+                float totalH = 80.0f*S + (float)depotLineIndices.size() * 70.0f*S + 50.0f*S;
                 // Background
                 wi::image::Params mbg;
                 mbg.pos = XMFLOAT3(mX, mY, 0.f);
@@ -2485,7 +3000,61 @@ public:
                         }
                     }
 
-                    lineY += 35.0f*S;
+                    // Bus count controls: [-] N [+]
+                    float busCtlY = lineY + 30.0f*S;
+                    float btnSize = 24.0f*S;
+                    float minBtnX = mX + 15.0f*S;
+                    float plusBtnX = mX + 15.0f*S + btnSize + 40.0f*S;
+
+                    // Label
+                    wi::font::Params bcl;
+                    bcl.posX = mX + 15.0f*S; bcl.posY = busCtlY - 1.0f*S;
+                    bcl.size = (int)(15*S);
+                    bcl.color = wi::Color(160, 170, 180, 220);
+                    std::ostringstream bcs;
+                    bcs << "Buses: " << r.maxBuses;
+                    // Count actual buses on this route
+                    int actualBuses = 0;
+                    for (uint32_t bci = 0; bci < cars.GetCarCount(); ++bci)
+                        if (cars.IsBus(bci) && cars.GetBusRouteIdx(bci) == ri) actualBuses++;
+                    bcs << " (active: " << actualBuses << ")";
+                    wi::font::Draw(bcs.str(), bcl, cmd);
+
+                    // [-] button
+                    wi::image::Params minBg;
+                    minBg.pos = XMFLOAT3(mX + 160.0f*S, busCtlY, 0.f);
+                    minBg.siz = XMFLOAT2(btnSize, btnSize);
+                    minBg.color = XMFLOAT4(0.40f, 0.15f, 0.15f, 0.85f);
+                    wi::image::Draw(nullptr, minBg, cmd);
+                    wi::font::Params minF;
+                    minF.posX = mX + 160.0f*S + 6.0f*S; minF.posY = busCtlY + 3.0f*S;
+                    minF.size = (int)(16*S); minF.color = wi::Color(255,255,255,255);
+                    wi::font::Draw("-", minF, cmd);
+
+                    // [+] button
+                    wi::image::Params plusBg;
+                    plusBg.pos = XMFLOAT3(mX + 190.0f*S, busCtlY, 0.f);
+                    plusBg.siz = XMFLOAT2(btnSize, btnSize);
+                    plusBg.color = XMFLOAT4(0.15f, 0.40f, 0.15f, 0.85f);
+                    wi::image::Draw(nullptr, plusBg, cmd);
+                    wi::font::Params plusF;
+                    plusF.posX = mX + 190.0f*S + 5.0f*S; plusF.posY = busCtlY + 3.0f*S;
+                    plusF.size = (int)(16*S); plusF.color = wi::Color(255,255,255,255);
+                    wi::font::Draw("+", plusF, cmd);
+
+                    // Handle clicks on [-] and [+]
+                    if (wi::input::Press(wi::input::MOUSE_BUTTON_LEFT)) {
+                        if (dptr.x >= mX + 160.0f*S && dptr.x <= mX + 160.0f*S + btnSize &&
+                            dptr.y >= busCtlY && dptr.y <= busCtlY + btnSize) {
+                            if (r.maxBuses > 1) pendingBusCountChanges_.push_back({ri, -1});
+                        }
+                        if (dptr.x >= mX + 190.0f*S && dptr.x <= mX + 190.0f*S + btnSize &&
+                            dptr.y >= busCtlY && dptr.y <= busCtlY + btnSize) {
+                            if (r.maxBuses < 20) pendingBusCountChanges_.push_back({ri, 1});
+                        }
+                    }
+
+                    lineY += 70.0f*S;
                 }
 
                 // "Add Line" button
@@ -2781,6 +3350,27 @@ public:
             sel << "└──────────────────┘";
             oss << sel.str();
         }
+        else if (selectedPed >= 0 && static_cast<uint32_t>(selectedPed) < crowd.GetPedCount())
+        {
+            auto pv2 = crowd.GetView();
+            uint32_t pi2 = static_cast<uint32_t>(selectedPed);
+            std::ostringstream ped;
+            ped << std::fixed << std::setprecision(1);
+            ped << "\n\n┌────── PED " << pi2 << " ──────┐\n"
+                << "| State:    ";
+            if (pv2.state[pi2] == 0) ped << "Idle";
+            else if (pv2.state[pi2] == 1) ped << "Walking";
+            else if (pv2.state[pi2] == 2) ped << "Waiting (crosswalk)";
+            else if (pv2.state[pi2] == 3) ped << "On Bus";
+            else ped << (int)pv2.state[pi2];
+            ped << "\n"
+                << "| Position: (" << pv2.posX[pi2] << ", " << pv2.posZ[pi2] << ")\n";
+            int pgx, pgz;
+            if (city.WorldToGrid(pv2.posX[pi2], pv2.posZ[pi2], pgx, pgz))
+                ped << "| Cell:     (" << pgx << ", " << pgz << ")\n";
+            ped << "└──────────────────┘";
+            oss << ped.str();
+        }
         else if (inspectGX >= 0 && inspectGZ >= 0)
         {
             auto ict = city.GetCellType(inspectGX, inspectGZ);
@@ -3028,6 +3618,986 @@ public:
                 fp2.size = (int)(18*S);
                 fp2.color = wi::Color(180, 180, 180, 180);
                 wi::font::Draw("[ESC] Close", fp2, cmd);
+            }
+        }
+
+        // ---- Settings Menu Overlay ----
+        if (settingsMenuOpen)
+        {
+            const float S = uiScale();
+            float mW = 580.0f*S;
+            float mH = 640.0f*S;
+            float mX = (float)this->width * 0.5f - mW * 0.5f;
+            float mY = (float)this->height * 0.5f - mH * 0.5f;
+
+            // Dim background
+            {
+                wi::image::Params dim;
+                dim.pos  = XMFLOAT3(0, 0, 0);
+                dim.siz  = XMFLOAT2((float)this->width, (float)this->height);
+                dim.color = XMFLOAT4(0, 0, 0, 0.55f);
+                wi::image::Draw(nullptr, dim, cmd);
+            }
+            // Panel background
+            {
+                wi::image::Params bg;
+                bg.pos  = XMFLOAT3(mX, mY, 0);
+                bg.siz  = XMFLOAT2(mW, mH);
+                bg.color = XMFLOAT4(0.08f, 0.08f, 0.14f, 0.95f);
+                wi::image::Draw(nullptr, bg, cmd);
+            }
+            // Title bar
+            {
+                wi::image::Params tb;
+                tb.pos  = XMFLOAT3(mX, mY, 0);
+                tb.siz  = XMFLOAT2(mW, 40.0f*S);
+                tb.color = XMFLOAT4(0.12f, 0.12f, 0.25f, 1.0f);
+                wi::image::Draw(nullptr, tb, cmd);
+
+                wi::font::Params tp;
+                tp.posX = mX + 15.0f*S; tp.posY = mY + 8.0f*S;
+                tp.size = (int)(24*S);
+                tp.color = wi::Color(255, 255, 255, 255);
+                wi::font::Draw("SETTINGS", tp, cmd);
+            }
+
+            // Tab buttons
+            float tabY = mY + 45.0f*S;
+            float tabW = mW / 3.0f;
+            XMFLOAT4 mptr = wi::input::GetPointer();
+            const char* tabNames[] = { "Keybinds", "Graphics", "Shadows" };
+            for (int t = 0; t < 3; ++t) {
+                float tx = mX + t * tabW;
+                bool active = (settingsTab == t);
+                wi::image::Params tbg;
+                tbg.pos = XMFLOAT3(tx, tabY, 0);
+                tbg.siz = XMFLOAT2(tabW - 2.0f*S, 32.0f*S);
+                tbg.color = active ? XMFLOAT4(0.20f, 0.25f, 0.50f, 1.0f) : XMFLOAT4(0.10f, 0.10f, 0.18f, 0.9f);
+                wi::image::Draw(nullptr, tbg, cmd);
+
+                wi::font::Params tf;
+                tf.posX = tx + 10.0f*S; tf.posY = tabY + 6.0f*S;
+                tf.size = (int)(17*S);
+                tf.color = active ? wi::Color(255, 255, 255, 255) : wi::Color(160, 160, 180, 200);
+                wi::font::Draw(tabNames[t], tf, cmd);
+
+                if (wi::input::Press(wi::input::MOUSE_BUTTON_LEFT)) {
+                    if (mptr.x >= tx && mptr.x <= tx + tabW && mptr.y >= tabY && mptr.y <= tabY + 32.0f*S)
+                        settingsTab = t;
+                }
+            }
+
+            float contentY = tabY + 38.0f*S;
+
+            if (settingsTab == 0) {
+                // ---- Keybinds tab ----
+                const KeybindEntry binds[] = {
+                    {"Move",           "W / A / S / D"},
+                    {"Look Around",    "RMB + Mouse"},
+                    {"Up / Down",      "Q / E"},
+                    {"Sprint",         "Shift"},
+                    {"Speed (Scroll)", "Mouse Wheel"},
+                    {"Build Mode",     "B"},
+                    {"Profiler",       "F3"},
+                    {"Settings",       "F4"},
+                    {"Save",           "F5"},
+                    {"Sidewalk Debug", "F8"},
+                    {"Load",           "F9"},
+                    {"President Menu", "P"},
+                    {"Sim Speed 1-6",  "1 / 2 / 3 / 4 / 5 / 6"},
+                };
+                int numBinds = sizeof(binds)/sizeof(binds[0]);
+                float rowH = 26.0f*S;
+                // Header
+                {
+                    wi::font::Params hf;
+                    hf.posX = mX + 20.0f*S; hf.posY = contentY;
+                    hf.size = (int)(16*S); hf.color = wi::Color(120, 140, 180, 200);
+                    wi::font::Draw("ACTION", hf, cmd);
+                    hf.posX = mX + 250.0f*S;
+                    wi::font::Draw("KEY", hf, cmd);
+                }
+                contentY += rowH;
+                for (int bi = 0; bi < numBinds; ++bi) {
+                    float ry = contentY + bi * rowH;
+                    // Alternating row background
+                    if (bi % 2 == 0) {
+                        wi::image::Params rbg;
+                        rbg.pos = XMFLOAT3(mX + 10.0f*S, ry, 0);
+                        rbg.siz = XMFLOAT2(mW - 20.0f*S, rowH);
+                        rbg.color = XMFLOAT4(0.12f, 0.12f, 0.20f, 0.5f);
+                        wi::image::Draw(nullptr, rbg, cmd);
+                    }
+                    wi::font::Params af;
+                    af.posX = mX + 20.0f*S; af.posY = ry + 4.0f*S;
+                    af.size = (int)(16*S); af.color = wi::Color(220, 220, 220, 240);
+                    wi::font::Draw(binds[bi].action, af, cmd);
+
+                    wi::font::Params kf;
+                    kf.posX = mX + 250.0f*S; kf.posY = ry + 4.0f*S;
+                    kf.size = (int)(16*S); kf.color = wi::Color(180, 200, 255, 240);
+                    wi::font::Draw(binds[bi].key, kf, cmd);
+                }
+            }
+            else if (settingsTab == 1) {
+                // ---- Graphics tab ----
+                float sliderW = 300.0f*S;
+                float sliderH = 16.0f*S;
+                float sliderX = mX + 180.0f*S;
+
+                // Anti-aliasing toggles
+                {
+                    float cy = contentY + 5.0f*S;
+                    wi::font::Params lbl;
+                    lbl.posX = mX + 20.0f*S; lbl.posY = cy;
+                    lbl.size = (int)(17*S); lbl.color = wi::Color(200, 200, 200, 240);
+                    wi::font::Draw("Anti-Aliasing", lbl, cmd);
+                    cy += 26.0f*S;
+
+                    // FXAA toggle
+                    {
+                        float bx = mX + 30.0f*S;
+                        float bw = 24.0f*S, bh = 24.0f*S;
+                        bool hov2 = (mptr.x >= bx && mptr.x <= bx + bw &&
+                                     mptr.y >= cy && mptr.y <= cy + bh);
+                        wi::image::Params cbg;
+                        cbg.pos = XMFLOAT3(bx, cy, 0);
+                        cbg.siz = XMFLOAT2(bw, bh);
+                        cbg.color = pendingFxaa_
+                            ? XMFLOAT4(0.25f, 0.55f, 0.25f, 1.0f)
+                            : XMFLOAT4(0.20f, 0.20f, 0.25f, 0.9f);
+                        wi::image::Draw(nullptr, cbg, cmd);
+                        if (pendingFxaa_) {
+                            wi::font::Params ck;
+                            ck.posX = bx + 4.0f*S; ck.posY = cy + 2.0f*S;
+                            ck.size = (int)(16*S); ck.color = wi::Color(255,255,255,255);
+                            wi::font::Draw("v", ck, cmd);
+                        }
+                        wi::font::Params fl;
+                        fl.posX = bx + bw + 10.0f*S; fl.posY = cy + 3.0f*S;
+                        fl.size = (int)(16*S);
+                        fl.color = pendingFxaa_ ? wi::Color(180,255,180,240) : wi::Color(180,180,180,200);
+                        wi::font::Draw("FXAA (Fast Approximate AA)", fl, cmd);
+                        if (hov2 && wi::input::Press(wi::input::MOUSE_BUTTON_LEFT))
+                            pendingFxaa_ = !pendingFxaa_;
+                        cy += 32.0f*S;
+                    }
+
+                    // TAA toggle
+                    {
+                        float bx = mX + 30.0f*S;
+                        float bw = 24.0f*S, bh = 24.0f*S;
+                        bool hov2 = (mptr.x >= bx && mptr.x <= bx + bw &&
+                                     mptr.y >= cy && mptr.y <= cy + bh);
+                        wi::image::Params cbg;
+                        cbg.pos = XMFLOAT3(bx, cy, 0);
+                        cbg.siz = XMFLOAT2(bw, bh);
+                        cbg.color = pendingTaa_
+                            ? XMFLOAT4(0.25f, 0.55f, 0.25f, 1.0f)
+                            : XMFLOAT4(0.20f, 0.20f, 0.25f, 0.9f);
+                        wi::image::Draw(nullptr, cbg, cmd);
+                        if (pendingTaa_) {
+                            wi::font::Params ck;
+                            ck.posX = bx + 4.0f*S; ck.posY = cy + 2.0f*S;
+                            ck.size = (int)(16*S); ck.color = wi::Color(255,255,255,255);
+                            wi::font::Draw("v", ck, cmd);
+                        }
+                        wi::font::Params fl;
+                        fl.posX = bx + bw + 10.0f*S; fl.posY = cy + 3.0f*S;
+                        fl.size = (int)(16*S);
+                        fl.color = pendingTaa_ ? wi::Color(180,255,180,240) : wi::Color(180,180,180,200);
+                        wi::font::Draw("TAA (Temporal AA)", fl, cmd);
+                        if (hov2 && wi::input::Press(wi::input::MOUSE_BUTTON_LEFT))
+                            pendingTaa_ = !pendingTaa_;
+                    }
+                }
+
+                // Near Cascade slider
+                {
+                    float cy = contentY + 110.0f*S;
+                    wi::font::Params lbl;
+                    lbl.posX = mX + 20.0f*S; lbl.posY = cy;
+                    lbl.size = (int)(17*S); lbl.color = wi::Color(200, 200, 200, 240);
+                    std::ostringstream ls2;
+                    ls2 << "Near Cascade: " << (int)pendingCascade1_ << "m";
+                    wi::font::Draw(ls2.str(), lbl, cmd);
+
+                    float sy = cy + 25.0f*S;
+                    // Track
+                    wi::image::Params trk;
+                    trk.pos = XMFLOAT3(sliderX, sy + sliderH*0.3f, 0);
+                    trk.siz = XMFLOAT2(sliderW, sliderH*0.4f);
+                    trk.color = XMFLOAT4(0.20f, 0.20f, 0.30f, 0.9f);
+                    wi::image::Draw(nullptr, trk, cmd);
+                    // Thumb
+                    float t1 = (pendingCascade1_ - 5.0f) / (150.0f - 5.0f);
+                    t1 = std::clamp(t1, 0.0f, 1.0f);
+                    float thumbX = sliderX + t1 * sliderW - 8.0f*S;
+                    wi::image::Params thm;
+                    thm.pos = XMFLOAT3(thumbX, sy, 0);
+                    thm.siz = XMFLOAT2(16.0f*S, sliderH);
+                    thm.color = XMFLOAT4(0.40f, 0.50f, 0.90f, 1.0f);
+                    wi::image::Draw(nullptr, thm, cmd);
+                    // Drag handling
+                    if (wi::input::Down(wi::input::MOUSE_BUTTON_LEFT)) {
+                        if (mptr.x >= sliderX - 5*S && mptr.x <= sliderX + sliderW + 5*S &&
+                            mptr.y >= sy - 5*S && mptr.y <= sy + sliderH + 5*S)
+                            draggingSettingsCasc1_ = true;
+                    } else {
+                        draggingSettingsCasc1_ = false;
+                    }
+                    if (draggingSettingsCasc1_) {
+                        float frac = (mptr.x - sliderX) / sliderW;
+                        frac = std::clamp(frac, 0.0f, 1.0f);
+                        pendingCascade1_ = 5.0f + frac * (150.0f - 5.0f);
+                    }
+                }
+
+                // Far Cascade slider
+                {
+                    float cy = contentY + 180.0f*S;
+                    wi::font::Params lbl;
+                    lbl.posX = mX + 20.0f*S; lbl.posY = cy;
+                    lbl.size = (int)(17*S); lbl.color = wi::Color(200, 200, 200, 240);
+                    std::ostringstream ls2;
+                    ls2 << "Far Cascade: " << (int)pendingCascade2_ << "m";
+                    wi::font::Draw(ls2.str(), lbl, cmd);
+
+                    float sy = cy + 25.0f*S;
+                    // Track
+                    wi::image::Params trk;
+                    trk.pos = XMFLOAT3(sliderX, sy + sliderH*0.3f, 0);
+                    trk.siz = XMFLOAT2(sliderW, sliderH*0.4f);
+                    trk.color = XMFLOAT4(0.20f, 0.20f, 0.30f, 0.9f);
+                    wi::image::Draw(nullptr, trk, cmd);
+                    // Thumb
+                    float t2 = (pendingCascade2_ - 30.0f) / (800.0f - 30.0f);
+                    t2 = std::clamp(t2, 0.0f, 1.0f);
+                    float thumbX = sliderX + t2 * sliderW - 8.0f*S;
+                    wi::image::Params thm;
+                    thm.pos = XMFLOAT3(thumbX, sy, 0);
+                    thm.siz = XMFLOAT2(16.0f*S, sliderH);
+                    thm.color = XMFLOAT4(0.40f, 0.50f, 0.90f, 1.0f);
+                    wi::image::Draw(nullptr, thm, cmd);
+                    // Drag handling
+                    if (wi::input::Down(wi::input::MOUSE_BUTTON_LEFT)) {
+                        if (mptr.x >= sliderX - 5*S && mptr.x <= sliderX + sliderW + 5*S &&
+                            mptr.y >= sy - 5*S && mptr.y <= sy + sliderH + 5*S)
+                            draggingSettingsCasc2_ = true;
+                    } else {
+                        draggingSettingsCasc2_ = false;
+                    }
+                    if (draggingSettingsCasc2_) {
+                        float frac = (mptr.x - sliderX) / sliderW;
+                        frac = std::clamp(frac, 0.0f, 1.0f);
+                        pendingCascade2_ = 30.0f + frac * (800.0f - 30.0f);
+                    }
+                }
+
+                // Apply button
+                {
+                    float btnW = 120.0f*S, btnH = 36.0f*S;
+                    float btnX = mX + mW * 0.5f - btnW * 0.5f;
+                    float btnY = contentY + 280.0f*S;
+                    bool hov = (mptr.x >= btnX && mptr.x <= btnX + btnW &&
+                                mptr.y >= btnY && mptr.y <= btnY + btnH);
+                    wi::image::Params abg;
+                    abg.pos = XMFLOAT3(btnX, btnY, 0);
+                    abg.siz = XMFLOAT2(btnW, btnH);
+                    abg.color = hov ? XMFLOAT4(0.20f, 0.55f, 0.20f, 1.0f) : XMFLOAT4(0.15f, 0.40f, 0.15f, 0.9f);
+                    wi::image::Draw(nullptr, abg, cmd);
+
+                    wi::font::Params af;
+                    af.posX = btnX + 30.0f*S; af.posY = btnY + 8.0f*S;
+                    af.size = (int)(20*S); af.color = wi::Color(255, 255, 255, 255);
+                    wi::font::Draw("Apply", af, cmd);
+
+                    if (hov && wi::input::Press(wi::input::MOUSE_BUTTON_LEFT)) {
+                        cascadeDist1_ = pendingCascade1_;
+                        cascadeDist2_ = pendingCascade2_;
+                        fxaaEnabled_ = pendingFxaa_;
+                        taaEnabled_  = pendingTaa_;
+                        aaApplyPending_ = true;
+                    }
+                }
+
+                // Reset button
+                {
+                    float btnW = 120.0f*S, btnH = 36.0f*S;
+                    float btnX = mX + mW * 0.5f - btnW * 0.5f;
+                    float btnY = contentY + 325.0f*S;
+                    bool hov = (mptr.x >= btnX && mptr.x <= btnX + btnW &&
+                                mptr.y >= btnY && mptr.y <= btnY + btnH);
+                    wi::image::Params abg;
+                    abg.pos = XMFLOAT3(btnX, btnY, 0);
+                    abg.siz = XMFLOAT2(btnW, btnH);
+                    abg.color = hov ? XMFLOAT4(0.50f, 0.25f, 0.15f, 1.0f) : XMFLOAT4(0.35f, 0.18f, 0.10f, 0.9f);
+                    wi::image::Draw(nullptr, abg, cmd);
+
+                    wi::font::Params af;
+                    af.posX = btnX + 30.0f*S; af.posY = btnY + 8.0f*S;
+                    af.size = (int)(20*S); af.color = wi::Color(255, 255, 255, 255);
+                    wi::font::Draw("Reset", af, cmd);
+
+                    if (hov && wi::input::Press(wi::input::MOUSE_BUTTON_LEFT)) {
+                        pendingCascade1_ = 30.0f;
+                        pendingCascade2_ = 200.0f;
+                        pendingFxaa_ = true;
+                        pendingTaa_  = true;
+                    }
+                }
+            }
+            else if (settingsTab == 2) {
+                // ---- Shadows tab ----
+                // Helper: draw a checkbox + label, returns true if toggled
+                auto drawCheck = [&](float cx, float cy, bool& pending, const char* label) {
+                    float bw = 22.0f*S, bh = 22.0f*S;
+                    bool hov2 = (mptr.x >= cx && mptr.x <= cx + bw &&
+                                 mptr.y >= cy && mptr.y <= cy + bh);
+                    wi::image::Params cbg;
+                    cbg.pos = XMFLOAT3(cx, cy, 0); cbg.siz = XMFLOAT2(bw, bh);
+                    cbg.color = pending ? XMFLOAT4(0.25f, 0.55f, 0.25f, 1.0f)
+                                       : XMFLOAT4(0.20f, 0.20f, 0.25f, 0.9f);
+                    wi::image::Draw(nullptr, cbg, cmd);
+                    if (pending) {
+                        wi::font::Params ck; ck.posX = cx + 3.0f*S; ck.posY = cy + 1.0f*S;
+                        ck.size = (int)(16*S); ck.color = wi::Color(255,255,255,255);
+                        wi::font::Draw("v", ck, cmd);
+                    }
+                    wi::font::Params fl;
+                    fl.posX = cx + bw + 10.0f*S; fl.posY = cy + 2.0f*S;
+                    fl.size = (int)(16*S);
+                    fl.color = pending ? wi::Color(180,255,180,240) : wi::Color(180,180,180,200);
+                    wi::font::Draw(label, fl, cmd);
+                    if (hov2 && wi::input::Press(wi::input::MOUSE_BUTTON_LEFT))
+                        pending = !pending;
+                };
+
+                // Helper: draw a row of toggle buttons, returns selected index
+                auto drawButtonRow = [&](float rowX, float rowY, float btnW, float btnH,
+                                         const char** names, int count, int& selected) {
+                    for (int bi = 0; bi < count; ++bi) {
+                        float bx = rowX + bi * (btnW + 4.0f*S);
+                        bool active = (selected == bi);
+                        bool hov2 = (mptr.x >= bx && mptr.x <= bx + btnW &&
+                                     mptr.y >= rowY && mptr.y <= rowY + btnH);
+                        wi::image::Params bb;
+                        bb.pos = XMFLOAT3(bx, rowY, 0); bb.siz = XMFLOAT2(btnW, btnH);
+                        if (active)       bb.color = XMFLOAT4(0.20f, 0.35f, 0.70f, 1.0f);
+                        else if (hov2)    bb.color = XMFLOAT4(0.18f, 0.22f, 0.40f, 0.9f);
+                        else              bb.color = XMFLOAT4(0.12f, 0.12f, 0.20f, 0.9f);
+                        wi::image::Draw(nullptr, bb, cmd);
+                        wi::font::Params bf;
+                        bf.posX = bx + 6.0f*S; bf.posY = rowY + 6.0f*S;
+                        bf.size = (int)(14*S);
+                        bf.color = active ? wi::Color(255,255,255,255) : wi::Color(160,160,200,220);
+                        wi::font::Draw(names[bi], bf, cmd);
+                        if (hov2 && wi::input::Press(wi::input::MOUSE_BUTTON_LEFT))
+                            selected = bi;
+                    }
+                };
+
+                auto drawSectionLabel = [&](float cx, float cy, const char* text) {
+                    wi::font::Params lbl;
+                    lbl.posX = cx; lbl.posY = cy;
+                    lbl.size = (int)(16*S); lbl.color = wi::Color(120, 160, 220, 200);
+                    wi::font::Draw(text, lbl, cmd);
+                };
+
+                float leftX  = mX + 20.0f*S;
+                float cy2    = contentY + 8.0f*S;
+                float rowGap = 30.0f*S;
+
+                // ---- Toggles section ----
+                drawSectionLabel(leftX, cy2, "General");
+                cy2 += 24.0f*S;
+                drawCheck(leftX + 8.0f*S, cy2, pendingShadowsEnabled_, "Shadows Enabled");
+                cy2 += rowGap;
+                drawCheck(leftX + 8.0f*S, cy2, pendingCarShadows_,     "Car Shadows");
+                cy2 += rowGap;
+                drawCheck(leftX + 8.0f*S, cy2, pendingPedShadows_,     "Pedestrian Shadows");
+                cy2 += rowGap;
+                drawCheck(leftX + 8.0f*S, cy2, pendingSSS_,            "Screen Space Shadows");
+                cy2 += rowGap + 6.0f*S;
+
+                // ---- Shadow map resolution ----
+                drawSectionLabel(leftX, cy2, "Shadow Map Resolution");
+                cy2 += 22.0f*S;
+                {
+                    static const char* resNames[] = { "Low (256)", "Med (512)", "High (1K)", "Ultra (2K)" };
+                    float btnW2 = (mW - 44.0f*S) / 4.0f - 4.0f*S;
+                    drawButtonRow(leftX + 8.0f*S, cy2, btnW2, 28.0f*S, resNames, 4, pendingShadowRes_);
+                }
+                cy2 += 36.0f*S + 6.0f*S;
+
+                // ---- Cascade count ----
+                drawSectionLabel(leftX, cy2, "Cascade Count");
+                cy2 += 22.0f*S;
+                {
+                    static const char* cascNames[] = { "1 Cascade", "2 Cascades" };
+                    float btnW2 = (mW * 0.5f - 20.0f*S) / 2.0f - 4.0f*S;
+                    drawButtonRow(leftX + 8.0f*S, cy2, btnW2, 28.0f*S, cascNames, 2, pendingCascadeCount_);
+                }
+                cy2 += 36.0f*S + 6.0f*S;
+
+                // ---- Ambient Occlusion ----
+                drawSectionLabel(leftX, cy2, "Ambient Occlusion");
+                cy2 += 22.0f*S;
+                {
+                    static const char* aoNames[] = { "Off", "SSAO", "MSAO" };
+                    float btnW2 = (mW * 0.5f - 20.0f*S) / 3.0f - 4.0f*S;
+                    drawButtonRow(leftX + 8.0f*S, cy2, btnW2, 28.0f*S, aoNames, 3, pendingAO_);
+                }
+                cy2 += 40.0f*S;
+
+                // ---- Apply button ----
+                {
+                    float btnW2 = 120.0f*S, btnH2 = 36.0f*S;
+                    float btnX2 = mX + mW * 0.5f - btnW2 * 0.5f;
+                    bool hov2 = (mptr.x >= btnX2 && mptr.x <= btnX2 + btnW2 &&
+                                 mptr.y >= cy2    && mptr.y <= cy2 + btnH2);
+                    wi::image::Params sb;
+                    sb.pos = XMFLOAT3(btnX2, cy2, 0); sb.siz = XMFLOAT2(btnW2, btnH2);
+                    sb.color = hov2 ? XMFLOAT4(0.20f, 0.55f, 0.20f, 1.0f) : XMFLOAT4(0.15f, 0.40f, 0.15f, 0.9f);
+                    wi::image::Draw(nullptr, sb, cmd);
+                    wi::font::Params af2;
+                    af2.posX = btnX2 + 30.0f*S; af2.posY = cy2 + 8.0f*S;
+                    af2.size = (int)(20*S); af2.color = wi::Color(255,255,255,255);
+                    wi::font::Draw("Apply", af2, cmd);
+                    if (hov2 && wi::input::Press(wi::input::MOUSE_BUTTON_LEFT)) {
+                        shadowsEnabled_  = pendingShadowsEnabled_;
+                        carShadows_      = pendingCarShadows_;
+                        pedShadows_      = pendingPedShadows_;
+                        shadowRes_       = pendingShadowRes_;
+                        cascadeCount_    = pendingCascadeCount_;
+                        sssEnabled_      = pendingSSS_;
+                        aoMode_          = pendingAO_;
+                        shadowApplyPending_ = true;
+                    }
+                }
+                cy2 += 44.0f*S;
+
+                // ---- Reset button ----
+                {
+                    float btnW2 = 120.0f*S, btnH2 = 36.0f*S;
+                    float btnX2 = mX + mW * 0.5f - btnW2 * 0.5f;
+                    bool hov2 = (mptr.x >= btnX2 && mptr.x <= btnX2 + btnW2 &&
+                                 mptr.y >= cy2    && mptr.y <= cy2 + btnH2);
+                    wi::image::Params sb;
+                    sb.pos = XMFLOAT3(btnX2, cy2, 0); sb.siz = XMFLOAT2(btnW2, btnH2);
+                    sb.color = hov2 ? XMFLOAT4(0.50f, 0.25f, 0.15f, 1.0f) : XMFLOAT4(0.35f, 0.18f, 0.10f, 0.9f);
+                    wi::image::Draw(nullptr, sb, cmd);
+                    wi::font::Params af2;
+                    af2.posX = btnX2 + 30.0f*S; af2.posY = cy2 + 8.0f*S;
+                    af2.size = (int)(20*S); af2.color = wi::Color(255,255,255,255);
+                    wi::font::Draw("Reset", af2, cmd);
+                    if (hov2 && wi::input::Press(wi::input::MOUSE_BUTTON_LEFT)) {
+                        pendingShadowsEnabled_ = true;
+                        pendingCarShadows_     = true;
+                        pendingPedShadows_     = true;
+                        pendingShadowRes_      = 2;
+                        pendingCascadeCount_   = 2;
+                        pendingSSS_            = true;
+                        pendingAO_             = 2;
+                    }
+                }
+            }
+
+            // Footer
+            {
+                wi::font::Params ff;
+                ff.posX = mX + 15.0f*S; ff.posY = mY + mH - 30.0f*S;
+                ff.size = (int)(16*S); ff.color = wi::Color(160, 160, 160, 160);
+                wi::font::Draw("[F4] or [ESC] to close", ff, cmd);
+            }
+        }
+
+        // ---- President / Economy Menu Overlay ----
+        if (presidentMenuOpen)
+        {
+            const float S = uiScale();
+            float mW = 620.0f*S;
+            float mH = 640.0f*S;
+            float mX = (float)this->width * 0.5f - mW * 0.5f;
+            float mY = (float)this->height * 0.5f - mH * 0.5f;
+            XMFLOAT4 mptr = wi::input::GetPointer();
+
+            // Dim background
+            {
+                wi::image::Params dim;
+                dim.pos  = XMFLOAT3(0, 0, 0);
+                dim.siz  = XMFLOAT2((float)this->width, (float)this->height);
+                dim.color = XMFLOAT4(0, 0, 0, 0.55f);
+                wi::image::Draw(nullptr, dim, cmd);
+            }
+            // Panel
+            {
+                wi::image::Params bg;
+                bg.pos  = XMFLOAT3(mX, mY, 0);
+                bg.siz  = XMFLOAT2(mW, mH);
+                bg.color = XMFLOAT4(0.06f, 0.08f, 0.12f, 0.96f);
+                wi::image::Draw(nullptr, bg, cmd);
+            }
+            // Title bar
+            {
+                wi::image::Params tb;
+                tb.pos  = XMFLOAT3(mX, mY, 0);
+                tb.siz  = XMFLOAT2(mW, 42.0f*S);
+                tb.color = XMFLOAT4(0.14f, 0.10f, 0.22f, 1.0f);
+                wi::image::Draw(nullptr, tb, cmd);
+
+                wi::font::Params tp;
+                tp.posX = mX + 15.0f*S; tp.posY = mY + 9.0f*S;
+                tp.size = (int)(24*S);
+                tp.color = wi::Color(255, 220, 100, 255);
+                wi::font::Draw("PRESIDENT DASHBOARD", tp, cmd);
+            }
+
+            // ---- Tab buttons ----
+            float tabY = mY + 42.0f*S;
+            float tabH = 34.0f*S;
+            {
+                wi::image::Params tabBg;
+                tabBg.pos = XMFLOAT3(mX, tabY, 0);
+                tabBg.siz = XMFLOAT2(mW, tabH);
+                tabBg.color = XMFLOAT4(0.08f, 0.06f, 0.14f, 0.9f);
+                wi::image::Draw(nullptr, tabBg, cmd);
+
+                const char* tabNames[] = { "Overview", "Budget" };
+                float tabBtnW = mW * 0.5f;
+                for (int t = 0; t < 2; ++t) {
+                    float tx = mX + t * tabBtnW;
+                    bool active = (presidentTab_ == t);
+                    bool hov = (mptr.x >= tx && mptr.x <= tx + tabBtnW &&
+                                mptr.y >= tabY && mptr.y <= tabY + tabH);
+                    // Tab background
+                    wi::image::Params tbtn;
+                    tbtn.pos = XMFLOAT3(tx, tabY, 0);
+                    tbtn.siz = XMFLOAT2(tabBtnW, tabH);
+                    if (active)
+                        tbtn.color = XMFLOAT4(0.14f, 0.12f, 0.24f, 1.0f);
+                    else if (hov)
+                        tbtn.color = XMFLOAT4(0.12f, 0.10f, 0.20f, 0.9f);
+                    else
+                        tbtn.color = XMFLOAT4(0.08f, 0.06f, 0.14f, 0.0f); // transparent when inactive
+                    wi::image::Draw(nullptr, tbtn, cmd);
+                    // Active indicator line
+                    if (active) {
+                        wi::image::Params ind;
+                        ind.pos = XMFLOAT3(tx, tabY + tabH - 3.0f*S, 0);
+                        ind.siz = XMFLOAT2(tabBtnW, 3.0f*S);
+                        ind.color = XMFLOAT4(0.90f, 0.70f, 0.20f, 1.0f);
+                        wi::image::Draw(nullptr, ind, cmd);
+                    }
+                    // Tab label
+                    wi::font::Params tl;
+                    tl.posX = tx + tabBtnW * 0.5f - 30.0f*S; tl.posY = tabY + 7.0f*S;
+                    tl.size = (int)(18*S);
+                    tl.color = active ? wi::Color(255, 220, 100, 255) : wi::Color(180, 180, 200, 200);
+                    wi::font::Draw(tabNames[t], tl, cmd);
+                    // Click
+                    if (hov && wi::input::Press(wi::input::MOUSE_BUTTON_LEFT))
+                        presidentTab_ = t;
+                }
+            }
+
+            float cy = tabY + tabH + 12.0f*S;
+
+            // Count things for display (shared by both tabs)
+            int totalPopP = 0, totalWorkersP = 0, busCount = 0;
+            int houseCount = 0, workplaceCount = 0, roadCount = 0;
+            int parkingCount = 0, lakeCount = 0;
+            int powerPlants = 0, waterPumps = 0, policeStations = 0;
+            int fireStations = 0, hospitals = 0, busDepots = 0;
+            for (int z2 = 0; z2 < CityLayout::GRID_SIZE; ++z2)
+            for (int x2 = 0; x2 < CityLayout::GRID_SIZE; ++x2) {
+                auto ct2 = city.GetCellType(x2, z2);
+                if (ct2 == CellType::HOUSE) { totalPopP += city.GetHousePop(x2, z2); houseCount++; }
+                if (ct2 == CellType::WORKPLACE) { totalWorkersP += city.GetWorkCount(x2, z2); workplaceCount++; }
+                if (ct2 == CellType::ROAD || ct2 == CellType::CROSSWALK) roadCount++;
+                if (ct2 == CellType::PARKING) parkingCount++;
+                if (ct2 == CellType::LAKE) lakeCount++;
+                if (ct2 == CellType::POWER_PLANT) powerPlants++;
+                if (ct2 == CellType::WATER_PUMP) waterPumps++;
+                if (ct2 == CellType::POLICE) policeStations++;
+                if (ct2 == CellType::FIRE_STATION) fireStations++;
+                if (ct2 == CellType::HOSPITAL) hospitals++;
+                if (ct2 == CellType::BUS_DEPOT) busDepots++;
+            }
+            for (uint32_t ci3 = 0; ci3 < cars.GetCarCount(); ++ci3)
+                if (cars.IsBus(ci3)) busCount++;
+
+            float netPerSec = incomePerSec_ - maintenanceCost_;
+
+            // Helper lambdas
+            auto drawStat = [&](float y, const char* label, const std::string& val, wi::Color col,
+                                float labelX = 0.0f, float valX = 0.0f) {
+                if (labelX == 0.0f) labelX = mX + 20.0f*S;
+                if (valX == 0.0f) valX = mX + 200.0f*S;
+                wi::font::Params lp;
+                lp.posX = labelX; lp.posY = y;
+                lp.size = (int)(17*S); lp.color = wi::Color(170, 170, 190, 220);
+                wi::font::Draw(label, lp, cmd);
+                wi::font::Params vp;
+                vp.posX = valX; vp.posY = y;
+                vp.size = (int)(17*S); vp.color = col;
+                wi::font::Draw(val, vp, cmd);
+            };
+
+            auto fmtMoney = [](float v) -> std::string {
+                std::ostringstream o; o << "$" << std::fixed << std::setprecision(0) << v;
+                return o.str();
+            };
+
+            // ================ TAB 0: Overview ================
+            if (presidentTab_ == 0)
+            {
+                // Section: City Statistics
+                {
+                    wi::font::Params sh;
+                    sh.posX = mX + 15.0f*S; sh.posY = cy;
+                    sh.size = (int)(19*S); sh.color = wi::Color(255, 220, 100, 240);
+                    wi::font::Draw("City Statistics", sh, cmd);
+                    cy += 28.0f*S;
+                }
+
+                // Two columns of stats
+                float col1X = mX + 20.0f*S;
+                float col1V = mX + 170.0f*S;
+                float col2X = mX + mW * 0.5f + 10.0f*S;
+                float col2V = mX + mW * 0.5f + 160.0f*S;
+                float lineH = 24.0f*S;
+
+                auto drawStat2 = [&](float y, const char* label, const std::string& val, wi::Color col,
+                                     float lx, float vx) {
+                    wi::font::Params lp;
+                    lp.posX = lx; lp.posY = y;
+                    lp.size = (int)(16*S); lp.color = wi::Color(170, 170, 190, 220);
+                    wi::font::Draw(label, lp, cmd);
+                    wi::font::Params vp;
+                    vp.posX = vx; vp.posY = y;
+                    vp.size = (int)(16*S); vp.color = col;
+                    wi::font::Draw(val, vp, cmd);
+                };
+
+                wi::Color statC = wi::Color(200, 210, 255, 240);
+
+                // Left column - population & traffic
+                drawStat2(cy, "Population:", std::to_string(totalPopP), statC, col1X, col1V);
+                drawStat2(cy, "Houses:", std::to_string(houseCount), statC, col2X, col2V);
+                cy += lineH;
+                drawStat2(cy, "Workers:", std::to_string(totalWorkersP), statC, col1X, col1V);
+                drawStat2(cy, "Workplaces:", std::to_string(workplaceCount), statC, col2X, col2V);
+                cy += lineH;
+                drawStat2(cy, "Cars:", std::to_string(cars.GetCarCount()), statC, col1X, col1V);
+                drawStat2(cy, "Roads:", std::to_string(roadCount), statC, col2X, col2V);
+                cy += lineH;
+                {
+                    std::ostringstream bs; bs << busCount << " (" << cars.busRoutes_.size() << " routes)";
+                    drawStat2(cy, "Buses:", bs.str(), statC, col1X, col1V);
+                }
+                drawStat2(cy, "Parking:", std::to_string(parkingCount), statC, col2X, col2V);
+                cy += lineH;
+                drawStat2(cy, "Lakes:", std::to_string(lakeCount), statC, col1X, col1V);
+                cy += lineH + 8.0f*S;
+
+                // Section: Services
+                {
+                    wi::font::Params sh;
+                    sh.posX = mX + 15.0f*S; sh.posY = cy;
+                    sh.size = (int)(19*S); sh.color = wi::Color(255, 220, 100, 240);
+                    wi::font::Draw("Services", sh, cmd);
+                    cy += 28.0f*S;
+                }
+                drawStat2(cy, "Power Plants:", std::to_string(powerPlants), statC, col1X, col1V);
+                drawStat2(cy, "Water Pumps:", std::to_string(waterPumps), statC, col2X, col2V);
+                cy += lineH;
+                drawStat2(cy, "Police:", std::to_string(policeStations), statC, col1X, col1V);
+                drawStat2(cy, "Fire Stations:", std::to_string(fireStations), statC, col2X, col2V);
+                cy += lineH;
+                drawStat2(cy, "Hospitals:", std::to_string(hospitals), statC, col1X, col1V);
+                drawStat2(cy, "Bus Depots:", std::to_string(busDepots), statC, col2X, col2V);
+                cy += lineH + 8.0f*S;
+
+                // Section: Financial Summary
+                {
+                    wi::font::Params sh;
+                    sh.posX = mX + 15.0f*S; sh.posY = cy;
+                    sh.size = (int)(19*S); sh.color = wi::Color(255, 220, 100, 240);
+                    wi::font::Draw("Financial Summary", sh, cmd);
+                    cy += 28.0f*S;
+                }
+                drawStat(cy, "Treasury:", fmtMoney(townTreasury),
+                         townTreasury >= 0 ? wi::Color(100, 255, 100, 255) : wi::Color(255, 80, 80, 255));
+                cy += 24.0f*S;
+                drawStat(cy, "Income/sec:", fmtMoney(incomePerSec_), wi::Color(80, 220, 80, 240));
+                cy += 24.0f*S;
+                drawStat(cy, "Expenses/sec:", fmtMoney(maintenanceCost_), wi::Color(220, 100, 80, 240));
+                cy += 24.0f*S;
+                drawStat(cy, "Net/sec:", fmtMoney(netPerSec),
+                         netPerSec >= 0 ? wi::Color(80, 255, 80, 255) : wi::Color(255, 60, 60, 255));
+                cy += 24.0f*S;
+                {
+                    std::ostringstream ts; ts << (int)(taxRate_ * 100.0f) << "%";
+                    drawStat(cy, "Tax Rate:", ts.str(), wi::Color(220, 200, 100, 240));
+                }
+            }
+
+            // ================ TAB 1: Budget ================
+            if (presidentTab_ == 1)
+            {
+                // Financial details
+                {
+                    wi::font::Params sh;
+                    sh.posX = mX + 15.0f*S; sh.posY = cy;
+                    sh.size = (int)(19*S); sh.color = wi::Color(255, 220, 100, 240);
+                    wi::font::Draw("Income & Expenses", sh, cmd);
+                    cy += 28.0f*S;
+                }
+
+                drawStat(cy, "Treasury:", fmtMoney(townTreasury),
+                         townTreasury >= 0 ? wi::Color(100, 255, 100, 255) : wi::Color(255, 80, 80, 255));
+                cy += 26.0f*S;
+                drawStat(cy, "Income/sec:", fmtMoney(incomePerSec_), wi::Color(80, 220, 80, 240));
+                cy += 26.0f*S;
+                drawStat(cy, "Expenses/sec:", fmtMoney(maintenanceCost_), wi::Color(220, 100, 80, 240));
+                cy += 26.0f*S;
+                drawStat(cy, "Net/sec:", fmtMoney(netPerSec),
+                         netPerSec >= 0 ? wi::Color(80, 255, 80, 255) : wi::Color(255, 60, 60, 255));
+                cy += 26.0f*S;
+
+                // Tax rate slider
+                {
+                    cy += 5.0f*S;
+                    wi::font::Params lbl;
+                    lbl.posX = mX + 20.0f*S; lbl.posY = cy;
+                    lbl.size = (int)(17*S); lbl.color = wi::Color(220, 200, 100, 240);
+                    std::ostringstream ts; ts << "Tax Rate: " << (int)(taxRate_ * 100.0f) << "%";
+                    wi::font::Draw(ts.str(), lbl, cmd);
+
+                    float sliderX = mX + 200.0f*S;
+                    float sliderW = 300.0f*S;
+                    float sliderH = 16.0f*S;
+                    float sy = cy + 2.0f*S;
+                    // Track
+                    wi::image::Params trk;
+                    trk.pos = XMFLOAT3(sliderX, sy + sliderH*0.3f, 0);
+                    trk.siz = XMFLOAT2(sliderW, sliderH*0.4f);
+                    trk.color = XMFLOAT4(0.25f, 0.20f, 0.10f, 0.9f);
+                    wi::image::Draw(nullptr, trk, cmd);
+                    // Thumb
+                    float tf2 = taxRate_ / 0.50f;
+                    tf2 = std::clamp(tf2, 0.0f, 1.0f);
+                    float thumbX = sliderX + tf2 * sliderW - 8.0f*S;
+                    wi::image::Params thm;
+                    thm.pos = XMFLOAT3(thumbX, sy, 0);
+                    thm.siz = XMFLOAT2(16.0f*S, sliderH);
+                    thm.color = XMFLOAT4(0.90f, 0.70f, 0.20f, 1.0f);
+                    wi::image::Draw(nullptr, thm, cmd);
+                    // Drag
+                    static bool draggingTax = false;
+                    if (wi::input::Down(wi::input::MOUSE_BUTTON_LEFT)) {
+                        if (mptr.x >= sliderX - 5*S && mptr.x <= sliderX + sliderW + 5*S &&
+                            mptr.y >= sy - 5*S && mptr.y <= sy + sliderH + 5*S)
+                            draggingTax = true;
+                    } else {
+                        draggingTax = false;
+                    }
+                    if (draggingTax) {
+                        float frac = (mptr.x - sliderX) / sliderW;
+                        frac = std::clamp(frac, 0.0f, 1.0f);
+                        taxRate_ = frac * 0.50f;
+                        taxRate_ = std::round(taxRate_ * 100.0f) / 100.0f;
+                    }
+                    cy += 30.0f*S;
+                }
+
+                // Graphs
+                cy += 10.0f*S;
+                {
+                    wi::font::Params gTitle;
+                    gTitle.posX = mX + 20.0f*S; gTitle.posY = cy;
+                    gTitle.size = (int)(18*S); gTitle.color = wi::Color(200, 200, 220, 240);
+                    wi::font::Draw("Economy History (last ~4 min)", gTitle, cmd);
+                    cy += 24.0f*S;
+                }
+
+                int graphCount = econHistoryCount_;
+                if (graphCount >= 2) {
+                    float graphW = (mW - 40.0f*S) * 0.5f;
+                    float graphH = 90.0f*S;
+                    float gapX = 10.0f*S;
+
+                    auto drawGraph = [&](float gx, float gy, float gw, float gh,
+                                          const float* data, int count2, const char* title,
+                                          XMFLOAT4 lineCol, XMFLOAT4 bgCol)
+                    {
+                        wi::image::Params gbg;
+                        gbg.pos = XMFLOAT3(gx, gy, 0);
+                        gbg.siz = XMFLOAT2(gw, gh);
+                        gbg.color = bgCol;
+                        wi::image::Draw(nullptr, gbg, cmd);
+                        wi::font::Params gtp;
+                        gtp.posX = gx + 4.0f*S; gtp.posY = gy + 2.0f*S;
+                        gtp.size = (int)(13*S); gtp.color = wi::Color(200, 200, 200, 200);
+                        wi::font::Draw(title, gtp, cmd);
+                        float vMin = 1e30f, vMax = -1e30f;
+                        int oldest = (econHistoryIdx_ - count2 + ECON_HISTORY_SIZE) % ECON_HISTORY_SIZE;
+                        for (int i2 = 0; i2 < count2; ++i2) {
+                            int idx2 = (oldest + i2) % ECON_HISTORY_SIZE;
+                            vMin = std::min(vMin, data[idx2]);
+                            vMax = std::max(vMax, data[idx2]);
+                        }
+                        if (vMax - vMin < 1.0f) { vMin -= 0.5f; vMax += 0.5f; }
+                        {
+                            wi::font::Params minP;
+                            minP.posX = gx + gw - 60.0f*S; minP.posY = gy + gh - 16.0f*S;
+                            minP.size = (int)(11*S); minP.color = wi::Color(150, 150, 150, 160);
+                            std::ostringstream oss2; oss2 << std::fixed << std::setprecision(0) << vMin;
+                            wi::font::Draw(oss2.str(), minP, cmd);
+                            minP.posY = gy + 14.0f*S;
+                            std::ostringstream oss3; oss3 << std::fixed << std::setprecision(0) << vMax;
+                            wi::font::Draw(oss3.str(), minP, cmd);
+                        }
+                        float padT = 18.0f*S, padB = 4.0f*S;
+                        for (int i2 = 1; i2 < count2; ++i2) {
+                            int idxA = (oldest + i2 - 1) % ECON_HISTORY_SIZE;
+                            int idxB = (oldest + i2) % ECON_HISTORY_SIZE;
+                            float x0 = gx + ((float)(i2-1) / (float)(count2-1)) * gw;
+                            float x1 = gx + ((float)i2 / (float)(count2-1)) * gw;
+                            float y0 = gy + gh - padB - ((data[idxA] - vMin) / (vMax - vMin)) * (gh - padT - padB);
+                            float y1 = gy + gh - padB - ((data[idxB] - vMin) / (vMax - vMin)) * (gh - padT - padB);
+                            wi::renderer::RenderableLine2D line;
+                            line.start = XMFLOAT2(x0, y0);
+                            line.end   = XMFLOAT2(x1, y1);
+                            line.color_start = line.color_end = lineCol;
+                            wi::renderer::DrawLine(line);
+                        }
+                    };
+
+                    drawGraph(mX + 10.0f*S, cy, graphW, graphH,
+                              treasuryHistory_, graphCount, "Treasury",
+                              XMFLOAT4(0.3f, 1.0f, 0.3f, 1.0f), XMFLOAT4(0.04f, 0.06f, 0.04f, 0.8f));
+                    drawGraph(mX + 10.0f*S + graphW + gapX, cy, graphW, graphH,
+                              incomeHistory_, graphCount, "Income/sec",
+                              XMFLOAT4(0.3f, 0.8f, 1.0f, 1.0f), XMFLOAT4(0.04f, 0.04f, 0.06f, 0.8f));
+                    cy += graphH + 8.0f*S;
+
+                    drawGraph(mX + 10.0f*S, cy, graphW, graphH,
+                              expenseHistory_, graphCount, "Expenses/sec",
+                              XMFLOAT4(1.0f, 0.4f, 0.3f, 1.0f), XMFLOAT4(0.06f, 0.04f, 0.04f, 0.8f));
+                    drawGraph(mX + 10.0f*S + graphW + gapX, cy, graphW, graphH,
+                              popHistory_, graphCount, "Population",
+                              XMFLOAT4(0.8f, 0.8f, 0.3f, 1.0f), XMFLOAT4(0.06f, 0.06f, 0.04f, 0.8f));
+                }
+            }
+
+            // Footer
+            {
+                wi::font::Params ff;
+                ff.posX = mX + 15.0f*S; ff.posY = mY + mH - 28.0f*S;
+                ff.size = (int)(16*S); ff.color = wi::Color(160, 160, 160, 160);
+                wi::font::Draw("[P] or [ESC] to close", ff, cmd);
+            }
+        }
+
+        // ---- Pause Menu Overlay ----
+        if (pauseMenuOpen_)
+        {
+            const float S = uiScale();
+            XMFLOAT4 mptr = wi::input::GetPointer();
+
+            // Dim background
+            wi::image::Params dim;
+            dim.pos = XMFLOAT3(0, 0, 0);
+            dim.siz = XMFLOAT2((float)this->width, (float)this->height);
+            dim.color = XMFLOAT4(0, 0, 0, 0.6f);
+            wi::image::Draw(nullptr, dim, cmd);
+
+            // Panel
+            float pW = 300.0f*S, pH = 320.0f*S;
+            float pX = (float)this->width * 0.5f - pW * 0.5f;
+            float pY = (float)this->height * 0.5f - pH * 0.5f;
+            {
+                wi::image::Params bg;
+                bg.pos = XMFLOAT3(pX, pY, 0);
+                bg.siz = XMFLOAT2(pW, pH);
+                bg.color = XMFLOAT4(0.06f, 0.08f, 0.12f, 0.96f);
+                wi::image::Draw(nullptr, bg, cmd);
+            }
+            // Title
+            {
+                wi::image::Params tb;
+                tb.pos = XMFLOAT3(pX, pY, 0);
+                tb.siz = XMFLOAT2(pW, 42.0f*S);
+                tb.color = XMFLOAT4(0.14f, 0.10f, 0.22f, 1.0f);
+                wi::image::Draw(nullptr, tb, cmd);
+                wi::font::Params tp;
+                tp.posX = pX + pW * 0.5f - 50.0f*S; tp.posY = pY + 9.0f*S;
+                tp.size = (int)(24*S);
+                tp.color = wi::Color(255, 220, 100, 255);
+                wi::font::Draw("PAUSED", tp, cmd);
+            }
+
+            float btnW = 220.0f*S, btnH = 42.0f*S;
+            float btnX = pX + pW * 0.5f - btnW * 0.5f;
+            float cy = pY + 60.0f*S;
+            float btnGap = 12.0f*S;
+
+            auto drawPauseBtn = [&](float bx, float by, float bw, float bh, const char* label) -> bool {
+                bool hov = (mptr.x >= bx && mptr.x <= bx + bw &&
+                            mptr.y >= by && mptr.y <= by + bh);
+                wi::image::Params bg;
+                bg.pos = XMFLOAT3(bx, by, 0);
+                bg.siz = XMFLOAT2(bw, bh);
+                bg.color = hov ? XMFLOAT4(0.20f, 0.18f, 0.30f, 1.0f) : XMFLOAT4(0.12f, 0.10f, 0.18f, 0.9f);
+                wi::image::Draw(nullptr, bg, cmd);
+                wi::font::Params fp;
+                fp.posX = bx + bw * 0.5f - 45.0f*S; fp.posY = by + 10.0f*S;
+                fp.size = (int)(20*S);
+                fp.color = hov ? wi::Color(255, 220, 100, 255) : wi::Color(220, 220, 230, 230);
+                wi::font::Draw(label, fp, cmd);
+                return hov && wi::input::Press(wi::input::MOUSE_BUTTON_LEFT);
+            };
+
+            // Resume
+            if (drawPauseBtn(btnX, cy, btnW, btnH, "Resume")) {
+                pauseMenuOpen_ = false;
+            }
+            cy += btnH + btnGap;
+
+            // Save
+            if (drawPauseBtn(btnX, cy, btnW, btnH, "Save")) {
+                savesMenuSaveMode = true;
+                typingSaveName = false;
+                pendingSaveName.clear();
+                RefreshSaveList();
+                savesMenuOpen = true;
+                pauseMenuOpen_ = false;
+            }
+            cy += btnH + btnGap;
+
+            // Load
+            if (drawPauseBtn(btnX, cy, btnW, btnH, "Load")) {
+                savesMenuSaveMode = false;
+                typingSaveName = false;
+                RefreshSaveList();
+                savesMenuOpen = true;
+                pauseMenuOpen_ = false;
+            }
+            cy += btnH + btnGap;
+
+            // Settings
+            if (drawPauseBtn(btnX, cy, btnW, btnH, "Settings")) {
+                settingsMenuOpen = true;
+                pauseMenuOpen_ = false;
+            }
+            cy += btnH + btnGap;
+
+            // Exit to Menu
+            if (drawPauseBtn(btnX, cy, btnW, btnH, "Exit to Menu")) {
+                pauseMenuOpen_ = false;
+                gameState_ = GameState::MAIN_MENU;
             }
         }
     }

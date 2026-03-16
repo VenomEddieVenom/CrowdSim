@@ -122,11 +122,17 @@ void TrafficLightSystem::UpdateVisuals()
         if (poles.empty()) continue;
 
         Phase ph = phase_[key];
+        bool isPedWalk  = (ph == Phase::PED_WALK);
+        bool isPedClear = (ph == Phase::PED_CLEAR);
+
+        // During PED_WALK/PED_CLEAR all vehicle lights are RED.
+        // Ped signal: GREEN during PED_WALK, RED during PED_CLEAR and vehicle phases.
+        bool allVehRed = isPedWalk || isPedClear;
         int phIdx = static_cast<int>(ph);
-        bool isYellow = (phIdx & 1) != 0;
-        int greenIdx = isYellow ? (phIdx - 1) : phIdx;
-        ApproachDir dominant  = static_cast<ApproachDir>(greenIdx / 2);
-        ApproachDir companion = static_cast<ApproachDir>((static_cast<int>(dominant) + 3) % 4);
+        bool isYellow = (!allVehRed && (phIdx & 1) != 0);
+        int greenIdx  = (!allVehRed && isYellow) ? (phIdx - 1) : phIdx;
+        ApproachDir dominant  = allVehRed ? ApproachDir::N /*unused*/ : static_cast<ApproachDir>(greenIdx / 2);
+        ApproachDir companion = allVehRed ? ApproachDir::N /*unused*/ : static_cast<ApproachDir>((static_cast<int>(dominant) + 3) % 4);
 
         for (int p = 0; p < (int)poles.size(); ++p)
         {
@@ -135,16 +141,16 @@ void TrafficLightSystem::UpdateVisuals()
             ApproachDir ad = poleDir[p];
             XMFLOAT4 leftC = RED, straightC = RED, rightC = RED;
 
-            if (ad == dominant) {
-                // All turns green/yellow
-                XMFLOAT4 c = isYellow ? YELLOW : GREEN;
-                leftC = c; straightC = c; rightC = c;
-            } else if (ad == companion) {
-                // Right turn only
-                XMFLOAT4 c = isYellow ? YELLOW : GREEN;
-                rightC = c;
+            if (!allVehRed) {
+                if (ad == dominant) {
+                    XMFLOAT4 c = isYellow ? YELLOW : GREEN;
+                    leftC = c; straightC = c; rightC = c;
+                } else if (ad == companion) {
+                    XMFLOAT4 c = isYellow ? YELLOW : GREEN;
+                    rightC = c;
+                }
             }
-            // else: all RED (default)
+            // During PED_WALK/PED_CLEAR: all vehicle lights stay RED (default)
 
             if (poles[p].hasLeft)     setLight(poles[p].lightLeft, leftC);
             if (poles[p].hasStraight) setLight(poles[p].lightStraight, straightC);
@@ -156,6 +162,9 @@ void TrafficLightSystem::UpdateVisuals()
             if (poles[p].hasLeft)     setLight(poles[p].arrowLeft, arrowCol(leftC));
             if (poles[p].hasStraight) setLight(poles[p].arrowStraight, arrowCol(straightC));
             if (poles[p].hasRight)    setLight(poles[p].arrowRight, arrowCol(rightC));
+
+            // Pedestrian signal: GREEN during PED_WALK only, RED during PED_CLEAR and vehicle phases
+            setLight(poles[p].pedSignal, isPedWalk ? GREEN : RED);
         }
     }
 }
@@ -314,6 +323,19 @@ void TrafficLightSystem::CreatePolesForIntersection(int gx, int gz,
             poles[p].arrowRight = makeArrow("tl_arr_right", rightOX, rightOZ, hArrowScale);
         }
 
+        // Pedestrian signal: small box on the pole at crosswalk height
+        {
+            auto pedEnt = scene.Entity_CreateCube("tl_ped");
+            auto* pt2 = scene.transforms.GetComponent(pedEnt);
+            pt2->Scale(XMFLOAT3(0.30f, 0.40f, 0.30f));
+            pt2->Translate(XMFLOAT3(px, 3.5f, pz));
+            pt2->UpdateTransform();
+            auto* pm = scene.materials.GetComponent(pedEnt);
+            pm->SetBaseColor(XMFLOAT4(0.9f, 0.1f, 0.1f, 1.0f));
+            pm->SetEmissiveColor(XMFLOAT4(0.9f, 0.1f, 0.1f, 4.0f));
+            poles[p].pedSignal = pedEnt;
+        }
+
         poles[p].pole = poleEnt;
         poles[p].arm  = armEnt;
     }
@@ -336,6 +358,7 @@ void TrafficLightSystem::RemovePolesForCell(int key)
         if (pv.arrowLeft     != wi::ecs::INVALID_ENTITY) scene.Entity_Remove(pv.arrowLeft);
         if (pv.arrowStraight != wi::ecs::INVALID_ENTITY) scene.Entity_Remove(pv.arrowStraight);
         if (pv.arrowRight    != wi::ecs::INVALID_ENTITY) scene.Entity_Remove(pv.arrowRight);
+        if (pv.pedSignal     != wi::ecs::INVALID_ENTITY) scene.Entity_Remove(pv.pedSignal);
         pv = {};
     }
     poles.clear();

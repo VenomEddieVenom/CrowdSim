@@ -364,6 +364,19 @@ void CrowdSystem::Update(float dt, const CityLayout& city,
 }
 
 // ============================================================
+//  SetShadowCasting — toggle shadow casting on all ped instances
+// ============================================================
+void CrowdSystem::SetShadowCasting(bool value)
+{
+    auto& scene = wi::scene::GetScene();
+    for (auto e : instPool_)
+    {
+        auto* obj = scene.objects.GetComponent(e);
+        if (obj) obj->SetCastShadow(value);
+    }
+}
+
+// ============================================================
 //  GetView — return lightweight snapshot for CarSystem
 // ============================================================
 PedestrianView CrowdSystem::GetView() const

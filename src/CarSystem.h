@@ -4,6 +4,7 @@
 #include "TrafficLightSystem.h"
 #include <vector>
 #include <unordered_map>
+#include <atomic>
 
 // Forward-declared lightweight ped view (defined in CrowdSystem.h)
 struct PedestrianView;
@@ -24,6 +25,7 @@ struct BusRoute {
     std::vector<XMFLOAT2> fullPathBA;   // precomputed waypoints B→A
     std::vector<int> stopWpIdxAB;       // waypoint index for each stop (A→B path)
     std::vector<int> stopWpIdxBA;       // waypoint index for each stop (B→A path, reversed order)
+    int maxBuses = 5;                   // max total buses on this route
     bool active = false;
 };
 
@@ -43,6 +45,7 @@ public:
     static constexpr uint32_t MAX_CARS     = 10'000;
     static constexpr uint8_t  MAX_WP       = 64;
     static constexpr uint32_t MAX_VISIBLE  = 5'000;
+    static constexpr uint32_t MAX_LIT_CARS = 500;  // cars with headlights + brake lights
 
     // Physics
     static constexpr float MAX_SPEED   = 14.0f;   // m/s ≈ 50 km/h
@@ -63,12 +66,10 @@ public:
     // Lane offsets for each road mode (per-direction, from centreline)
     // Drivable half-width = HALF_CS - SIDEWALK_W = 10 - 2 = 8 m per side.
     // 2-lane (1 per dir): centre at 4.0 m  (midpoint of 0..8)
-    // 4-lane (2 per dir): inner 2.0 m, outer 6.0 m  (8/4=2m lane width centres)
     // 6-lane (3 per dir): inner 1.33, middle 4.0, outer 6.67
     static void GetLaneOffsets(int totalLanes, float* offsets, int& count)
     {
         if (totalLanes >= 6) { count = 3; offsets[0] = 1.33f; offsets[1] = 4.0f; offsets[2] = 6.67f; }
-        else if (totalLanes >= 4) { count = 2; offsets[0] = 2.0f; offsets[1] = 6.0f; }
         else { count = 1; offsets[0] = 4.0f; }
     }
 
@@ -78,11 +79,13 @@ public:
     static constexpr float IDM_B    =  3.0f;   // comfortable deceleration, m/s²
 
     // Economy
-    static constexpr float TAX_RATE    =  0.10f;
+    static constexpr float TAX_RATE    =  0.10f;  // default; overridable via taxRateOverride
+    float taxRateOverride = 0.10f;  // set by president menu
 
     // Schedule
     static constexpr float JOYRIDE_CHANCE = 0.15f;  // 15% chance per parked-at-home cycle
     static constexpr float WANDER_HOME_CHANCE = 0.30f; // 30% chance wanderer goes home after stop
+    static constexpr float STAY_HOME_CHANCE = 0.25f;   // 25% of cars stay home and wander
 
     enum class State : uint8_t { PARKED, DRIVING, ENTERING_PARKING, EXITING_PARKING };
 
@@ -101,12 +104,15 @@ public:
     float    GetPosX(uint32_t i)  const { return i < posX_.size() ? posX_[i] : 0.f; }
     float    GetPosZ(uint32_t i)  const { return i < posZ_.size() ? posZ_[i] : 0.f; }
     // Drain tax accumulated since last call (main loop adds to treasury)
-    float    DrainTax()                 { float t = taxAccum_; taxAccum_ = 0.f; return t; }
+    float    DrainTax()                 { return taxAccum_.exchange(0.f); }
     // For HUD
     float    GetMoney(uint32_t i) const { return i < money_.size() ? money_[i] : 0.f; }
 
     bool IsBus(uint32_t i) const { return i < isBus_.size() && isBus_[i]; }
     float GetHalfLen(uint32_t i) const { return i < halfLen_.size() ? halfLen_[i] : CAR_HL; }
+
+    // Shadow casting toggle — applies to all visible car instances
+    void SetShadowCasting(bool value);
 
     // Bus route system
     std::vector<BusRoute> busRoutes_;
@@ -164,6 +170,9 @@ public:
     // Merge consecutive collinear waypoints, keeping only turn points and endpoints
     static void SimplifyPath(XMFLOAT2* wp, uint8_t& count);
 
+    // Reset all cars (for save loading)
+    void ResetAll() { activeCount = 0; busRoutes_.clear(); }
+
 private:
     uint32_t activeCount = 0;
 
@@ -176,6 +185,7 @@ private:
     std::vector<XMFLOAT4>carColor_;
     std::vector<float>   halfLen_;         // per-vehicle half-length
     std::vector<bool>    isBus_;           // true for buses
+    std::vector<bool>    braking_;         // true when decelerating (for brake lights)
 
     // Per-bus route data (-1 = legacy random bus)
     std::vector<int8_t>  busRouteIdx_;     // which route this bus follows
@@ -187,7 +197,7 @@ private:
     // Economy
     std::vector<float>   wage_;           // $/game-sec when returning from work
     std::vector<float>   money_;
-    float                taxAccum_ = 0.f;
+    std::atomic<float>   taxAccum_{0.f};
 
     // Waypoints – raw road-cell centres  [i * MAX_WP + j]
     std::vector<XMFLOAT2> wpBuf_;
@@ -195,9 +205,15 @@ private:
     std::vector<uint8_t>  wpCurr_;
     std::vector<uint8_t>  carDir_;   // 0 = to work, 1 = to home
     std::vector<bool>     wandering_; // true = car is wandering (random destination)
+    std::vector<bool>     stayHome_;  // true = car never commutes, just wanders
     std::vector<float>    laneOff_;  // current lane offset from centreline
     std::vector<float>    laneTarget_; // target lane for smooth transitions
     std::vector<int8_t>   laneIdx_;    // lane index (0=inner, N-1=outer)
+    std::vector<int8_t>   wantsLaneDir_; // gap-creation signal (-1/0/+1) for cooperative lane changes
+
+    // Stuck/deadlock detection
+    std::vector<float>   stuckTimer_;     // seconds car has been near-stationary
+    std::vector<uint8_t> stuckStalls_;    // consecutive stall count (for escalating fix)
 
     // Parking-animation data
     struct ParkAnim {
@@ -221,6 +237,9 @@ private:
     std::vector<uint32_t> driveHead_;    // head per grid cell     (UINT32_MAX = empty)
     std::vector<uint32_t> driveNext_;    // next car in same cell  (UINT32_MAX = end)
 
+    // Scratch buffer for parallel dispatch of DRIVING cars
+    std::vector<uint32_t> drivingIdx_;
+
     // Parking occupancy (building slots only)
     std::vector<uint32_t> parkCell_;     // which grid cell car i is parked in
     std::vector<uint8_t>  myParkSlot_;   // which slot this car occupies, 0xFF = none
@@ -231,6 +250,12 @@ private:
     uint32_t                     prevVisCount_ = 0;   // slots visible last frame
     wi::ecs::Entity              meshEnt_  = wi::ecs::INVALID_ENTITY;
     std::vector<wi::ecs::Entity> instPool_;
+
+    // Car lights: 2 headlights + 2 brake lights per visible slot
+    std::vector<wi::ecs::Entity> headlightL_;   // left headlight
+    std::vector<wi::ecs::Entity> headlightR_;   // right headlight
+    std::vector<wi::ecs::Entity> brakelightL_;  // left brake light
+    std::vector<wi::ecs::Entity> brakelightR_;  // right brake light
 
     void CreateInstPool();
 };

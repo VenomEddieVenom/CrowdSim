@@ -34,6 +34,7 @@ void CarSystem::Initialize()
     carColor_.resize(MAX_CARS, {0.82f, 0.82f, 0.82f, 1.f});
     halfLen_.resize(MAX_CARS, CAR_HL);
     isBus_.resize(MAX_CARS, false);
+    braking_.resize(MAX_CARS, false);
     busRouteIdx_.resize(MAX_CARS, -1);
     busDirection_.resize(MAX_CARS, 0);
     busNextStop_.resize(MAX_CARS, -1);
@@ -47,9 +48,13 @@ void CarSystem::Initialize()
     wpCurr_.resize(MAX_CARS, 0);
     carDir_.resize(MAX_CARS, 0);
     wandering_.resize(MAX_CARS, false);
+    stayHome_.resize(MAX_CARS, false);
     laneOff_.resize(MAX_CARS, 4.5f);
     laneTarget_.resize(MAX_CARS, 4.5f);
     laneIdx_.resize(MAX_CARS, 0);
+    wantsLaneDir_.resize(MAX_CARS, 0);
+    stuckTimer_.resize(MAX_CARS, 0.f);
+    stuckStalls_.resize(MAX_CARS, 0);
     parkAnim_.resize(MAX_CARS);
 
     schedDepart_.resize(MAX_CARS, 8.0f);
@@ -60,6 +65,7 @@ void CarSystem::Initialize()
 
     driveHead_.resize(CityLayout::GRID_SIZE * CityLayout::GRID_SIZE, UINT32_MAX);
     driveNext_.resize(MAX_CARS, UINT32_MAX);
+    drivingIdx_.resize(MAX_CARS);
     parkCell_.resize(MAX_CARS, UINT32_MAX);
     myParkSlot_.resize(MAX_CARS, 0xFF);
 
@@ -102,11 +108,23 @@ uint32_t CarSystem::SpawnCar(const std::vector<XMFLOAT2>& roadPath, uint32_t col
     wpCurr_[i]  = 1;
     carDir_[i]  = 0;
 
-    // Assign lane: distribute evenly across all lanes
+    // Smart spawn lane: pick lane based on first upcoming turn in path.
+    // Left turn -> inner lane (0), right -> outer (N-1), straight -> middle.
     {
         float lo[3]; int lc;
         GetLaneOffsets(spawnLanes, lo, lc);
-        laneIdx_[i] = (int8_t)(colorSeed % lc);
+        int8_t spawnIdx = (lc >= 3) ? 1 : (int8_t)(lc - 1);
+        for (uint8_t w = 1; w + 1 < wc; ++w) {
+            XMFLOAT2 s1 = DirTo(wp[w-1], wp[w]);
+            XMFLOAT2 s2 = DirTo(wp[w], wp[w+1]);
+            float fc = s1.x * s2.x + s1.y * s2.y;
+            if (fc < 0.3f) {
+                float fx = s1.x * s2.y - s1.y * s2.x;
+                spawnIdx = (fx > 0.0f) ? 0 : (int8_t)(lc - 1);
+                break;
+            }
+        }
+        laneIdx_[i] = spawnIdx;
         laneOff_[i] = lo[laneIdx_[i]];
         laneTarget_[i] = laneOff_[i];
     }
@@ -121,6 +139,8 @@ uint32_t CarSystem::SpawnCar(const std::vector<XMFLOAT2>& roadPath, uint32_t col
 
     parkCell_[i]  = UINT32_MAX;
     myParkSlot_[i]= 0xFF;
+    stuckTimer_[i] = 0.f;
+    stuckStalls_[i] = 0;
 
     // Start PARKED with staggered departure so they enter the road sequentially
     state_[i]     = State::PARKED;
@@ -136,6 +156,11 @@ uint32_t CarSystem::SpawnCar(const std::vector<XMFLOAT2>& roadPath, uint32_t col
     uint32_t ws = colorSeed * 1103515245u + 12345u;
     wage_[i]  = 0.50f + (float)((ws >> 8) & 0x3F) / 63.f * 1.50f;
     money_[i] = 0.f;
+
+    // Some cars stay home and wander instead of commuting
+    uint32_t stayRand = ws * 2654435761u + 12345u;
+    stayHome_[i] = ((float)(stayRand & 0xFFFF) / 65535.f) < STAY_HOME_CHANCE;
+    wandering_[i] = stayHome_[i]; // start wandering immediately if stay-home
 
     // Work schedule: spread across 6 shift windows for even traffic distribution
     //   15% early morning  (5:00 – 7:00)   – bakeries, hospitals, logistics
@@ -306,9 +331,15 @@ void CarSystem::UpdateBusRoutes(float dt, CityLayout& city)
             else ++countBA;
         }
 
-        // Spawn if needed (1 bus per direction per route)
-        if (countAB == 0) SpawnRouteBus(ri, city, 0);
-        if (countBA == 0) SpawnRouteBus(ri, city, 1);
+        // Spawn buses up to the route's maxBuses cap (split between directions)
+        int totalBuses = countAB + countBA;
+        int maxPerDir = std::max(1, route.maxBuses / 2);
+        if (totalBuses < route.maxBuses) {
+            if (countAB < maxPerDir) SpawnRouteBus(ri, city, 0);
+            else if (countBA < maxPerDir) SpawnRouteBus(ri, city, 1);
+            else if (countAB <= countBA) SpawnRouteBus(ri, city, 0);
+            else SpawnRouteBus(ri, city, 1);
+        }
     }
 
     // Handle bus stop detection and timers (position-based)
@@ -437,7 +468,12 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
         }
     }
 
-    // ---- Per-car update ----
+    // ================================================================
+    //  Pass 1 (sequential): PARKED cars + end-of-route transitions.
+    //  These touch shared state (city parking, driveHead_ grid).
+    //  Also collect indices of DRIVING cars that need physics.
+    // ================================================================
+    uint32_t drivingCount = 0;
     for (uint32_t i = 0; i < activeCount; ++i)
     {
         // ---- PARKED ----
@@ -452,7 +488,20 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
             // Check if it's time to depart based on schedule
             bool shouldDepart = wandering_[i]; // wandering cars depart immediately
 
-            if (!shouldDepart && carDir_[i] == 0)
+            if (!shouldDepart && stayHome_[i])
+            {
+                // Stay-home cars: wander periodically with higher chance
+                uint32_t jHash = (uint32_t)(i * 2654435761u + dayCounter_ * 31u +
+                                 (uint32_t)(currentHour * 100.f));
+                float jRand = (float)(jHash & 0xFFFF) / 65535.f;
+                float hourFrac = dt / (dayDuration / 24.0f);
+                if (jRand < 0.40f * hourFrac) // 40% chance per hour
+                {
+                    shouldDepart = true;
+                    wandering_[i] = true;
+                }
+            }
+            else if (!shouldDepart && carDir_[i] == 0)
             {
                 float dep = schedDepart_[i];
                 float diff = currentHour - dep;
@@ -570,7 +619,7 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
                     rh = rh * 1664525u + 1013904223u;
                     int rz = (int)(rh % GS2);
                     auto ct = city.GetCellType(rx, rz);
-                    if (ct != CityLayout::CellType::ROAD && ct != CityLayout::CellType::BUS_STOP)
+                    if (ct != CityLayout::CellType::ROAD)
                         continue;
                     // Must be at least 5 cells away for a meaningful trip
                     if (std::abs(rx - srcGX) + std::abs(rz - srcGZ) < 5)
@@ -625,9 +674,6 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
             wpCurr_[i] = 1;
             carDir_[i] ^= 1;
 
-            // Set heading toward wp[1] — but do NOT snap position to lane.
-            // The car is already on the road from the parking exit above.
-            // The Stanley controller will smoothly guide it to the lane centre.
             wc = wpCount_[i];
             if (wc >= 2)
             {
@@ -770,6 +816,23 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
             continue;
         }
 
+        // This car is DRIVING with waypoints remaining — needs physics
+        drivingIdx_[drivingCount++] = i;
+    } // end pass 1
+
+    // ================================================================
+    //  Pass 2 (parallel): DRIVING physics — per-car, no shared writes
+    //  except atomic taxAccum_.  Grid (driveHead_/driveNext_) is
+    //  read-only here; city/lights/peds are read-only.
+    // ================================================================
+    const float par_taxRate = taxRateOverride;
+    wi::jobsystem::context carCtx;
+    wi::jobsystem::Dispatch(carCtx, drivingCount, 64, [&, par_taxRate](wi::jobsystem::JobArgs args) {
+        const uint32_t i = drivingIdx_[args.jobIndex];
+        XMFLOAT2* wp = &wpBuf_[(size_t)i * MAX_WP];
+        uint8_t   wc = wpCount_[i];
+        uint8_t&  wn = wpCurr_[i];
+
         // ---- Segment geometry ----
         XMFLOAT2 prev_raw   = (wn > 0) ? wp[wn-1] : wp[0];
         XMFLOAT2 target_raw = wp[wn];
@@ -834,7 +897,7 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
         // Smooth lane transition: blend laneOff toward laneTarget
         {
             float laneDiff = laneTarget_[i] - laneOff_[i];
-            float maxLateral = 5.0f * dt;
+            float maxLateral = 12.0f * dt;
             if (std::abs(laneDiff) > maxLateral)
                 laneOff_[i] += (laneDiff > 0.0f ? maxLateral : -maxLateral);
             else
@@ -855,7 +918,12 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
         bool canChangeLane = (!isTurn || onTurnApproach) && !inIntersection && onGrid && laneSettled;
 
         // Helper: check if a target lane is clear of nearby same-direction cars
-        auto isLaneClear = [&](float targetLane) -> bool {
+        // backR/fwdR control the clearance window (larger = stricter)
+        // Check if target lane is clear; optionally report nearest blocker.
+        auto isLaneClear = [&](float targetLane, float backR = 8.f, float fwdR = 15.f,
+                               float* outFwd = nullptr, float* outSpd = nullptr) -> bool {
+            bool clear = true;
+            float closestAbs = 1e6f;
             for (int dg = -1; dg <= 1; ++dg)
             for (int dh2 = -1; dh2 <= 1; ++dh2)
             {
@@ -873,67 +941,119 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
                     float odx = posX_[j] - posX_[i];
                     float odz = posZ_[j] - posZ_[i];
                     float fwd = odx * myFwdX + odz * myFwdZ;
-                    if (fwd > -8.f && fwd < 15.f) return false;
+                    if (fwd > -backR && fwd < fwdR) {
+                        if (!outFwd) return false; // fast path
+                        clear = false;
+                        if (std::abs(fwd) < closestAbs) {
+                            closestAbs = std::abs(fwd);
+                            *outFwd = fwd;
+                            *outSpd = speed_[j];
+                        }
+                    }
                 }
             }
-            return true;
+            return clear;
         };
 
         // ---- Turn lane preparation (uses lane index) ----
         // Left turn → leftmost lane (0), right turn → rightmost lane (N-1),
         // straight → any lane (pick least busy)
+        //
+        // turnSwitchNow  = current segment ends in a turn → start switching
+        //                  lanes immediately, suppress middle-lane balance
+        // turnPrepNeeded = turn is within 30 m → slow down / stop if
+        //                  still in the wrong lane
         int8_t requiredIdx = laneIdx_[i];
+        bool turnSwitchNow = false;
         bool turnPrepNeeded = false;
         float distToTurnWp = 1e6f;
 
-        // Current turn: left → inner (0), right → outer (N-1)
+        // Current segment ends in a turn: left → inner (0), right → outer (N-1)
+        // Switch as soon as there is space — don't wait until close.
         if (isTurn)
         {
             requiredIdx = (turnCross > 0.0f) ? 0 : (int8_t)(cellLaneCount - 1);
-            turnPrepNeeded = true;
             float tdx = target_raw.x - posX_[i], tdz = target_raw.y - posZ_[i];
             distToTurnWp = std::sqrt(tdx * tdx + tdz * tdz);
+            if (distToTurnWp < 80.0f)
+                turnSwitchNow = true;
+            if (distToTurnWp < 60.0f)
+                turnPrepNeeded = true;
         }
 
-        // Look ahead for upcoming turns (8 segments for early lane change)
-        if (!turnPrepNeeded)
+        // ---- Gap creation for blocked turn lane changes ----
+        // When a car can't switch to the required turn lane because an
+        // adjacent car is blocking, actively adjust speed to create a gap.
+        wantsLaneDir_[i] = 0;
+        bool blockedForTurn = false;
+        float gapCreationMax = MAX_SPEED;
+
+        // Switch to the required turn lane as soon as safely possible
+        if (turnSwitchNow && laneIdx_[i] != requiredIdx && canChangeLane)
         {
-            float tdx0 = target_raw.x - posX_[i], tdz0 = target_raw.y - posZ_[i];
-            float accumDist = std::sqrt(tdx0 * tdx0 + tdz0 * tdz0);
-            for (uint8_t look = 1; look <= 8 && (wn + look) < wc; ++look)
+            float bFwd = 0.f, bSpd = 0.f;
+            if (isLaneClear(cellLaneOffs[requiredIdx], 8.f, 15.f, &bFwd, &bSpd))
             {
-                uint8_t futIdx = wn + look;
-                if (futIdx + 1 >= wc) break;
-                XMFLOAT2 fSeg = DirTo(wp[futIdx - 1], wp[futIdx]);
-                XMFLOAT2 fNext = DirTo(wp[futIdx], wp[futIdx + 1]);
-                float fCos = fSeg.x * fNext.x + fSeg.y * fNext.y;
-                float fCross = fSeg.x * fNext.y - fSeg.y * fNext.x;
-                if (fCos < 0.3f)
-                {
-                    requiredIdx = (fCross > 0.0f) ? 0 : (int8_t)(cellLaneCount - 1);
-                    turnPrepNeeded = true;
-                    distToTurnWp = accumDist;
-                    break;
+                laneIdx_[i] = requiredIdx;
+                laneTarget_[i] = cellLaneOffs[laneIdx_[i]];
+            }
+            else
+            {
+                // Blocked — signal intent and compute speed adjustment.
+                blockedForTurn = true;
+                wantsLaneDir_[i] = (requiredIdx < laneIdx_[i]) ? (int8_t)-1 : (int8_t)1;
+
+                // Strategy: create a speed differential with the blocker
+                // so it pulls ahead (or falls behind), opening a gap.
+                if (bFwd >= -2.0f) {
+                    // Blocker is ahead or alongside: slow down to drop behind
+                    gapCreationMax = std::max(bSpd * 0.4f, 1.0f);
+                } else {
+                    // Blocker is behind: use parity tiebreaker
+                    // Even-indexed cars slow, odd maintain speed
+                    if ((i & 1) == 0)
+                        gapCreationMax = std::max(bSpd * 0.4f, 1.0f);
+                    // else gapCreationMax stays MAX_SPEED
                 }
-                float sdx = wp[futIdx].x - wp[futIdx - 1].x;
-                float sdz = wp[futIdx].y - wp[futIdx - 1].y;
-                accumDist += std::sqrt(sdx * sdx + sdz * sdz);
             }
         }
 
-        // Execute lane change for turn preparation (only on safe straights)
-        if (turnPrepNeeded && laneIdx_[i] != requiredIdx
-            && canChangeLane && isLaneClear(cellLaneOffs[requiredIdx]))
-        {
-            laneIdx_[i] = requiredIdx;
-            laneTarget_[i] = cellLaneOffs[laneIdx_[i]];
-        }
-
-        // Wrong lane for upcoming turn: car must slow down to change before intersection
+        // Wrong lane for upcoming turn AND close: slow down to change before intersection
         bool wrongLaneForTurn = turnPrepNeeded && (laneIdx_[i] != requiredIdx);
 
-        // Balance lane distribution: no turn ahead → prefer less crowded lane
-        if (!turnPrepNeeded && canChangeLane && cellLaneCount > 1)
+        // If stopped at lights / in queue AND in the wrong lane, give up the
+        // turn and go straight — don't block traffic trying to switch lanes.
+        if (wrongLaneForTurn && speed_[i] < 0.5f && !inIntersection
+            && distToTurnWp > 5.0f)
+        {
+            int turnGX, turnGZ;
+            if (city.WorldToGrid(target_raw.x, target_raw.y, turnGX, turnGZ))
+            {
+                int sGX = turnGX + (int)std::round(segDir.x);
+                int sGZ = turnGZ + (int)std::round(segDir.y);
+                if (city.IsRoadLike(sGX, sGZ))
+                {
+                    // Modify path to continue straight past the intersection
+                    if (wn + 1 < MAX_WP) {
+                        wp[wn + 1] = { target_raw.x + segDir.x * CityLayout::CELL_SIZE * 2.0f,
+                                       target_raw.y + segDir.y * CityLayout::CELL_SIZE * 2.0f };
+                        wpCount_[i] = wn + 2;
+                    }
+                    isTurn = false;
+                    turnSwitchNow = false;
+                    turnPrepNeeded = false;
+                    wrongLaneForTurn = false;
+                    nextSeg = segDir;
+                    cornerCos = 1.0f;
+                    turnCross = 0.0f;
+                }
+            }
+        }
+
+        // Balance lane distribution → prefer MIDDLE lane.
+        // Suppressed when actively switching to a turn lane (< 80 m).
+        bool suppressBalance = turnSwitchNow;
+        if (!suppressBalance && canChangeLane && cellLaneCount > 1)
         {
             int laneCounts[3] = {0, 0, 0};
             for (int dg = -1; dg <= 1; ++dg)
@@ -960,20 +1080,72 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
                     }
                 }
             }
-            int myCount = laneCounts[laneIdx_[i]];
-            int bestIdx = laneIdx_[i];
-            int bestCount = myCount;
+
+            // Balance lanes: switch to less-crowded lane, middle as tiebreaker on 3-lane roads
+            int8_t bestIdx = laneIdx_[i];
+            int bestCnt = laneCounts[laneIdx_[i]];
             for (int l = 0; l < cellLaneCount; ++l)
             {
-                if (l != laneIdx_[i] && laneCounts[l] < bestCount - 1)
-                { bestCount = laneCounts[l]; bestIdx = l; }
+                if (l == laneIdx_[i]) continue;
+                bool prefer = false;
+                // Switch to significantly less-crowded lane
+                if (laneCounts[l] < bestCnt - 1) prefer = true;
+                // Drift to middle when equal or less crowded (3+ lanes)
+                else if (cellLaneCount >= 3 && l == 1
+                         && laneCounts[l] <= laneCounts[laneIdx_[i]]
+                         && bestIdx == laneIdx_[i]) prefer = true;
+                if (prefer) { bestCnt = laneCounts[l]; bestIdx = (int8_t)l; }
             }
-            if (bestIdx != laneIdx_[i] && isLaneClear(cellLaneOffs[bestIdx]))
+
+            // When nearly stopped (e.g. at a red light), only change
+            // lanes if the target is completely free — wider clearance.
+            bool balanceClear = (speed_[i] < 2.0f)
+                ? isLaneClear(cellLaneOffs[bestIdx], 30.f, 50.f)
+                : isLaneClear(cellLaneOffs[bestIdx]);
+            if (bestIdx != laneIdx_[i] && balanceClear)
             {
-                laneIdx_[i] = (int8_t)bestIdx;
+                laneIdx_[i] = bestIdx;
                 laneTarget_[i] = cellLaneOffs[laneIdx_[i]];
             }
         }
+
+        // ---- Cooperative yielding ----
+        // If a neighbor in an adjacent lane is signaling that it needs
+        // our lane, speed up slightly to help create a gap.
+        bool cooperativeYield = [&]() -> bool {
+            if (blockedForTurn || turnSwitchNow || !onGrid || inIntersection)
+                return false;
+            for (int dg = -1; dg <= 1; ++dg)
+            for (int dh2 = -1; dh2 <= 1; ++dh2)
+            {
+                int cgx = myGX + dh2, cgz = myGZ + dg;
+                if (cgx < 0 || cgx >= GS || cgz < 0 || cgz >= GS) continue;
+                int cellKey = cgz * GS + cgx;
+                for (uint32_t j = driveHead_[cellKey]; j != UINT32_MAX; j = driveNext_[j])
+                {
+                    if (j == i) continue;
+                    if (wantsLaneDir_[j] == 0) continue;
+                    float jFwdX = std::sin(heading_[j]);
+                    float jFwdZ = std::cos(heading_[j]);
+                    float hcos = myFwdX * jFwdX + myFwdZ * jFwdZ;
+                    if (hcos < 0.5f) continue;
+                    // Must be in adjacent lane, not same
+                    float lDiff = laneOff_[j] - laneOff_[i];
+                    if (std::abs(lDiff) < 1.5f || std::abs(lDiff) > 6.0f) continue;
+                    // Check j wants to move toward my lane
+                    bool jWantsMyDir = (wantsLaneDir_[j] < 0 && lDiff > 0.f)
+                                    || (wantsLaneDir_[j] > 0 && lDiff < 0.f);
+                    if (!jWantsMyDir) continue;
+                    // Must be alongside
+                    float odx = posX_[j] - posX_[i];
+                    float odz = posZ_[j] - posZ_[i];
+                    float fwd = odx * myFwdX + odz * myFwdZ;
+                    if (fwd > -12.f && fwd < 12.f)
+                        return true;
+                }
+            }
+            return false;
+        }();
 
         // ---- Compute target point for steering ----
         //   Two-phase turn model:
@@ -1009,6 +1181,24 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
             {
                 // ---- ARC PHASE: car is at/past the intersection entry ----
                 inArc = true;
+
+                // If still in the wrong lane at arc entry, force-snap to required lane
+                // so the arc geometry uses the correct offset. Cars must always turn.
+                if (laneIdx_[i] != requiredIdx && turnSwitchNow)
+                {
+                    laneIdx_[i] = requiredIdx;
+                    laneTarget_[i] = cellLaneOffs[requiredIdx];
+                    // Recompute entry/exit points with corrected lane
+                    entryPt = {
+                        target_raw.x - segDir.x * HALF_CS + inRX * laneTarget_[i],
+                        target_raw.y - segDir.y * HALF_CS + inRZ * laneTarget_[i]
+                    };
+                    exitPt = {
+                        target_raw.x + nextSeg.x * HALF_CS + outRX * laneTarget_[i],
+                        target_raw.y + nextSeg.y * HALF_CS + outRZ * laneTarget_[i]
+                    };
+                }
+
                 // Commit lane offset — no more smooth transition during the arc
                 laneOff_[i] = laneTarget_[i];
 
@@ -1053,7 +1243,7 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
                 {
                     heading_[i] = std::atan2(nextSeg.x, nextSeg.y);
                     ++wn;
-                    continue;
+                    return;
                 }
             }
             else
@@ -1083,7 +1273,7 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
             if (crossDot >= -0.3f && segFwd >= segLen - 1.0f)
             {
                 ++wn;
-                continue;
+                return;
             }
         }
 
@@ -1216,7 +1406,9 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
             }
 
             // ---- Gridlock prevention: don't enter intersection if exit is blocked ----
-            // "Don't block the box" — treat a jammed exit as a virtual red light
+            // "Don't block the box" — if the exit road has stopped/slow cars
+            // in our lane, treat it as a virtual red light. One stopped car
+            // per lane is enough to block — we must NOT enter if we won't fit.
             if (!inArc && !lights.IsIntersection(myGX, myGZ))
             {
                 int prevScanGX2 = myGX, prevScanGZ2 = myGZ;
@@ -1231,32 +1423,38 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
 
                     if (!lights.IsIntersection(sgx, sgz)) continue;
 
-                    // Found an intersection ahead — check the exit cell beyond it
-                    int exitCX = sgx + (int)std::round(segDir.x);
-                    int exitCZ = sgz + (int)std::round(segDir.y);
-                    if (isTurn) {
-                        exitCX = sgx + (int)std::round(nextSeg.x);
-                        exitCZ = sgz + (int)std::round(nextSeg.y);
-                    }
+                    // Found an intersection ahead — check exit cell AND intersection itself
+                    XMFLOAT2 exitDir = segDir;
+                    if (isTurn) exitDir = nextSeg;
+                    int exitCX = sgx + (int)std::round(exitDir.x);
+                    int exitCZ = sgz + (int)std::round(exitDir.y);
                     if (exitCX < 0 || exitCX >= GS || exitCZ < 0 || exitCZ >= GS) break;
 
-                    // Count stopped/slow cars in exit cell heading same direction
+                    // Count stopped/slow cars in exit cell AND intersection cell in our direction
+                    auto countJam = [&](int checkKey) -> int {
+                        int cnt = 0;
+                        for (uint32_t j2 = driveHead_[checkKey]; j2 != UINT32_MAX; j2 = driveNext_[j2])
+                        {
+                            if (speed_[j2] >= 1.5f) continue;
+                            float j2Fx = std::sin(heading_[j2]);
+                            float j2Fz = std::cos(heading_[j2]);
+                            float dirDot = exitDir.x * j2Fx + exitDir.y * j2Fz;
+                            if (dirDot > 0.3f) cnt++;
+                        }
+                        return cnt;
+                    };
+
                     int exitKey = exitCZ * GS + exitCX;
-                    int jamCount = 0;
-                    for (uint32_t j2 = driveHead_[exitKey]; j2 != UINT32_MAX; j2 = driveNext_[j2])
-                    {
-                        if (speed_[j2] >= 1.0f) continue;
-                        float j2Fx = std::sin(heading_[j2]);
-                        float j2Fz = std::cos(heading_[j2]);
-                        float dirDot = segDir.x * j2Fx + segDir.y * j2Fz;
-                        if (dirDot > 0.3f) jamCount++;
-                    }
-                    // Scale threshold by lane count: need real blockage, not just 2 cars
+                    int intKey = sgz * GS + sgx;
+                    int exitJam = countJam(exitKey);
+                    int intJam  = countJam(intKey);
+
+                    // Block entry if there's even 1 stopped car per lane in exit,
+                    // or any cars jammed inside the intersection itself
                     int exitLanes = city.GetRoadLanes(exitCX, exitCZ);
-                    int jamThreshold = exitLanes * 2;
-                    if (jamCount >= jamThreshold)
+                    int perLane = std::max(1, exitLanes / 2); // lanes per direction
+                    if (exitJam >= perLane || intJam >= 1)
                     {
-                        // Treat as virtual stop before the intersection
                         XMFLOAT2 intC2 = city.GridCellCenter(sgx, sgz);
                         float toCX2 = intC2.x - posX_[i];
                         float toCZ2 = intC2.y - posZ_[i];
@@ -1358,6 +1556,14 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
             desiredMax = MAX_SPEED * (0.30f + 0.70f * approachFactor);
         }
 
+        // Blocked turn lane change: slow down aggressively from 80m
+        if (blockedForTurn)
+            desiredMax = std::min(desiredMax, gapCreationMax);
+
+        // Cooperative yielding: boost speed slightly to help neighbor switch
+        if (cooperativeYield && !isTurn && !inArc)
+            desiredMax = std::min(desiredMax * 1.15f, MAX_SPEED);
+
         // Wrong lane for turn: slow down and stop ONLY if the correct lane is available
         if (wrongLaneForTurn && !inArc)
         {
@@ -1368,16 +1574,25 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
             desiredMax = std::min(desiredMax, laneChangeMax);
 
             // Near the arc: stop and force lane change IF the target lane has room.
-            // If the lane is blocked, don't stop — just proceed at reduced speed.
+            // If the lane is blocked, force the car into the required lane anyway —
+            // cars must ALWAYS make their assigned turn, never go straight.
             if (isTurn)
             {
                 float distToArc = arcEntryDist - segFwd;
-                if (distToArc < 15.0f && isLaneClear(cellLaneOffs[requiredIdx]))
+                if (distToArc < 25.0f && isLaneClear(cellLaneOffs[requiredIdx]))
                 {
                     float stopDist = std::max(0.0f, distToArc - halfLen_[i] - 2.0f);
                     if (stopDist < bestGap) { bestGap = stopDist; bestSpd = 0.0f; }
                     laneIdx_[i] = requiredIdx;
                     laneTarget_[i] = cellLaneOffs[requiredIdx];
+                }
+                else if (distToArc < 10.0f && !isLaneClear(cellLaneOffs[requiredIdx]))
+                {
+                    // Can't change lane but must still turn — force lane snap.
+                    // The arc geometry will use the required lane offset.
+                    laneIdx_[i] = requiredIdx;
+                    laneTarget_[i] = cellLaneOffs[requiredIdx];
+                    laneOff_[i] = cellLaneOffs[requiredIdx];
                 }
             }
         }
@@ -1395,6 +1610,9 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
         // Apply acceleration
         speed_[i] = std::clamp(v + idmAccel * dt, 0.0f, desiredMax);
 
+        // Brake light detection: on when decelerating significantly
+        braking_[i] = (idmAccel < -1.5f) || (speed_[i] < 0.3f && bestGap < 8.0f);
+
         // Allow slow creep instead of permanent hard-stop
         if (bestGap <= -0.5f && bestSpd < 0.1f)
             speed_[i] = std::min(speed_[i], 0.5f);
@@ -1403,16 +1621,52 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
         if (inIntersection && speed_[i] < 2.0f && bestGap > 5.0f)
             speed_[i] = std::min(2.0f, desiredMax);
 
+        // ---- Stuck timer / deadlock breaker ----
+        // If a car is nearly stopped for too long, force it to creep forward.
+        // After repeated stalls, skip the current waypoint to escape gridlock.
+        if (speed_[i] < 0.15f && state_[i] == State::DRIVING) {
+            stuckTimer_[i] += dt;
+            if (stuckTimer_[i] > 8.0f) {
+                // Force creep to break deadlock
+                speed_[i] = std::max(speed_[i], 2.0f);
+                stuckTimer_[i] = 0.f;
+                stuckStalls_[i]++;
+                // After 3 stalls at the same location, skip waypoint
+                if (stuckStalls_[i] >= 3 && wn + 1 < wc) {
+                    ++wn;
+                    stuckStalls_[i] = 0;
+                }
+            }
+        } else {
+            stuckTimer_[i] = 0.f;
+            stuckStalls_[i] = 0;
+        }
+
         // ---- Proactive lane switching (congestion avoidance) ----
+        // Use wider clearance when nearly stopped so lane changes don't
+        // cut in front of queued cars at lights.
         if (!isTurn && !inArc && !inIntersection && speed_[i] < MAX_SPEED * 0.25f
-            && bestGap < 10.f && onGrid && !turnPrepNeeded
+            && bestGap < 10.f && onGrid && !turnSwitchNow
             && std::abs(laneOff_[i] - laneTarget_[i]) < 0.1f)
         {
-            int8_t otherIdx = (laneIdx_[i] == 0) ? (int8_t)(cellLaneCount - 1) : (int8_t)0;
-            if (isLaneClear(cellLaneOffs[otherIdx]))
+            float pB = (speed_[i] < 2.0f) ? 30.f : 8.f;
+            float pF = (speed_[i] < 2.0f) ? 50.f : 15.f;
+            if (cellLaneCount >= 3)
             {
-                laneIdx_[i] = otherIdx;
-                laneTarget_[i] = cellLaneOffs[otherIdx];
+                constexpr int8_t midIdx = 1;
+                if (laneIdx_[i] != midIdx && isLaneClear(cellLaneOffs[midIdx], pB, pF))
+                { laneIdx_[i] = midIdx; laneTarget_[i] = cellLaneOffs[midIdx]; }
+                else if (laneIdx_[i] == midIdx)
+                {
+                    int8_t a = 0, b = (int8_t)(cellLaneCount - 1);
+                    if (isLaneClear(cellLaneOffs[a], pB, pF)) { laneIdx_[i] = a; laneTarget_[i] = cellLaneOffs[a]; }
+                    else if (isLaneClear(cellLaneOffs[b], pB, pF)) { laneIdx_[i] = b; laneTarget_[i] = cellLaneOffs[b]; }
+                }
+            }
+            else if (cellLaneCount == 2)
+            {
+                int8_t other = (laneIdx_[i] == 0) ? 1 : (int8_t)0;
+                if (isLaneClear(cellLaneOffs[other], pB, pF)) { laneIdx_[i] = other; laneTarget_[i] = cellLaneOffs[other]; }
             }
         }
 
@@ -1436,19 +1690,26 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
                 float laneZ = prev_raw.y + segDir.y * segFwd2 + rightZ * laneOff_[i];
                 float cte = (posX_[i] - laneX) * rightX + (posZ_[i] - laneZ) * rightZ;
 
-                constexpr float K_STANLEY = 3.5f;
+                constexpr float K_STANLEY = 8.0f;
                 float steerCorr = -std::atan2(K_STANLEY * cte, speed_[i] + 0.5f);
                 // Stronger correction when off-center or changing lanes
                 float maxCorr;
                 if (std::abs(cte) > 1.0f)
-                    maxCorr = 0.40f;  // far off-center: strong correction
+                    maxCorr = 0.55f;  // far off-center: strong correction
                 else if (std::abs(laneTarget_[i] - laneOff_[i]) > 0.3f)
-                    maxCorr = 0.30f;  // lane change in progress
+                    maxCorr = 0.40f;  // lane change in progress
                 else
-                    maxCorr = 0.18f;  // normal tracking
+                    maxCorr = 0.35f;  // normal tracking — tight centering
                 steerCorr = std::clamp(steerCorr, -maxCorr, maxCorr);
 
                 heading_[i] = segH + steerCorr;
+
+                // Snap to lane center when CTE is tiny
+                if (std::abs(cte) < 0.05f && std::abs(laneTarget_[i] - laneOff_[i]) < 0.01f)
+                {
+                    posX_[i] = laneX;
+                    posZ_[i] = laneZ;
+                }
 
                 float fwdX = std::sin(heading_[i]);
                 float fwdZ = std::cos(heading_[i]);
@@ -1488,9 +1749,14 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
         {
             float earned  = wage_[i] * dt;
             money_[i]    += earned;
-            taxAccum_    += earned * TAX_RATE;
+            // Atomic add to shared accumulator
+            float tax = earned * par_taxRate;
+            float old = taxAccum_.load(std::memory_order_relaxed);
+            while (!taxAccum_.compare_exchange_weak(old, old + tax,
+                    std::memory_order_relaxed));
         }
-    } // end per-car
+    }); // end parallel dispatch lambda
+    wi::jobsystem::Wait(carCtx);
 
     // ==========================================================
     //  Soft collision resolution — speed-only + gentle nudge
@@ -1538,23 +1804,27 @@ void CarSystem::Update(float dt, CityLayout& city, const TrafficLightSystem& lig
         float overlap = sep - dd;
         float nx = ddx / dd, nz = ddz / dd;
 
-        // Project push onto the FORWARD axis of car A (longitudinal only)
-        // This prevents cars from being shoved sideways out of their lane
-        float sinH = std::sin(heading_[a]), cosH = std::cos(heading_[a]);
-        float pushFwd = nx * sinH + nz * cosH;
+        // Project push onto the FORWARD axis ONLY (no lateral displacement)
+        // This keeps cars perfectly centered in their lanes
+        float sinHA = std::sin(heading_[a]), cosHA = std::cos(heading_[a]);
+        float sinHB = std::sin(heading_[b]), cosHB = std::cos(heading_[b]);
         float pushMag = std::min(overlap * 0.3f, 0.3f);
-        float pushX = sinH * pushFwd * pushMag;
-        float pushZ = cosH * pushFwd * pushMag;
-        // Only push if magnitude is meaningful
-        if (std::abs(pushFwd) > 0.1f) {
-            posX_[a] -= pushX;
-            posZ_[a] -= pushZ;
-            posX_[b] += pushX;
-            posZ_[b] += pushZ;
+
+        // Car A: push along its own forward axis only
+        float pushFwdA = nx * sinHA + nz * cosHA;
+        if (std::abs(pushFwdA) > 0.1f) {
+            posX_[a] -= sinHA * pushFwdA * pushMag;
+            posZ_[a] -= cosHA * pushFwdA * pushMag;
+        }
+        // Car B: push along its own forward axis only
+        float pushFwdB = nx * sinHB + nz * cosHB;
+        if (std::abs(pushFwdB) > 0.1f) {
+            posX_[b] += sinHB * pushFwdB * pushMag;
+            posZ_[b] += cosHB * pushFwdB * pushMag;
         }
 
         // Slow down the car that's behind
-        float fwd = ddx * sinH + ddz * cosH;
+        float fwd = ddx * sinHA + ddz * cosHA;
         if (fwd > 0.f)
             speed_[a] = std::min(speed_[a], speed_[b] * 0.5f);
         else
@@ -1618,7 +1888,45 @@ void CarSystem::CreateInstPool()
         obj.color  = XMFLOAT4(0.82f, 0.82f, 0.82f, 1.f);
         instPool_[j] = e;
     }
+
+    // ---- Car lights: headlights (spot) + brake lights (point) per visible slot ----
+    headlightL_.resize(MAX_LIT_CARS);
+    headlightR_.resize(MAX_LIT_CARS);
+    brakelightL_.resize(MAX_LIT_CARS);
+    brakelightR_.resize(MAX_LIT_CARS);
+    for (uint32_t j = 0; j < MAX_LIT_CARS; ++j)
+    {
+        using LT = wi::scene::LightComponent;
+        // Headlights: warm white spot lights
+        headlightL_[j] = scene.Entity_CreateLight("hl_l",
+            XMFLOAT3(0, -1000, 0), XMFLOAT3(1.0f, 0.95f, 0.8f),
+            80.0f, 30.0f, LT::SPOT, XM_PI / 5.0f, XM_PI / 10.0f);
+        headlightR_[j] = scene.Entity_CreateLight("hl_r",
+            XMFLOAT3(0, -1000, 0), XMFLOAT3(1.0f, 0.95f, 0.8f),
+            80.0f, 30.0f, LT::SPOT, XM_PI / 5.0f, XM_PI / 10.0f);
+        // Brake lights: red point lights (initially off via Y=-1000)
+        brakelightL_[j] = scene.Entity_CreateLight("bl_l",
+            XMFLOAT3(0, -1000, 0), XMFLOAT3(1.0f, 0.1f, 0.05f),
+            15.0f, 5.0f, LT::POINT);
+        brakelightR_[j] = scene.Entity_CreateLight("bl_r",
+            XMFLOAT3(0, -1000, 0), XMFLOAT3(1.0f, 0.1f, 0.05f),
+            15.0f, 5.0f, LT::POINT);
+    }
+
     prevVisCount_ = 0;
+}
+
+// ============================================================
+//  SetShadowCasting — toggle shadow casting on all car instances
+// ============================================================
+void CarSystem::SetShadowCasting(bool value)
+{
+    auto& scene = wi::scene::GetScene();
+    for (auto e : instPool_)
+    {
+        auto* obj = scene.objects.GetComponent(e);
+        if (obj) obj->SetCastShadow(value);
+    }
 }
 
 // ============================================================
@@ -1664,6 +1972,19 @@ void CarSystem::RenderCars(const XMFLOAT3& cameraPos, const CityLayout& city)
     }
     visCount_ = count;
 
+    // Partition: cars within light range come first, sorted by distance.
+    // Use stable_sort with car-index tiebreaker to prevent slot flickering
+    // when cars are at nearly equal distances.
+    const float lightSq = 250.f * 250.f;
+    std::stable_sort(visIdx_.begin(), visIdx_.begin() + count, [&](uint32_t a, uint32_t b) {
+        float da = (posX_[a] - camX) * (posX_[a] - camX) + (posZ_[a] - camZ) * (posZ_[a] - camZ);
+        float db = (posX_[b] - camX) * (posX_[b] - camX) + (posZ_[b] - camZ) * (posZ_[b] - camZ);
+        bool aLit = da < lightSq, bLit = db < lightSq;
+        if (aLit != bLit) return aLit; // lit cars first
+        if (da != db) return da < db;
+        return a < b; // stable tiebreaker
+    });
+
     // Position visible cars
     for (uint32_t s = 0; s < count; ++s)
     {
@@ -1703,6 +2024,103 @@ void CarSystem::RenderCars(const XMFLOAT3& cameraPos, const CityLayout& city)
         // Per-car colour via ObjectComponent tint
         auto* obj = scene.objects.GetComponent(instPool_[s]);
         if (obj) obj->color = carColor_[i];
+    }
+
+    // ---- Position car lights for closest visible cars ----
+    // Only light cars within lightSq distance (already sorted to front)
+    uint32_t litCount = std::min(count, MAX_LIT_CARS);
+    for (uint32_t s = 0; s < litCount; ++s) {
+        float dx2 = posX_[visIdx_[s]] - camX, dz2 = posZ_[visIdx_[s]] - camZ;
+        if (dx2*dx2 + dz2*dz2 >= lightSq) { litCount = s; break; }
+    }
+    for (uint32_t s = 0; s < litCount; ++s)
+    {
+        const uint32_t i = visIdx_[s];
+        const float h = heading_[i];
+        const float fwdX = sinf(h), fwdZ = cosf(h);  // car forward
+        const float rgtX = fwdZ,    rgtZ = -fwdX;     // car right
+        const float hl = halfLen_[i];
+        const float hw = isBus_[i] ? BUS_HW : CAR_HW;
+        const float hh = isBus_[i] ? BUS_HH : CAR_HH;
+        const float carY = hh + 0.15f;
+        const bool parkedInBuilding = (state_[i] == State::PARKED &&
+                                       parkCell_[i] != UINT32_MAX &&
+                                       myParkSlot_[i] != 0xFF);
+
+        // Headlight positions: front-left and front-right
+        float hlY = carY + hh * 0.3f;
+        float flX = posX_[i] + fwdX * hl + rgtX * (-hw * 0.7f);
+        float flZ = posZ_[i] + fwdZ * hl + rgtZ * (-hw * 0.7f);
+        float frX = posX_[i] + fwdX * hl + rgtX * (hw * 0.7f);
+        float frZ = posZ_[i] + fwdZ * hl + rgtZ * (hw * 0.7f);
+
+        // Brake light positions: rear-left and rear-right
+        float blX = posX_[i] - fwdX * hl + rgtX * (-hw * 0.7f);
+        float blZ = posZ_[i] - fwdZ * hl + rgtZ * (-hw * 0.7f);
+        float brX = posX_[i] - fwdX * hl + rgtX * (hw * 0.7f);
+        float brZ = posZ_[i] - fwdZ * hl + rgtZ * (hw * 0.7f);
+
+        // Hide lights for parked-in-building cars
+        if (parkedInBuilding)
+        {
+            auto* thl = scene.transforms.GetComponent(headlightL_[s]);
+            if (thl) { thl->translation_local = XMFLOAT3(0, -1000, 0); thl->SetDirty(); }
+            auto* thr = scene.transforms.GetComponent(headlightR_[s]);
+            if (thr) { thr->translation_local = XMFLOAT3(0, -1000, 0); thr->SetDirty(); }
+            auto* tbl = scene.transforms.GetComponent(brakelightL_[s]);
+            if (tbl) { tbl->translation_local = XMFLOAT3(0, -1000, 0); tbl->SetDirty(); }
+            auto* tbr = scene.transforms.GetComponent(brakelightR_[s]);
+            if (tbr) { tbr->translation_local = XMFLOAT3(0, -1000, 0); tbr->SetDirty(); }
+            continue;
+        }
+
+        // Headlight left
+        {
+            auto* tr = scene.transforms.GetComponent(headlightL_[s]);
+            if (tr) {
+                tr->ClearTransform();
+                tr->translation_local = XMFLOAT3(flX, hlY, flZ);
+                tr->RotateRollPitchYaw(XMFLOAT3(-XM_PIDIV2 - 0.15f, h, 0.0f));
+                tr->SetDirty();
+            }
+        }
+        // Headlight right
+        {
+            auto* tr = scene.transforms.GetComponent(headlightR_[s]);
+            if (tr) {
+                tr->ClearTransform();
+                tr->translation_local = XMFLOAT3(frX, hlY, frZ);
+                tr->RotateRollPitchYaw(XMFLOAT3(-XM_PIDIV2 - 0.15f, h, 0.0f));
+                tr->SetDirty();
+            }
+        }
+        // Brake lights: only show when braking
+        if (braking_[i] && state_[i] == State::DRIVING)
+        {
+            auto* tbl = scene.transforms.GetComponent(brakelightL_[s]);
+            if (tbl) { tbl->translation_local = XMFLOAT3(blX, hlY, blZ); tbl->SetDirty(); }
+            auto* tbr = scene.transforms.GetComponent(brakelightR_[s]);
+            if (tbr) { tbr->translation_local = XMFLOAT3(brX, hlY, brZ); tbr->SetDirty(); }
+        }
+        else
+        {
+            auto* tbl = scene.transforms.GetComponent(brakelightL_[s]);
+            if (tbl) { tbl->translation_local = XMFLOAT3(0, -1000, 0); tbl->SetDirty(); }
+            auto* tbr = scene.transforms.GetComponent(brakelightR_[s]);
+            if (tbr) { tbr->translation_local = XMFLOAT3(0, -1000, 0); tbr->SetDirty(); }
+        }
+    }
+    // Hide lights for slots beyond litCount (previous frame may have had more)
+    for (uint32_t s = litCount; s < MAX_LIT_CARS; ++s)
+    {
+        auto* thl = scene.transforms.GetComponent(headlightL_[s]);
+        if (thl) { thl->translation_local = XMFLOAT3(0, -1000, 0); thl->SetDirty(); }
+        auto* thr = scene.transforms.GetComponent(headlightR_[s]);
+        if (thr) { thr->translation_local = XMFLOAT3(0, -1000, 0); thr->SetDirty(); }
+        auto* tbl = scene.transforms.GetComponent(brakelightL_[s]);
+        if (tbl) { tbl->translation_local = XMFLOAT3(0, -1000, 0); tbl->SetDirty(); }
+        auto* tbr = scene.transforms.GetComponent(brakelightR_[s]);
+        if (tbr) { tbr->translation_local = XMFLOAT3(0, -1000, 0); tbr->SetDirty(); }
     }
 
     // Only un-hide the slots that were visible last frame but are hidden this frame
